@@ -116,6 +116,7 @@ TT_SMC_MSG_READ_PD = 0x1C
 TT_SMC_MSG_READ_VM = 0x1D
 TT_SMC_MSG_SET_TDP_LIMIT = 0x22
 TT_SMC_MSG_SET_ASIC_HOST_FMAX = 0x23
+TT_SMC_MSG_SET_BOARD_POWER_LIMIT = 0x24
 TT_SMC_MSG_CHARACTERISATION = 0xC6
 TT_SMC_MSG_COUNTER = 0x35
 TT_SMC_MSG_TOGGLE_GDDR_RESET = 0xB6
@@ -1605,6 +1606,47 @@ def test_set_tdp_limit(arc_chip_dut, asic_id):
     assert tdp_limit == orig_tdp_limit, (
         f"TDP limit not restored to {orig_tdp_limit} watts"
     )
+
+
+def test_set_board_power_limit(arc_chip_dut, asic_id):
+    """Validate the runtime total-board input power limit message."""
+    arc_chip = pyluwen.detect_chips()[asic_id]
+
+    orig_power_limit = arc_chip.get_telemetry().board_power_limit
+    new_power_limit = max(50, orig_power_limit - 25)
+    logger.info(f"Original board power limit: {orig_power_limit}")
+
+    try:
+        response = arc_chip.as_bh().arc_msg_buf(
+            [TT_SMC_MSG_SET_BOARD_POWER_LIMIT, new_power_limit, 0, 0, 0, 0, 0, 0]
+        )
+        assert response[0] == 0, (
+            f"Failed to set board power limit to {new_power_limit} watts"
+        )
+        assert arc_chip.get_telemetry().board_power_limit == new_power_limit
+
+        response = arc_chip.as_bh().arc_msg_buf(
+            [
+                TT_SMC_MSG_SET_BOARD_POWER_LIMIT,
+                orig_power_limit + 1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        )
+        assert response[0] != 0, (
+            "Accepted a board power limit above the board maximum"
+        )
+        assert arc_chip.get_telemetry().board_power_limit == new_power_limit
+    finally:
+        response = arc_chip.as_bh().arc_msg_buf(
+            [TT_SMC_MSG_SET_BOARD_POWER_LIMIT, 0, 1, 0, 0, 0, 0, 0]
+        )
+        assert response[0] == 0, "Failed to restore the default board power limit"
+        assert arc_chip.get_telemetry().board_power_limit == orig_power_limit
 
 
 def test_set_asic_host_fmax(arc_chip_dut, asic_id):
