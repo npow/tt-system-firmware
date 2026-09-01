@@ -21,6 +21,7 @@
 #include "tensix_state_msg.h"
 
 static uint32_t power_limit;
+static uint32_t max_board_power_limit;
 
 static bool doppler;
 static bool doppler_slow;
@@ -163,6 +164,14 @@ static void SetThrottlerLimit(ThrottlerId id, float limit)
 
 	LOG_INF("Throttler %d limit set to %d", id, (uint32_t)clamped_limit);
 	throttler[id].limit = clamped_limit;
+}
+
+static void apply_board_power_limit(uint32_t new_power_limit)
+{
+	power_limit = new_power_limit;
+	SetThrottlerLimit(kThrottlerBoardPower, power_limit);
+	SetThrottlerLimit(kThrottlerDopplerSlow, power_limit);
+	UpdateTelemetryBoardPowerLimit(power_limit);
 }
 
 static uint32_t throttle_counter;
@@ -509,16 +518,37 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 		return -1;
 	}
 
-	power_limit = sys_get_le16(data);
+	uint32_t cable_power_limit = sys_get_le16(data);
 
-	LOG_INF("Cable Power Limit: %u", power_limit);
-	power_limit = MIN(power_limit,
-			  tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
+	LOG_INF("Cable Power Limit: %u", cable_power_limit);
+	max_board_power_limit =
+		MIN(cable_power_limit,
+		    tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
+	apply_board_power_limit(max_board_power_limit);
 
-	SetThrottlerLimit(kThrottlerBoardPower, power_limit);
-	SetThrottlerLimit(kThrottlerDopplerSlow, power_limit);
+	return 0;
+}
 
-	UpdateTelemetryBoardPowerLimit(power_limit);
+static uint8_t set_board_power_limit_handler(const union request *request,
+					     struct response *response)
+{
+	ARG_UNUSED(response);
+
+	uint32_t new_power_limit = request->set_board_power_limit.restore_default
+					   ? max_board_power_limit
+					   : request->set_board_power_limit.board_power_limit;
+
+	/* Do not allow the host to exceed the cable/board limit or the controller's
+	 * supported range. The DMC initializes max_board_power_limit before the host
+	 * can issue runtime requests; a zero maximum therefore remains invalid.
+	 */
+	if (new_power_limit > max_board_power_limit ||
+	    get_throttler_clamped_limit(kThrottlerBoardPower, new_power_limit) != new_power_limit) {
+		return 1;
+	}
+
+	LOG_INF("Runtime board power limit: %u", new_power_limit);
+	apply_board_power_limit(new_power_limit);
 
 	return 0;
 }
@@ -600,3 +630,4 @@ uint32_t GetNOPOnDuration(uint32_t window_ms)
 }
 
 REGISTER_MESSAGE(TT_SMC_MSG_SET_TDP_LIMIT, set_tdp_limit_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_SET_BOARD_POWER_LIMIT, set_board_power_limit_handler);
