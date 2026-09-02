@@ -42,6 +42,8 @@ ZTEST(throttler, test_set_board_power_limit)
 
 	zassert_equal(set_board_power_limit(225, false), 0);
 	zassert_equal(GetTelemetryTag(TAG_BOARD_POWER_LIMIT), 225);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 247);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 270);
 }
 
 ZTEST(throttler, test_reject_board_power_limit_above_board_maximum)
@@ -67,6 +69,20 @@ ZTEST(throttler, test_restore_board_power_limit)
 
 	zassert_equal(set_board_power_limit(0, true), 0);
 	zassert_equal(GetTelemetryTag(TAG_BOARD_POWER_LIMIT), 300);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 600);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 750);
+}
+
+ZTEST(throttler, test_runtime_board_power_limit_tightens_transient_thresholds)
+{
+	set_dmc_board_power_limit(300);
+
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 600);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 750);
+
+	zassert_equal(set_board_power_limit(150, false), 0);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 165);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 180);
 }
 
 ZTEST_SUITE(throttler, NULL, NULL, NULL, NULL, NULL);

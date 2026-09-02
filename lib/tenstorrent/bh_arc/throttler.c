@@ -22,6 +22,7 @@
 
 static uint32_t power_limit;
 static uint32_t max_board_power_limit;
+static bool strict_runtime_power_limit;
 
 static bool doppler;
 static bool doppler_slow;
@@ -349,6 +350,33 @@ static bool DopplerActive(void)
 	return doppler && power_limit > 0;
 }
 
+static uint32_t GetDopplerT2PowerLimit(void)
+{
+	/* Preserve the board-qualified transient envelope at the DMC-provided
+	 * default. A host-requested limit is intended to protect the surrounding
+	 * system as well as control sustained power, so give it much less transient
+	 * headroom before forcing kernel NOPs.
+	 */
+	return strict_runtime_power_limit ? power_limit * 11U / 10U : power_limit * 2U;
+}
+
+static uint32_t GetDopplerT3PowerLimit(void)
+{
+	return strict_runtime_power_limit ? power_limit * 6U / 5U : power_limit * 5U / 2U;
+}
+
+#if defined(CONFIG_ZTEST)
+uint32_t ThrottlerGetDopplerT2PowerLimit(void)
+{
+	return GetDopplerT2PowerLimit();
+}
+
+uint32_t ThrottlerGetDopplerT3PowerLimit(void)
+{
+	return GetDopplerT3PowerLimit();
+}
+#endif
+
 static void UpdateDoppler(const TelemetryInternalData *telemetry)
 {
 	uint16_t current_power = GetInputPower();
@@ -356,8 +384,8 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 
 	UpdateThrottler(kThrottlerDopplerSlow, average_power);
 
-	/* Doppler T2 throttler: 2x power limit for 10 consecutive samples */
-	uint32_t t2_power_limit = power_limit * 2;
+	/* Doppler T2 throttler: 10 consecutive samples over its transient limit. */
+	uint32_t t2_power_limit = GetDopplerT2PowerLimit();
 
 	if (current_power > t2_power_limit) {
 		if (t2_count < UINT8_MAX) {
@@ -369,8 +397,8 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 
 	bool t2_triggered = t2_count >= 10 && doppler_t2;
 
-	/* Doppler T3 throttler: 2.5x power limit for 2 consecutive samples */
-	uint32_t t3_power_limit = power_limit * 5 / 2;
+	/* Doppler T3 throttler: 2 consecutive samples over its critical limit. */
+	uint32_t t3_power_limit = GetDopplerT3PowerLimit();
 
 	if (current_power > t3_power_limit) {
 		if (t3_count < UINT8_MAX) {
@@ -524,6 +552,7 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 	max_board_power_limit =
 		MIN(cable_power_limit,
 		    tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
+	strict_runtime_power_limit = false;
 	apply_board_power_limit(max_board_power_limit);
 
 	return 0;
@@ -548,6 +577,7 @@ static uint8_t set_board_power_limit_handler(const union request *request,
 	}
 
 	LOG_INF("Runtime board power limit: %u", new_power_limit);
+	strict_runtime_power_limit = !request->set_board_power_limit.restore_default;
 	apply_board_power_limit(new_power_limit);
 
 	return 0;
