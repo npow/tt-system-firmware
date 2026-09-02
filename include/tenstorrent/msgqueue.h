@@ -745,6 +745,27 @@ struct set_tdp_limit_rqst {
 	uint8_t restore_default: 1;
 };
 
+/** @brief Host request to set the total board input power limit
+ * @details Messages of this type are processed by @ref set_board_power_limit_handler.
+ *
+ * The requested limit is bounded by the board firmware table and the power-cable
+ * capability detected by DMC. The active value is reported by
+ * @ref TAG_BOARD_POWER_LIMIT.
+ */
+struct set_board_power_limit_rqst {
+	/** @brief The command code corresponding to @ref TT_SMC_MSG_SET_BOARD_POWER_LIMIT */
+	uint8_t command_code;
+
+	/** @brief Three bytes of padding */
+	uint8_t pad[3];
+
+	/** @brief Total board input power limit to set in watts */
+	uint32_t board_power_limit;
+
+	/** @brief Restore the cable- and board-specific default limit */
+	uint8_t restore_default: 1;
+};
+
 /** @brief Host request to report scratch-only status
  * @details Messages of this type are processed by @ref process_queued_message.
  * This is a command-only message with no payload fields.
@@ -1086,6 +1107,9 @@ union request {
 
 	/** @brief A set TDP limit request */
 	struct set_tdp_limit_rqst set_tdp_limit;
+
+	/** @brief A set total board input power limit request */
+	struct set_board_power_limit_rqst set_board_power_limit;
 
 	/** @brief An EEPROM read or write request */
 	struct eeprom_rqst eeprom;
