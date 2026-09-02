@@ -95,9 +95,9 @@ int32_t bh_force_safe_power_state(void)
 	power_state[BH_POWER_DOMAIN_AICLK] = false;
 	aiclk_update_busy();
 
-	/* Let MRISC place each GDDR PHY into its supported low-power state before
-	 * the hard tile clock gate. Even if this cooperative step fails, finish
-	 * the fail-closed transition below.
+	/* Let MRISC place each GDDR PHY into its supported low-power state. Keep
+	 * the NoC fabric active: ARC telemetry, fan control, and PCIe recovery all
+	 * depend on that fabric remaining responsive after the fault is latched.
 	 */
 	ret = set_mrisc_power_setting(false);
 	if (ret == 0) {
@@ -105,14 +105,6 @@ int32_t bh_force_safe_power_state(void)
 	} else if (first_error == 0) {
 		first_error = ret;
 	}
-
-	/* This is the same topology used by cable-fault mode: the NOC mesh and
-	 * physical column 15 stay alive for ARC/PCIe management, while compute,
-	 * GDDR, Ethernet, and other non-management tiles are clock-gated.
-	 */
-	SetNonManagementTilesClockGate(true);
-	power_state[BH_POWER_DOMAIN_MRISC] = false;
-	power_state[BH_POWER_DOMAIN_TENSIX] = false;
 
 	return first_error;
 }
@@ -125,7 +117,7 @@ static int32_t apply_power_settings(const struct power_setting_rqst *power_setti
 	 * request so no partial or legacy request can raise a gated domain.
 	 */
 	if (ThrottlerRuntimePowerFaultLatched()) {
-		LOG_ERR("Refusing to leave whole-board safety state before reset");
+		LOG_ERR("Refusing to leave low-power safety state before reset");
 		return -EPERM;
 	}
 

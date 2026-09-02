@@ -31,14 +31,14 @@ int32_t bh_set_l2cpu_enable(bool enable);
 int32_t bh_force_tensix_off(void);
 
 /**
- * @brief Enter a reset-latched whole-board low-power safety state.
+ * @brief Enter a reset-latched low-power safety state.
  *
- * Stops Tensix, powers down the GDDR PHYs, and clock-gates all tiles except
- * the ARC/PCIe management column so the host can inspect and reset the card.
+ * Stops Tensix and asks each GDDR PHY to enter its supported power-down state.
+ * ARC, PCIe, telemetry, and fan control remain active so the host can inspect
+ * and reset the card.
  *
  * @retval 0 On success
- * @retval negative errno if a graceful power-down step failed; the final
- *         hardware clock gate is still applied
+ * @retval negative errno if a power-down step failed
  */
 int32_t bh_force_safe_power_state(void);
 

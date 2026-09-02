@@ -420,7 +420,7 @@ static void UpdateRuntimePowerFailSafe(uint16_t current_power)
 	LOG_ERR("Runtime board-power fail-safe tripped at %u W (limit %u W)", current_power,
 		power_limit);
 	if (bh_force_safe_power_state() != 0) {
-		LOG_ERR("A graceful power-down step failed; whole-board clock gate applied");
+		LOG_ERR("Failed to power down one or more domains after runtime board-power fault");
 	}
 }
 
