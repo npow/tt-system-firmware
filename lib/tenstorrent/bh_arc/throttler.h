@@ -25,6 +25,7 @@ uint32_t ThrottlerGetDopplerT2PowerLimit(void);
 uint32_t ThrottlerGetDopplerT3PowerLimit(void);
 uint32_t ThrottlerGetRuntimePowerFailSafeLimit(void);
 uint32_t ThrottlerGetDopplerSlowAiclkLimit(void);
+bool ThrottlerTestRuntimePowerFailSafeEligible(uint16_t current_power, uint32_t aiclk_targ);
 bool ThrottlerTestUpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint32_t now_ms);
 void ThrottlerTestResetRuntimePowerGuard(void);
 #endif

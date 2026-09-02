@@ -113,6 +113,9 @@ ZTEST(throttler, test_runtime_power_guard_requires_sustained_overage)
 	set_dmc_board_power_limit(300);
 	zassert_equal(set_board_power_limit(100, false), 0);
 	zassert_equal(ThrottlerGetRuntimePowerFailSafeLimit(), 110);
+	zassert_false(ThrottlerTestRuntimePowerFailSafeEligible(110, GetAiclkFmin()));
+	zassert_true(ThrottlerTestRuntimePowerFailSafeEligible(111, GetAiclkFmin()));
+	zassert_false(ThrottlerTestRuntimePowerFailSafeEligible(160, GetAiclkFmin() + 1));
 
 	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1000));
 	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1099));

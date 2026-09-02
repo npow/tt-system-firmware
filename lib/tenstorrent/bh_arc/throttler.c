@@ -380,6 +380,16 @@ static uint32_t GetRuntimePowerFailSafeLimit(void)
 	return power_limit * (100U + RUNTIME_POWER_FAILSAFE_MARGIN_PERCENT) / 100U;
 }
 
+static bool RuntimePowerFailSafeEligible(uint16_t current_power, uint32_t aiclk_targ)
+{
+	/* This constrains total board input power, not only active compute power.
+	 * An initialized or idle GDDR subsystem can exceed a low host cap without
+	 * Tensix or kernel NOPs being active, so neither is a prerequisite here.
+	 */
+	return strict_runtime_power_limit && aiclk_targ == GetAiclkFmin() &&
+	       current_power > GetRuntimePowerFailSafeLimit();
+}
+
 static bool UpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint32_t now_ms)
 {
 	if (runtime_power_fault_latched) {
@@ -409,9 +419,7 @@ static bool UpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint3
 
 static void UpdateRuntimePowerFailSafe(uint16_t current_power)
 {
-	bool eligible = strict_runtime_power_limit && tensixes_enabled && kernel_nops_enabled &&
-			GetAiclkTarg() == GetAiclkFmin() &&
-			current_power > GetRuntimePowerFailSafeLimit();
+	bool eligible = RuntimePowerFailSafeEligible(current_power, GetAiclkTarg());
 
 	if (!UpdateRuntimePowerGuard(eligible, current_power, k_uptime_get_32())) {
 		return;
@@ -443,6 +451,11 @@ uint32_t ThrottlerGetRuntimePowerFailSafeLimit(void)
 uint32_t ThrottlerGetDopplerSlowAiclkLimit(void)
 {
 	return GetThrottlerArbMax(throttler[kThrottlerDopplerSlow].arb_max);
+}
+
+bool ThrottlerTestRuntimePowerFailSafeEligible(uint16_t current_power, uint32_t aiclk_targ)
+{
+	return RuntimePowerFailSafeEligible(current_power, aiclk_targ);
 }
 
 bool ThrottlerTestUpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint32_t now_ms)
