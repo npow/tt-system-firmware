@@ -231,6 +231,29 @@ void SetSingleTileClockGate(uint8_t noc0_x, uint8_t noc0_y, bool gate)
 	WriteNocCfgReg(noc_regs, NIU_CFG_0, niu_cfg_0);
 }
 
+void SetNonManagementTilesClockGate(bool gate)
+{
+	for (uint8_t py = 0; py < NOC_Y_SIZE; py++) {
+		for (uint8_t px = 0; px < NOC_X_SIZE; px++) {
+			/* Physical column 15 contains the ARC and PCIe endpoint. Keeping
+			 * it active preserves the host control and telemetry path.
+			 */
+			if (px == 15) {
+				continue;
+			}
+
+			for (uint8_t noc_id = 0; noc_id < NUM_NOCS; noc_id++) {
+				volatile uint32_t *noc_regs =
+					SetupNiuTlbPhys(kTlbIndex, px, py, noc_id);
+				uint32_t niu_cfg_0 = ReadNocCfgReg(noc_regs, NIU_CFG_0);
+
+				WRITE_BIT(niu_cfg_0, NIU_CFG_0_TILE_CLK_OFF, gate);
+				WriteNocCfgReg(noc_regs, NIU_CFG_0, niu_cfg_0);
+			}
+		}
+	}
+}
+
 int NocInit(void)
 {
 	if (IS_ENABLED(CONFIG_TT_SMC_RECOVERY) || !IS_ENABLED(CONFIG_ARC)) {

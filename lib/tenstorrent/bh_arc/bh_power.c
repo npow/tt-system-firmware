@@ -84,9 +84,50 @@ int32_t bh_force_tensix_off(void)
 	return ret;
 }
 
+int32_t bh_force_safe_power_state(void)
+{
+	int32_t first_error = bh_force_tensix_off();
+	int32_t ret;
+
+	/* Stop asking PPM for the busy AICLK floor before removing the memory
+	 * domain. The strict power arbiter remains at Fmin independently.
+	 */
+	power_state[BH_POWER_DOMAIN_AICLK] = false;
+	aiclk_update_busy();
+
+	/* Let MRISC place each GDDR PHY into its supported low-power state before
+	 * the hard tile clock gate. Even if this cooperative step fails, finish
+	 * the fail-closed transition below.
+	 */
+	ret = set_mrisc_power_setting(false);
+	if (ret == 0) {
+		power_state[BH_POWER_DOMAIN_MRISC] = false;
+	} else if (first_error == 0) {
+		first_error = ret;
+	}
+
+	/* This is the same topology used by cable-fault mode: the NOC mesh and
+	 * physical column 15 stay alive for ARC/PCIe management, while compute,
+	 * GDDR, Ethernet, and other non-management tiles are clock-gated.
+	 */
+	SetNonManagementTilesClockGate(true);
+	power_state[BH_POWER_DOMAIN_MRISC] = false;
+	power_state[BH_POWER_DOMAIN_TENSIX] = false;
+
+	return first_error;
+}
+
 static int32_t apply_power_settings(const struct power_setting_rqst *power_setting)
 {
 	int32_t ret = 0;
+
+	/* The hardware safety state is reset-latched. Reject every power-setting
+	 * request so no partial or legacy request can raise a gated domain.
+	 */
+	if (ThrottlerRuntimePowerFaultLatched()) {
+		LOG_ERR("Refusing to leave whole-board safety state before reset");
+		return -EPERM;
+	}
 
 	if (power_setting->power_flags_valid > BH_POWER_DOMAIN_AICLK) {
 		power_state[BH_POWER_DOMAIN_AICLK] = power_setting->power_flags_bitfield.max_ai_clk;
@@ -95,16 +136,6 @@ static int32_t apply_power_settings(const struct power_setting_rqst *power_setti
 
 	if (power_setting->power_flags_valid > BH_POWER_DOMAIN_TENSIX) {
 		bool enable = power_setting->power_flags_bitfield.tensix_enable;
-
-		/* A runtime board-power fault is deliberately reset-latched. Do not
-		 * allow a new or legacy client to undo the safety clock gate merely by
-		 * opening the device and requesting its normal high-power state.
-		 */
-		if (enable && ThrottlerRuntimePowerFaultLatched()) {
-			LOG_ERR("Refusing to enable Tensix after runtime board-power fault");
-			(void)bh_force_tensix_off();
-			return -EPERM;
-		}
 
 		if (enable) {
 			ret = set_tensix_enable(true);

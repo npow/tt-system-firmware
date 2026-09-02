@@ -10,6 +10,7 @@
 #include "aiclk_ppm.h"
 #include "telemetry.h"
 #include "throttler.h"
+#include <tenstorrent/bh_power.h>
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/smc_msg.h>
 
@@ -35,6 +36,25 @@ static void set_dmc_board_power_limit(uint16_t watts)
 
 	sys_put_le16(watts, data);
 	zassert_ok(Dm2CmSetBoardPowerLimit(data, sizeof(data)));
+}
+
+static uint8_t request_full_power_state(void)
+{
+	union request req = {0};
+	struct response rsp = {0};
+
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	req.power_setting.power_flags_bitfield.max_ai_clk = 1;
+	req.power_setting.power_flags_bitfield.mrisc_phy_power = 1;
+	req.power_setting.power_flags_bitfield.tensix_enable = 1;
+	req.power_setting.power_flags_bitfield.l2cpu_enable = 1;
+
+	zassert_ok(msgqueue_request_push(0, &req));
+	process_message_queues();
+	zassert_ok(msgqueue_response_pop(0, &rsp));
+
+	return rsp.data[0];
 }
 
 ZTEST(throttler, test_set_board_power_limit)
@@ -101,6 +121,7 @@ ZTEST(throttler, test_runtime_power_guard_requires_sustained_overage)
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT), (160U << 16U) | 1U);
 	zassert_equal(set_board_power_limit(100, false), 2);
+	zassert_equal(request_full_power_state(), 1);
 
 	ThrottlerTestResetRuntimePowerGuard();
 }
