@@ -19,4 +19,9 @@ uint32_t GetNOPOnAccumulatedTime(void);
 /* ms NOP was on during the last telemetry update window, clamped to window_ms */
 uint32_t GetNOPOnDuration(uint32_t window_ms);
 
+#if defined(CONFIG_ZTEST)
+uint32_t ThrottlerGetDopplerT2PowerLimit(void);
+uint32_t ThrottlerGetDopplerT3PowerLimit(void);
+#endif
+
 #endif
