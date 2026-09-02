@@ -20,6 +20,17 @@ enum bh_power_domain {
 int32_t bh_set_l2cpu_enable(bool enable);
 
 /**
+ * @brief Assert reset and clock-gate every Tensix core.
+ *
+ * This is also used by the runtime board-power fail-safe, which must be able
+ * to stop non-cooperative kernels without disabling the ARC/PCIe control path.
+ *
+ * @retval 0 On success
+ * @retval negative errno On failure
+ */
+int32_t bh_force_tensix_off(void);
+
+/**
  * @brief Returns the power state of the specified domain
  *
  * @param[out] state True if power state is high (busy for AICLK),

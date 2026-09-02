@@ -7,6 +7,7 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/ztest.h>
 
+#include "aiclk_ppm.h"
 #include "telemetry.h"
 #include "throttler.h"
 #include <tenstorrent/msgqueue.h>
@@ -44,6 +45,7 @@ ZTEST(throttler, test_set_board_power_limit)
 	zassert_equal(GetTelemetryTag(TAG_BOARD_POWER_LIMIT), 225);
 	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 247);
 	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 270);
+	zassert_equal(ThrottlerGetDopplerSlowAiclkLimit(), GetAiclkFmin());
 }
 
 ZTEST(throttler, test_reject_board_power_limit_above_board_maximum)
@@ -83,6 +85,37 @@ ZTEST(throttler, test_runtime_board_power_limit_tightens_transient_thresholds)
 	zassert_equal(set_board_power_limit(150, false), 0);
 	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 165);
 	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 180);
+}
+
+ZTEST(throttler, test_runtime_power_guard_requires_sustained_overage)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+	zassert_equal(set_board_power_limit(100, false), 0);
+	zassert_equal(ThrottlerGetRuntimePowerFailSafeLimit(), 110);
+
+	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1000));
+	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1099));
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1100));
+	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT), (160U << 16U) | 1U);
+	zassert_equal(set_board_power_limit(100, false), 2);
+
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_runtime_power_guard_resets_dwell_after_recovery)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+
+	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1000));
+	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(false, 100, 1099));
+	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1100));
+	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1199));
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+
+	ThrottlerTestResetRuntimePowerGuard();
 }
 
 ZTEST_SUITE(throttler, NULL, NULL, NULL, NULL, NULL);

@@ -18,10 +18,15 @@ uint32_t GetStartNOPCount(void);
 uint32_t GetNOPOnAccumulatedTime(void);
 /* ms NOP was on during the last telemetry update window, clamped to window_ms */
 uint32_t GetNOPOnDuration(uint32_t window_ms);
+bool ThrottlerRuntimePowerFaultLatched(void);
 
 #if defined(CONFIG_ZTEST)
 uint32_t ThrottlerGetDopplerT2PowerLimit(void);
 uint32_t ThrottlerGetDopplerT3PowerLimit(void);
+uint32_t ThrottlerGetRuntimePowerFailSafeLimit(void);
+uint32_t ThrottlerGetDopplerSlowAiclkLimit(void);
+bool ThrottlerTestUpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint32_t now_ms);
+void ThrottlerTestResetRuntimePowerGuard(void);
 #endif
 
 #endif

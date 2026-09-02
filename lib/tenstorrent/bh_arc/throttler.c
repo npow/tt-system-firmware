@@ -19,10 +19,14 @@
 #include "telemetry.h"
 #include "noc2axi.h"
 #include "tensix_state_msg.h"
+#include <tenstorrent/bh_power.h>
 
 static uint32_t power_limit;
 static uint32_t max_board_power_limit;
 static bool strict_runtime_power_limit;
+static bool runtime_power_guard_tracking;
+static uint32_t runtime_power_guard_started_ms;
+static bool runtime_power_fault_latched;
 
 static bool doppler;
 static bool doppler_slow;
@@ -39,8 +43,10 @@ static const bool thermal_throttling = true;
 static uint32_t kernel_throttler_stop_nops_freq;
 static uint32_t kernel_throttler_stop_nops_freq_default;
 
-#define kThrottlerAiclkScaleFactor 500.0F
-#define DEFAULT_BOARD_POWER_LIMIT  150
+#define kThrottlerAiclkScaleFactor            500.0F
+#define DEFAULT_BOARD_POWER_LIMIT             150
+#define RUNTIME_POWER_FAILSAFE_MARGIN_PERCENT 10U
+#define RUNTIME_POWER_FAILSAFE_DWELL_MS       100U
 
 LOG_MODULE_REGISTER(throttler);
 
@@ -249,6 +255,10 @@ void InitThrottlers(void)
 	doppler_slow = doppler;
 	doppler_t2 = doppler;
 	doppler_t3 = doppler;
+	runtime_power_guard_tracking = false;
+	runtime_power_guard_started_ms = 0;
+	runtime_power_fault_latched = false;
+	UpdateTelemetryRuntimePowerFault(false, 0);
 
 	kernel_throttler_stop_nops_freq_default =
 		tt_bh_fwtable_get_fw_table(fwtable_dev)
@@ -365,6 +375,55 @@ static uint32_t GetDopplerT3PowerLimit(void)
 	return strict_runtime_power_limit ? power_limit * 6U / 5U : power_limit * 5U / 2U;
 }
 
+static uint32_t GetRuntimePowerFailSafeLimit(void)
+{
+	return power_limit * (100U + RUNTIME_POWER_FAILSAFE_MARGIN_PERCENT) / 100U;
+}
+
+static bool UpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint32_t now_ms)
+{
+	if (runtime_power_fault_latched) {
+		return false;
+	}
+
+	if (!eligible) {
+		runtime_power_guard_tracking = false;
+		return false;
+	}
+
+	if (!runtime_power_guard_tracking) {
+		runtime_power_guard_tracking = true;
+		runtime_power_guard_started_ms = now_ms;
+		return false;
+	}
+
+	if ((uint32_t)(now_ms - runtime_power_guard_started_ms) < RUNTIME_POWER_FAILSAFE_DWELL_MS) {
+		return false;
+	}
+
+	runtime_power_guard_tracking = false;
+	runtime_power_fault_latched = true;
+	UpdateTelemetryRuntimePowerFault(true, current_power);
+	return true;
+}
+
+static void UpdateRuntimePowerFailSafe(uint16_t current_power)
+{
+	bool eligible = strict_runtime_power_limit && tensixes_enabled && kernel_nops_enabled &&
+			GetAiclkTarg() == GetAiclkFmin() &&
+			current_power > GetRuntimePowerFailSafeLimit();
+
+	if (!UpdateRuntimePowerGuard(eligible, current_power, k_uptime_get_32())) {
+		return;
+	}
+
+	LOG_ERR("Runtime board-power fail-safe tripped at %u W (limit %u W)", current_power,
+		power_limit);
+	if (bh_force_tensix_off() != 0) {
+		LOG_ERR("Failed to clock-gate Tensix after runtime board-power fault");
+	}
+}
+
 #if defined(CONFIG_ZTEST)
 uint32_t ThrottlerGetDopplerT2PowerLimit(void)
 {
@@ -374,6 +433,29 @@ uint32_t ThrottlerGetDopplerT2PowerLimit(void)
 uint32_t ThrottlerGetDopplerT3PowerLimit(void)
 {
 	return GetDopplerT3PowerLimit();
+}
+
+uint32_t ThrottlerGetRuntimePowerFailSafeLimit(void)
+{
+	return GetRuntimePowerFailSafeLimit();
+}
+
+uint32_t ThrottlerGetDopplerSlowAiclkLimit(void)
+{
+	return GetThrottlerArbMax(throttler[kThrottlerDopplerSlow].arb_max);
+}
+
+bool ThrottlerTestUpdateRuntimePowerGuard(bool eligible, uint16_t current_power, uint32_t now_ms)
+{
+	return UpdateRuntimePowerGuard(eligible, current_power, now_ms);
+}
+
+void ThrottlerTestResetRuntimePowerGuard(void)
+{
+	runtime_power_guard_tracking = false;
+	runtime_power_guard_started_ms = 0;
+	runtime_power_fault_latched = false;
+	UpdateTelemetryRuntimePowerFault(false, 0);
 }
 #endif
 
@@ -425,6 +507,7 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 	}
 
 	EnableArbMax(aiclk_arb_max_doppler_critical, critical_throttling);
+	UpdateRuntimePowerFailSafe(current_power);
 }
 
 /* Update kernel throttler NOPs state when running at the AICLK floor.
@@ -492,6 +575,11 @@ void CalculateThrottlers(void)
 	}
 }
 
+bool ThrottlerRuntimePowerFaultLatched(void)
+{
+	return runtime_power_fault_latched;
+}
+
 uint8_t ThrottlerSetKernelThrottlerEnabled(uint32_t enabled)
 {
 	if (enabled > 1) {
@@ -553,6 +641,7 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 		MIN(cable_power_limit,
 		    tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
 	strict_runtime_power_limit = false;
+	runtime_power_guard_tracking = false;
 	apply_board_power_limit(max_board_power_limit);
 
 	return 0;
@@ -567,6 +656,14 @@ static uint8_t set_board_power_limit_handler(const union request *request,
 					   ? max_board_power_limit
 					   : request->set_board_power_limit.board_power_limit;
 
+	/* The fail-safe deliberately requires an ASIC reset. Accepting another
+	 * limit here would suggest the card is ready to run even though Tensix is
+	 * still held reset and clock-gated.
+	 */
+	if (runtime_power_fault_latched) {
+		return 2;
+	}
+
 	/* Do not allow the host to exceed the cable/board limit or the controller's
 	 * supported range. The DMC initializes max_board_power_limit before the host
 	 * can issue runtime requests; a zero maximum therefore remains invalid.
@@ -578,7 +675,16 @@ static uint8_t set_board_power_limit_handler(const union request *request,
 
 	LOG_INF("Runtime board power limit: %u", new_power_limit);
 	strict_runtime_power_limit = !request->set_board_power_limit.restore_default;
+	runtime_power_guard_tracking = false;
 	apply_board_power_limit(new_power_limit);
+
+	/* A host-requested limit is a safety constraint. Begin at the AICLK floor
+	 * and let the closed-loop controller ramp upward instead of waiting for an
+	 * over-limit sample before it reacts.
+	 */
+	if (strict_runtime_power_limit) {
+		SetAiclkArbMax(throttler[kThrottlerDopplerSlow].arb_max, GetAiclkFmin());
+	}
 
 	return 0;
 }

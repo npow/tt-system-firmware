@@ -473,12 +473,21 @@ typedef union {
  */
 #define TAG_FW_ACTIVE_CONFIG_0 79
 
+/** @brief Latched runtime board-power fail-safe status.
+ *
+ * Bit 0 is set after a host-requested board-power limit could not be met at
+ * minimum AICLK while kernel NOP throttling was active. Bits [31:16] contain
+ * the board-input power sample, in watts, that caused the fail-safe to trip.
+ * The latch is cleared only by an ASIC reset.
+ */
+#define TAG_RUNTIME_POWER_FAULT 80
+
 /** @} */ /* end of telemetry_tag group */
 
 /* Not a real tag, signifies the last tag in the list.
  * MUST be incremented if new tags are defined.
  */
-#define TAG_COUNT 80
+#define TAG_COUNT 81
 
 /* Telemetry tags are at offset `tag` in the telemetry buffer */
 #define TELEM_OFFSET(tag) (tag)
@@ -494,6 +503,7 @@ void UpdateTelemetryTdpLimit(uint32_t tdp_limit);
 void UpdateTelemetryThermTripCount(uint16_t therm_trip_count);
 void UpdateTelemetryHostAiclkLimit(uint32_t fmax);
 void UpdateTelemetryKernelThrottler(bool enabled, uint32_t stop_nops_freq);
+void UpdateTelemetryRuntimePowerFault(bool latched, uint16_t input_power);
 /** @brief Get the current active firmware feature bits from @ref TAG_FW_ACTIVE_CONFIG_0.
  * @ingroup telemetry_feature_capabilities
  *
