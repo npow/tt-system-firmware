@@ -21,6 +21,8 @@
 #include "tensix_state_msg.h"
 
 static uint32_t power_limit;
+static uint32_t max_board_power_limit;
+static bool strict_runtime_power_limit;
 
 static bool doppler;
 static bool doppler_slow;
@@ -163,6 +165,14 @@ static void SetThrottlerLimit(ThrottlerId id, float limit)
 
 	LOG_INF("Throttler %d limit set to %d", id, (uint32_t)clamped_limit);
 	throttler[id].limit = clamped_limit;
+}
+
+static void apply_board_power_limit(uint32_t new_power_limit)
+{
+	power_limit = new_power_limit;
+	SetThrottlerLimit(kThrottlerBoardPower, power_limit);
+	SetThrottlerLimit(kThrottlerDopplerSlow, power_limit);
+	UpdateTelemetryBoardPowerLimit(power_limit);
 }
 
 static uint32_t throttle_counter;
@@ -340,6 +350,37 @@ static bool DopplerActive(void)
 	return doppler && power_limit > 0;
 }
 
+static uint32_t GetDopplerT2PowerLimit(void)
+{
+	/* Preserve the board-qualified transient envelope at the DMC-provided
+	 * default. A host-requested limit is a system safety constraint, so begin
+	 * critical throttling as soon as input power exceeds it.
+	 */
+	return strict_runtime_power_limit ? power_limit : power_limit * 2U;
+}
+
+static uint32_t GetDopplerT3PowerLimit(void)
+{
+	return strict_runtime_power_limit ? power_limit * 21U / 20U : power_limit * 5U / 2U;
+}
+
+#if defined(CONFIG_ZTEST)
+uint32_t ThrottlerGetDopplerT2PowerLimit(void)
+{
+	return GetDopplerT2PowerLimit();
+}
+
+uint32_t ThrottlerGetDopplerT3PowerLimit(void)
+{
+	return GetDopplerT3PowerLimit();
+}
+
+uint32_t ThrottlerGetDopplerSlowAiclkLimit(void)
+{
+	return GetThrottlerArbMax(throttler[kThrottlerDopplerSlow].arb_max);
+}
+#endif
+
 static void UpdateDoppler(const TelemetryInternalData *telemetry)
 {
 	uint16_t current_power = GetInputPower();
@@ -347,8 +388,8 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 
 	UpdateThrottler(kThrottlerDopplerSlow, average_power);
 
-	/* Doppler T2 throttler: 2x power limit for 10 consecutive samples */
-	uint32_t t2_power_limit = power_limit * 2;
+	/* Doppler T2 throttler: 10 consecutive samples over its transient limit. */
+	uint32_t t2_power_limit = GetDopplerT2PowerLimit();
 
 	if (current_power > t2_power_limit) {
 		if (t2_count < UINT8_MAX) {
@@ -360,8 +401,8 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 
 	bool t2_triggered = t2_count >= 10 && doppler_t2;
 
-	/* Doppler T3 throttler: 2.5x power limit for 2 consecutive samples */
-	uint32_t t3_power_limit = power_limit * 5 / 2;
+	/* Doppler T3 throttler: 2 consecutive samples over its critical limit. */
+	uint32_t t3_power_limit = GetDopplerT3PowerLimit();
 
 	if (current_power > t3_power_limit) {
 		if (t3_count < UINT8_MAX) {
@@ -509,16 +550,46 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 		return -1;
 	}
 
-	power_limit = sys_get_le16(data);
+	uint32_t cable_power_limit = sys_get_le16(data);
 
-	LOG_INF("Cable Power Limit: %u", power_limit);
-	power_limit = MIN(power_limit,
-			  tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
+	LOG_INF("Cable Power Limit: %u", cable_power_limit);
+	max_board_power_limit =
+		MIN(cable_power_limit,
+		    tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
+	strict_runtime_power_limit = false;
+	apply_board_power_limit(max_board_power_limit);
 
-	SetThrottlerLimit(kThrottlerBoardPower, power_limit);
-	SetThrottlerLimit(kThrottlerDopplerSlow, power_limit);
+	return 0;
+}
 
-	UpdateTelemetryBoardPowerLimit(power_limit);
+static uint8_t set_board_power_limit_handler(const union request *request,
+					     struct response *response)
+{
+	ARG_UNUSED(response);
+
+	uint32_t new_power_limit = request->set_board_power_limit.restore_default
+					   ? max_board_power_limit
+					   : request->set_board_power_limit.board_power_limit;
+
+	/* Do not allow the host to exceed the cable/board limit or the controller's
+	 * supported range. The DMC initializes max_board_power_limit before the host
+	 * can issue runtime requests; a zero maximum therefore remains invalid.
+	 */
+	if (new_power_limit > max_board_power_limit ||
+	    get_throttler_clamped_limit(kThrottlerBoardPower, new_power_limit) != new_power_limit) {
+		return 1;
+	}
+
+	LOG_INF("Runtime board power limit: %u", new_power_limit);
+	strict_runtime_power_limit = !request->set_board_power_limit.restore_default;
+	apply_board_power_limit(new_power_limit);
+
+	/* Begin a host-requested limit at the clock floor, then let the closed-loop
+	 * controller add performance after observing board input power.
+	 */
+	if (strict_runtime_power_limit) {
+		SetAiclkArbMax(throttler[kThrottlerDopplerSlow].arb_max, GetAiclkFmin());
+	}
 
 	return 0;
 }
@@ -600,3 +671,4 @@ uint32_t GetNOPOnDuration(uint32_t window_ms)
 }
 
 REGISTER_MESSAGE(TT_SMC_MSG_SET_TDP_LIMIT, set_tdp_limit_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_SET_BOARD_POWER_LIMIT, set_board_power_limit_handler);
