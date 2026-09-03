@@ -233,6 +233,16 @@ void CalculateTargAiclk(void)
 	aiclk_ppm.targ_freq =
 		ApplyPowerSlew(aiclk_ppm.curr_freq, aiclk_ppm.targ_freq, k_uptime_get_32());
 
+	/* A power fault can arrive from the DMC interrupt at any point in a DVFS
+	 * pass. Make the final published target fail-safe even if the throttler
+	 * calculation above started before the latch was set.
+	 */
+	if (ThrottlerRuntimePowerClampActive()) {
+		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
+		info.reason = limit_reason_max_arb;
+		info.arbiter = aiclk_arb_max_doppler_critical;
+	}
+
 	aiclk_ppm.lim_arb_info = info;
 	sys_trace_named_event("targ_freq_update", aiclk_ppm.targ_freq,
 			      aiclk_ppm.lim_arb_info.u32_all);
@@ -240,6 +250,9 @@ void CalculateTargAiclk(void)
 
 void DecreaseAiclk(void)
 {
+	if (ThrottlerRuntimePowerClampActive()) {
+		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
+	}
 	if (aiclk_ppm.targ_freq < aiclk_ppm.curr_freq) {
 		clock_control_set_rate(pll_dev_0,
 				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
@@ -251,6 +264,12 @@ void DecreaseAiclk(void)
 
 void IncreaseAiclk(void)
 {
+	/* Never commit a target calculated before an asynchronous power fault. */
+	if (ThrottlerRuntimePowerClampActive()) {
+		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
+		DecreaseAiclk();
+		return;
+	}
 	if (aiclk_ppm.targ_freq > aiclk_ppm.curr_freq) {
 		clock_control_set_rate(pll_dev_0,
 				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,

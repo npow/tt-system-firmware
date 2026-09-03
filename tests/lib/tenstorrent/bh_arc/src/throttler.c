@@ -9,7 +9,9 @@
 
 #include "aiclk_ppm.h"
 #include "cm2dm_msg.h"
+#include "init.h"
 #include "pcie.h"
+#include "reg_mock.h"
 #include "telemetry.h"
 #include "throttler.h"
 #include <tenstorrent/bh_power.h>
@@ -159,11 +161,58 @@ ZTEST(throttler, test_runtime_power_guard_trips_on_first_emergency_sample)
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
+ZTEST(throttler, test_runtime_power_latch_immediately_asserts_asic_risc_resets)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	RESET_FAKE(WriteReg);
+
+	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
+	zassert_equal(WriteReg_fake.call_count, 8U);
+	for (uint32_t i = 0; i < 8U; i++) {
+		zassert_equal(WriteReg_fake.arg0_history[i],
+			      RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + i * sizeof(uint32_t));
+		zassert_equal(WriteReg_fake.arg1_history[i], 0U);
+	}
+
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_input_power_addition_saturates_instead_of_wrapping)
+{
+	uint8_t power_data[2];
+
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+	sys_put_le16(UINT16_MAX, power_data);
+	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	zassert_equal(GetInputPower(), UINT16_MAX);
+	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) >> 16U, UINT16_MAX);
+
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
 ZTEST(throttler, test_latched_containment_cannot_release_kernel_nops)
 {
 	ThrottlerTestResetRuntimePowerGuard();
 	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
 	zassert_equal(ThrottlerSetKernelThrottlerEnabled(0), 2);
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_lowering_cap_checks_already_published_peak)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+	ThrottlerTestRecordInputPowerSampleAtPower(1000, 250);
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+
+	/* Tightening the cap must inspect the coherent current/peak snapshot; it
+	 * cannot wait for another DMC sample that may already be below the peak.
+	 */
+	zassert_equal(set_board_power_limit(225, false), 0);
+	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) >> 16U, 250U);
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
@@ -195,7 +244,7 @@ ZTEST(throttler, test_runtime_power_freshness_latches_when_sample_is_stale)
 	/* A valid sample arriving near the end of the post-reset allowance arms
 	 * the normal 10 ms stale-sample watchdog immediately.
 	 */
-	ThrottlerTestRecordInputPowerSample(199);
+	ThrottlerTestRecordInputPowerSampleAtPower(199, 100);
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) & 0xffU,
 		      RUNTIME_POWER_FAULT_STRICT_BIT | RUNTIME_POWER_FAULT_SAMPLE_FRESH_BIT |
 			      RUNTIME_POWER_FAULT_POLICY_READY_BIT);
@@ -215,7 +264,7 @@ ZTEST(throttler, test_runtime_power_freshness_accepts_valid_samples_and_wraps)
 	set_dmc_board_power_limit(300);
 	now_ms = k_uptime_get_32();
 	ThrottlerTestStartRuntimePowerSampleWatchdog(now_ms);
-	sys_put_le16(300, power_data);
+	sys_put_le16(100, power_data);
 	PcieTestResetErrorInterrupts();
 	zassert_false(PcieTestErrorInterruptsArmed());
 	zassert_equal(Dm2CmSendPowerHandler(power_data, 1), -1);
@@ -263,10 +312,128 @@ ZTEST(throttler, test_runtime_power_guard_stays_latched)
 	zassert_false(ThrottlerTestUpdateRuntimePowerGuard(true, 170, 1002));
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	/* Later sampling must retain the sample that originally latched the fault. */
-	ThrottlerTestRecordInputPowerSample(1003);
+	ThrottlerTestRecordInputPowerSampleAtPower(1003, 100);
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) >> 16U, 160U);
 
 	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_over_limit_sample_latches_before_dvfs_and_cannot_be_hidden)
+{
+	uint8_t power_data[2];
+	uint16_t trip_power;
+	uint16_t later_power;
+	union request req = {0};
+	struct response rsp = {0};
+	bool state;
+
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+	zassert_equal(request_full_power_state(), 0);
+
+	/* Queue a normal last-close/all-off request ahead of the DVFS worker. The
+	 * accepted DMC sample must latch synchronously, so processing this request
+	 * cannot remove a target after the limit was crossed.
+	 */
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	zassert_ok(msgqueue_request_push(0, &req));
+
+	/* The DMC callback can publish multiple samples before the cooperative
+	 * DVFS work item runs. The first over-limit sample must latch immediately,
+	 * and a later low value must not replace its fault provenance.
+	 */
+	sys_put_le16(301, power_data);
+	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	trip_power = GetInputPower();
+	sys_put_le16(100, power_data);
+	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	later_power = GetInputPower();
+
+	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(later_power < trip_power);
+	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) >> 16U, trip_power);
+	process_message_queues();
+	zassert_ok(msgqueue_response_pop(0, &rsp));
+	zassert_equal(rsp.data[0], 1);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_MRISC, &state));
+	zassert_true(state);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &state));
+	zassert_true(state);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_L2CPU, &state));
+	zassert_true(state);
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_runtime_power_peak_survives_newer_low_sample)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+
+	ThrottlerTestRecordInputPowerSampleAtPower(1000, 280);
+	ThrottlerTestRecordInputPowerSampleAtPower(1001, 100);
+	zassert_equal(GetInputPower(), 100);
+	zassert_equal(ThrottlerTestConsumeRuntimePowerPeak(), 280);
+	zassert_equal(ThrottlerTestConsumeRuntimePowerPeak(), 100);
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_exact_sample_publishes_fast_clamp_before_hard_limit)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+
+	ThrottlerTestRecordInputPowerSampleAtPower(1000, 269);
+	zassert_false(ThrottlerRuntimePowerClampActive());
+	ThrottlerTestRecordInputPowerSampleAtPower(1001, 270);
+	zassert_true(ThrottlerRuntimePowerClampActive());
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	CalculateTargAiclk();
+	zassert_equal(GetAiclkTarg(), GetAiclkFmin());
+	/* A newer low sample cannot erase the clamp until the retained peak was
+	 * consumed by DVFS. One later sample below the hysteretic release point
+	 * then permits normal arbitration to resume.
+	 */
+	ThrottlerTestRecordInputPowerSampleAtPower(1002, 100);
+	zassert_true(ThrottlerRuntimePowerClampActive());
+	zassert_equal(ThrottlerTestConsumeRuntimePowerPeak(), 270);
+	zassert_true(ThrottlerRuntimePowerClampActive());
+	ThrottlerTestRecordInputPowerSampleAtPower(1003, 100);
+	zassert_false(ThrottlerRuntimePowerClampActive());
+
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_strict_power_idle_keeps_pcie_targets_clocked)
+{
+	union request req = {0};
+	struct response rsp = {0};
+	bool state;
+
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+	zassert_equal(request_full_power_state(), 0);
+
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	/* Every power bit is zero: AICLK may idle, but strict policy must not
+	 * remove any PCIe-addressable Tensix, L2CPU, or GDDR/MRISC target.
+	 */
+	zassert_ok(msgqueue_request_push(0, &req));
+	process_message_queues();
+	zassert_ok(msgqueue_response_pop(0, &rsp));
+	zassert_equal(rsp.data[0], 0);
+
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_AICLK, &state));
+	zassert_false(state);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_MRISC, &state));
+	zassert_true(state);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &state));
+	zassert_true(state);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_L2CPU, &state));
+	zassert_true(state);
+
+	zassert_equal(request_full_power_state(), 0);
 }
 
 ZTEST(throttler, test_runtime_power_controller_uses_instantaneous_and_short_windows)
@@ -295,7 +462,7 @@ ZTEST(throttler, test_strict_policy_rejects_characterization_clock_raises)
 	union request req = {0};
 
 	set_dmc_board_power_limit(300);
-	ThrottlerTestRecordInputPowerSample(k_uptime_get_32());
+	ThrottlerTestRecordInputPowerSampleAtPower(k_uptime_get_32(), 100);
 
 	req.force_aiclk.command_code = TT_SMC_MSG_FORCE_AICLK;
 	req.force_aiclk.forced_freq = GetAiclkFmax();
@@ -310,6 +477,11 @@ ZTEST(throttler, test_strict_policy_rejects_characterization_clock_raises)
 	zassert_equal(request_aiclk_control(&req), 2);
 	req.force_aiclk.forced_freq = 0U;
 	zassert_ok(request_aiclk_control(&req));
+
+	req = (union request){0};
+	req.force_vdd.command_code = TT_SMC_MSG_FORCE_VDD;
+	req.force_vdd.forced_voltage = 800U;
+	zassert_equal(request_aiclk_control(&req), 2);
 
 	req = (union request){0};
 	req.aisweep.command_code = TT_SMC_MSG_AISWEEP_START;

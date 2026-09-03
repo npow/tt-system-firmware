@@ -13,7 +13,8 @@ void InitThrottlers(void);
 void CalculateThrottlers(void);
 int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size);
 /* Called only after CMFW has accepted a complete DMC input-power sample. */
-void ThrottlerRecordInputPowerSample(uint32_t now_ms);
+void ThrottlerRecordInputPowerSample(uint32_t now_ms, uint16_t input_power);
+uint16_t ThrottlerGetInputPower(void);
 uint8_t ThrottlerSetKernelThrottlerEnabled(uint32_t enabled);
 uint8_t ThrottlerSetKernelThrottlerStopFreq(uint32_t frequency);
 uint32_t GetStartNOPCount(void);
@@ -21,6 +22,10 @@ uint32_t GetNOPOnAccumulatedTime(void);
 /* ms NOP was on during the last telemetry update window, clamped to window_ms */
 uint32_t GetNOPOnDuration(uint32_t window_ms);
 bool ThrottlerRuntimePowerFaultLatched(void);
+/* True while retained DMC power requires an immediate Fmin commit, including
+ * the hysteretic 10%-headroom fast clamp before the hard reset-latched boundary.
+ */
+bool ThrottlerRuntimePowerClampActive(void);
 bool ThrottlerStrictRuntimePowerLimitActive(void);
 /* True only after throttler initialization and a later complete DMC sample. */
 bool ThrottlerRuntimePowerMonitorReady(void);
@@ -39,6 +44,8 @@ bool ThrottlerTestUpdateRuntimePowerGuard(bool eligible, uint16_t current_power,
 void ThrottlerTestResetRuntimePowerGuard(void);
 void ThrottlerTestStartRuntimePowerSampleWatchdog(uint32_t now_ms);
 void ThrottlerTestRecordInputPowerSample(uint32_t now_ms);
+void ThrottlerTestRecordInputPowerSampleAtPower(uint32_t now_ms, uint16_t input_power);
+uint16_t ThrottlerTestConsumeRuntimePowerPeak(void);
 void ThrottlerTestSetRuntimePowerMonitorInitialized(bool initialized);
 bool ThrottlerTestRuntimePowerSampleExpired(uint32_t now_ms);
 bool ThrottlerTestUpdateRuntimePowerFreshnessGuard(uint32_t now_ms);

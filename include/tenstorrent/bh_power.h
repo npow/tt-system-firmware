@@ -22,8 +22,8 @@ int32_t bh_set_l2cpu_enable(bool enable);
 /**
  * @brief Assert reset and clock-gate every Tensix core.
  *
- * This is also used by the runtime board-power fail-safe, which must be able
- * to stop non-cooperative kernels without disabling the ARC/PCIe control path.
+ * This is reserved for host-coordinated legacy power-down. Runtime board-power
+ * containment keeps every PCIe-addressable target clocked.
  *
  * @retval 0 On success
  * @retval negative errno On failure
@@ -33,10 +33,10 @@ int32_t bh_force_tensix_off(void);
 /**
  * @brief Enter a reset-latched low-power safety state.
  *
- * Holds the Tensix RISCs in soft reset and clamps AICLK without clock- or
- * power-gating any PCIe-addressable target. GDDR, L2CPU, ARC, PCIe, telemetry,
- * and fan control remain active so in-flight host transactions can complete
- * and the host can inspect and reset the card safely.
+ * Holds the Tensix compute engines and RISCs in soft reset and clamps AICLK
+ * without clock- or power-gating any PCIe-addressable target. GDDR, L2CPU, ARC,
+ * PCIe, telemetry, and fan control remain active so in-flight host transactions
+ * can complete and the host can inspect and reset the card safely.
  *
  * @retval 0 On success
  */

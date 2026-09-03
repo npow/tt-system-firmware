@@ -88,14 +88,14 @@ int32_t bh_force_safe_power_state(void)
 	 * trips; removing the destination clock turns those transactions into PCIe
 	 * Completion Timeouts and can make the root port contain the entire link.
 	 *
-	 * Holding every Tensix RISC in soft reset stops the untrusted workload while
-	 * leaving its register/L1 target and the NOC routers able to complete host
-	 * accesses.  The strict Doppler critical arbiter and kernel-NOP request own
-	 * the immediate power reduction; an explicit host reset performs any later
-	 * destructive domain transition after mappings have been revoked.
+	 * Holding every Tensix compute engine and RISC in soft reset stops the
+	 * untrusted workload while leaving its register/L1 target and the NOC routers
+	 * able to complete host accesses. The strict Doppler critical arbiter and
+	 * kernel-NOP request own the immediate power reduction; an explicit host reset
+	 * performs any later destructive domain transition after mappings are revoked.
 	 */
 	if (power_state[BH_POWER_DOMAIN_TENSIX]) {
-		bh_soft_reset_all_tensix();
+		bh_soft_reset_all_tensix_compute();
 		k_usleep(100);
 	}
 
@@ -128,12 +128,22 @@ static int32_t apply_power_settings(const struct power_setting_rqst *power_setti
 	if (power_setting->power_flags_valid > BH_POWER_DOMAIN_TENSIX) {
 		bool enable = power_setting->power_flags_bitfield.tensix_enable;
 
-		if (enable) {
+		if (enable && !power_state[BH_POWER_DOMAIN_TENSIX]) {
 			ret = set_tensix_enable(true);
 			if (ret == 0) {
 				power_state[BH_POWER_DOMAIN_TENSIX] = true;
 			}
-		} else {
+		} else if (!enable && (ThrottlerStrictRuntimePowerLimitActive() ||
+				       ThrottlerRuntimePowerFaultLatched())) {
+			/* A strict whole-board policy may receive an idle request while a
+			 * host mapping or non-posted transaction is still live. Stop the
+			 * workload, but keep the tile/NOC target clocked and reachable.
+			 */
+			if (power_state[BH_POWER_DOMAIN_TENSIX]) {
+				bh_soft_reset_all_tensix_compute();
+				k_usleep(100);
+			}
+		} else if (!enable && power_state[BH_POWER_DOMAIN_TENSIX]) {
 			ret = bh_force_tensix_off();
 		}
 
@@ -142,15 +152,38 @@ static int32_t apply_power_settings(const struct power_setting_rqst *power_setti
 		 */
 	}
 	if (power_setting->power_flags_valid > BH_POWER_DOMAIN_L2CPU) {
-		ret = bh_set_l2cpu_enable(power_setting->power_flags_bitfield.l2cpu_enable);
-		power_state[BH_POWER_DOMAIN_L2CPU] =
-			power_setting->power_flags_bitfield.l2cpu_enable;
+		bool enable = power_setting->power_flags_bitfield.l2cpu_enable;
+
+		if (enable != power_state[BH_POWER_DOMAIN_L2CPU] &&
+		    (enable || (!ThrottlerStrictRuntimePowerLimitActive() &&
+				!ThrottlerRuntimePowerFaultLatched()))) {
+			ret = bh_set_l2cpu_enable(enable);
+			if (ret == 0) {
+				power_state[BH_POWER_DOMAIN_L2CPU] = enable;
+			}
+		}
 	}
 
 	if (power_setting->power_flags_valid > BH_POWER_DOMAIN_MRISC) {
-		ret = set_mrisc_power_setting(power_setting->power_flags_bitfield.mrisc_phy_power);
-		power_state[BH_POWER_DOMAIN_MRISC] =
-			power_setting->power_flags_bitfield.mrisc_phy_power;
+		bool enable = power_setting->power_flags_bitfield.mrisc_phy_power;
+
+		if (enable != power_state[BH_POWER_DOMAIN_MRISC] &&
+		    (enable || (!ThrottlerStrictRuntimePowerLimitActive() &&
+				!ThrottlerRuntimePowerFaultLatched()))) {
+			ret = set_mrisc_power_setting(enable);
+			if (ret == 0) {
+				power_state[BH_POWER_DOMAIN_MRISC] = enable;
+			}
+		}
+	}
+
+	/* A PCIe error interrupt can latch asynchronously while safe domain-enable
+	 * work is in progress. Re-apply the non-destructive containment state before
+	 * returning so that transition cannot leave compute running above the cap.
+	 */
+	if (ThrottlerRuntimePowerFaultLatched()) {
+		(void)bh_force_safe_power_state();
+		return -EPERM;
 	}
 
 	return ret;

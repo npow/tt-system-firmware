@@ -72,6 +72,11 @@ static const uint8_t kNocRing;
 static const uint8_t kNocTlb;
 static const uint32_t kSoftReset0Addr = 0xFFB121B0; /* NOC address in each tile */
 static const uint32_t kAllRiscSoftReset = 0x47800;
+/* SOFT_RESET_0 bits 0-18 cover unpackers, packers, mover/search, glue/TDMA,
+ * thread control, FPU/SFPU, source/destination state, and all five RISCs.
+ * Bits 19-22 are redundant source-column resets while bit 10 is asserted.
+ */
+static const uint32_t kAllComputeSoftReset = 0x7FFFF;
 
 static bool RejectTensixRecoveryAfterPowerFault(struct response *rsp)
 {
@@ -102,12 +107,38 @@ bool bh_get_boot_cable_power_limit(uint16_t *power_limit)
 	return true;
 }
 
-void bh_soft_reset_all_tensix(void)
+void bh_assert_all_tensix_risc_resets(void)
+{
+	/* These reset inputs are active-low. Unlike SOFT_RESET_0, the registers
+	 * live on ARC's local APB path and do not consume a shared NOC TLB. Keep
+	 * this helper limited to direct writes so a power interrupt can use it.
+	 */
+	for (uint32_t i = 0; i < 8; i++) {
+		WriteReg(RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + i * sizeof(uint32_t), 0);
+	}
+}
+
+static void bh_soft_reset_all_tensix_mask(uint32_t reset_mask)
 {
 	/* Broadcast to SOFT_RESET_0 of all Tensixes */
 	/* Harvesting is handled by broadcast disables of NocInit */
 	NOC2AXITensixBroadcastTlbSetup(kNocRing, kNocTlb, kSoftReset0Addr, kNoc2AxiOrderingStrict);
-	NOC2AXIWrite32(kNocRing, kNocTlb, kSoftReset0Addr, kAllRiscSoftReset);
+	NOC2AXIWrite32(kNocRing, kNocTlb, kSoftReset0Addr, reset_mask);
+}
+
+void bh_soft_reset_all_tensix(void)
+{
+	bh_soft_reset_all_tensix_mask(kAllRiscSoftReset);
+}
+
+void bh_soft_reset_all_tensix_compute(void)
+{
+	/* Runtime containment is terminal until ASIC reset, so this whole-register
+	 * broadcast cannot race a legitimate deassert or lose live compute state.
+	 * It intentionally does not touch the NOC overlay, NIU, router, or tile
+	 * clock: those remain available to retire host transactions.
+	 */
+	bh_soft_reset_all_tensix_mask(kAllComputeSoftReset);
 }
 
 /* Assert soft reset for all RISC-V cores */

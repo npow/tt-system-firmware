@@ -12,6 +12,23 @@
 void bh_soft_reset_all_tensix(void);
 
 /**
+ * @brief Assert soft reset for every Tensix compute engine and RISC.
+ *
+ * This leaves the tile NOC endpoint and clock running, so outstanding host
+ * transactions can still complete while non-cooperative compute is stopped.
+ */
+void bh_soft_reset_all_tensix_compute(void);
+
+/**
+ * @brief Assert the ASIC-level reset input for every Tensix RISC.
+ *
+ * This path only writes ARC-local reset-unit registers, so it is safe from an
+ * interrupt handler. It stops RISC instruction issue without resetting the
+ * Tensix tiles or their NOC endpoints.
+ */
+void bh_assert_all_tensix_risc_resets(void);
+
+/**
  * @brief Check if the system is in cable fault mode
  *
  * Cable fault mode is entered when DMC reports 0W power limit (no cable or

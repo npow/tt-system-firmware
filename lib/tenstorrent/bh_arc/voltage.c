@@ -12,6 +12,7 @@
 #include "voltage.h"
 #include "regulator.h"
 #include "dvfs.h"
+#include "throttler.h"
 
 #define VDD_BOOT            750
 /* Bound checks for VDD_MAX and VDD_MIN (in mV) */
@@ -26,6 +27,14 @@ VoltageArbiter voltage_arbiter;
 
 void VoltageChange(void)
 {
+	/* A DMC fault can interrupt DVFS after it calculated a stale high-voltage
+	 * target. Holding the existing voltage is electrically safe until the next
+	 * pass recalculates the request for the already-clamped AICLK.
+	 */
+	if (ThrottlerRuntimePowerClampActive() &&
+	    voltage_arbiter.targ_voltage > voltage_arbiter.curr_voltage) {
+		return;
+	}
 	if (voltage_arbiter.targ_voltage != voltage_arbiter.curr_voltage) {
 		set_vcore(voltage_arbiter.targ_voltage);
 		voltage_arbiter.curr_voltage = voltage_arbiter.targ_voltage;
@@ -84,11 +93,20 @@ int InitVoltagePPM(void)
 	return 0;
 }
 
+void ClearVoltageCharacterizationOverride(void)
+{
+	voltage_arbiter.forced_voltage = 0;
+}
+
 uint8_t ForceVdd(uint32_t voltage)
 {
 	if ((voltage > voltage_arbiter.vdd_max || voltage < voltage_arbiter.vdd_min) &&
 	    (voltage != 0)) {
 		return 1;
+	}
+	if (ThrottlerRuntimePowerFaultLatched() ||
+	    (ThrottlerStrictRuntimePowerLimitActive() && voltage != 0U)) {
+		return 2;
 	}
 
 	if (dvfs_enabled) {

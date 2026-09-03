@@ -30,5 +30,6 @@ void VoltageArbRequest(VoltageRequestor req, uint32_t voltage);
 void CalculateTargVoltage(void);
 int InitVoltagePPM(void);
 uint8_t ForceVdd(uint32_t voltage);
+void ClearVoltageCharacterizationOverride(void);
 
 #endif
