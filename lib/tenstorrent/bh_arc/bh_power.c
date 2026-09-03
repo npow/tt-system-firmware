@@ -13,6 +13,7 @@
 #include <zephyr/drivers/clock_control/clock_control_tt_bh.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/__assert.h>
+#include <zephyr/sys/util.h>
 
 #include "noc_init.h"
 #include "aiclk_ppm.h"
@@ -32,29 +33,24 @@ static bool power_state[BH_POWER_DOMAIN_COUNT] = {
 
 int32_t bh_set_l2cpu_enable(bool enable)
 {
-	int32_t ret = 0;
+	static const enum clock_control_tt_bh_clock clocks[] = {
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0,
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_1,
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_2,
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_3,
+	};
+	int32_t first_error = 0;
 
-	if (enable) {
-		ret = clock_control_on(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0);
-		ret = clock_control_on(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_1);
-		ret = clock_control_on(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_2);
-		ret = clock_control_on(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_3);
-	} else {
-		ret = clock_control_off(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0);
-		ret = clock_control_off(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_1);
-		ret = clock_control_off(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_2);
-		ret = clock_control_off(
-			pll4, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_3);
+	ARRAY_FOR_EACH(clocks, i) {
+		int32_t ret = enable ? clock_control_on(pll4, (clock_control_subsys_t)clocks[i])
+				     : clock_control_off(pll4, (clock_control_subsys_t)clocks[i]);
+
+		if (ret != 0 && first_error == 0) {
+			first_error = ret;
+		}
 	}
 
-	return ret;
+	return first_error;
 }
 
 int bh_power_state_get(enum bh_power_domain domain, bool *state)
@@ -88,6 +84,17 @@ int32_t bh_force_safe_power_state(void)
 {
 	int32_t first_error = bh_force_tensix_off();
 	int32_t ret;
+
+	/* L2CPU is not part of the ARC/NoC/PCIe management path. Gate it as well
+	 * so an independent L2CPU workload cannot keep drawing power after the
+	 * whole-board limit has latched containment.
+	 */
+	ret = bh_set_l2cpu_enable(false);
+	if (ret == 0) {
+		power_state[BH_POWER_DOMAIN_L2CPU] = false;
+	} else if (first_error == 0) {
+		first_error = ret;
+	}
 
 	/* Stop asking PPM for the busy AICLK floor before removing the memory
 	 * domain. The strict power arbiter remains at Fmin independently.

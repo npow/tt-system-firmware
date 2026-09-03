@@ -7,6 +7,7 @@
 #include <zephyr/ztest.h>
 
 #include "aiclk_ppm.h"
+#include "throttler.h"
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/smc_msg.h>
 static uint32_t fmax;
@@ -25,6 +26,7 @@ static void *aiclk_ppm_setup(void)
 static void reset_arb(void *fixture)
 {
 	(void)fixture;
+	SetAiclkPowerSlew(false);
 
 	/* Reset all arbiter values and disable */
 	for (int i = 0; i < aiclk_arb_max_count; i++) {
@@ -37,7 +39,43 @@ static void reset_arb(void *fixture)
 	}
 }
 
-static void set_busy(bool busy)
+ZTEST(aiclk_ppm, test_power_slew_limits_increases_but_not_decreases)
+{
+	SetAiclkPowerSlew(true);
+
+	zassert_equal(AiclkTestApplyPowerSlew(800, 1350, 100),
+		      800 + AICLK_POWER_SLEW_UP_MHZ_PER_MS);
+	/* A second synchronous DVFSChange in the same tick cannot gain another
+	 * MHz. A later, delayed call makes one step rather than catching up.
+	 */
+	zassert_equal(AiclkTestApplyPowerSlew(801, 1350, 100), 801);
+	zassert_equal(AiclkTestApplyPowerSlew(801, 1350, 101), 802);
+	zassert_equal(AiclkTestApplyPowerSlew(802, 1350, 200), 803);
+	zassert_equal(AiclkTestApplyPowerSlew(1000, 900, 200), 900);
+	zassert_equal(AiclkTestApplyPowerSlew(1349, 1350, 201), 1350);
+
+	SetAiclkPowerSlew(false);
+	zassert_equal(AiclkTestApplyPowerSlew(800, 1350, 202), 1350);
+}
+
+ZTEST(aiclk_ppm, test_board_power_safety_max_overrides_forced_aiclk)
+{
+	uint32_t safety_max = fmin + 50U;
+
+	SetAiclkArbMax(aiclk_arb_max_doppler_slow, safety_max);
+	EnableArbMax(aiclk_arb_max_doppler_slow, true);
+	SetAiclkPowerSlew(true);
+
+	zassert_ok(ForceAiclk(fmax));
+	CalculateTargAiclk();
+	zassert_true(GetAiclkTarg() <= safety_max,
+		     "forced AICLK bypassed board-power safety maximum");
+
+	SetAiclkPowerSlew(false);
+	zassert_ok(ForceAiclk(0));
+}
+
+static uint8_t request_busy(bool busy)
 {
 	union request req = {0};
 	struct response rsp = {0};
@@ -47,7 +85,28 @@ static void set_busy(bool busy)
 	msgqueue_request_push(0, &req);
 	process_message_queues();
 	msgqueue_response_pop(0, &rsp);
-	zexpect_equal(rsp.data[0], 0);
+	return rsp.data[0];
+}
+
+static void set_busy(bool busy)
+{
+	zexpect_equal(request_busy(busy), 0);
+}
+
+ZTEST(aiclk_ppm, test_latched_containment_blocks_aiclk_raise_paths)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	SetAiclkResetSafe(true);
+	zassert_true(AiclkTestResetSafeEnabled());
+	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
+
+	zassert_equal(ForceAiclk(fmax), 2);
+	zassert_equal(request_busy(true), 2);
+	SetAiclkResetSafe(false);
+	zassert_true(AiclkTestResetSafeEnabled());
+
+	ThrottlerTestResetRuntimePowerGuard();
+	SetAiclkResetSafe(false);
 }
 
 static void reinit_arb(void *fixture)

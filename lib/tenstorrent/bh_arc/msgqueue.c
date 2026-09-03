@@ -320,14 +320,18 @@ static void process_queued_message(struct message_queue *queue, const union requ
 	}
 }
 
-/* Run all the outstanding messages in a single queue. */
-static void process_message_queue(struct message_queue *queue)
+/* Run at most max_messages outstanding messages in one queue. Return true
+ * when another request can be processed immediately after this batch.
+ */
+static bool process_message_queue_bounded(struct message_queue *queue, uint32_t max_messages,
+					  uint32_t *processed_out)
 {
-
 	uint32_t request_rptr;
 	uint32_t response_wptr;
+	uint32_t processed = 0;
 
-	while (start_next_message(queue, &request_rptr, &response_wptr)) {
+	while (processed < max_messages &&
+	       start_next_message(queue, &request_rptr, &response_wptr)) {
 		union request request = (union request){0};
 		struct response response = (struct response){0};
 
@@ -336,7 +340,40 @@ static void process_message_queue(struct message_queue *queue)
 		msgqueue_response_push(queue - message_queues, &response);
 
 		advance_serial(queue, &request);
+		processed++;
 	}
+
+	*processed_out = processed;
+	return start_next_message(queue, &request_rptr, &response_wptr);
+}
+
+static bool process_message_queues_bounded(uint32_t max_messages)
+{
+	bool more_messages = false;
+	uint32_t queue_start;
+	uint32_t processed = 0;
+	static uint32_t next_queue_start;
+
+	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_MSG_HANDLE_START);
+	queue_start = next_queue_start;
+	for (unsigned int offset = 0; offset < NUM_MSG_QUEUES && processed < max_messages;
+	     offset++) {
+		uint32_t queue_id = (queue_start + offset) % NUM_MSG_QUEUES;
+		uint32_t remaining = max_messages - processed;
+		uint32_t processed_in_queue;
+
+		SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARG_MSG_QUEUE_START + queue_id);
+		more_messages |= process_message_queue_bounded(&message_queues[queue_id], remaining,
+							       &processed_in_queue);
+		processed += processed_in_queue;
+	}
+	if (processed == max_messages && max_messages != UINT32_MAX) {
+		more_messages = true;
+	}
+	next_queue_start = (queue_start + 1U) % NUM_MSG_QUEUES;
+	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_MSG_HANDLE_DONE);
+
+	return more_messages;
 }
 
 void clear_msg_irq(void)
@@ -352,13 +389,15 @@ void clear_msg_irq(void)
 /* Run all messages in all queues. */
 void process_message_queues(void)
 {
-	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_MSG_HANDLE_START);
-	for (unsigned int i = 0; i < NUM_MSG_QUEUES; i++) {
-		SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARG_MSG_QUEUE_START + i);
-		process_message_queue(&message_queues[i]);
-	}
-	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_MSG_HANDLE_DONE);
+	(void)process_message_queues_bounded(UINT32_MAX);
 }
+
+#if defined(CONFIG_ZTEST)
+bool msgqueue_test_process_message_queues_bounded(uint32_t max_messages)
+{
+	return process_message_queues_bounded(max_messages);
+}
+#endif
 
 void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler)
 {
@@ -393,12 +432,22 @@ SYS_INIT_APP(register_interrupt_handlers);
 #endif
 
 #ifdef CONFIG_BOARD_TT_BLACKHOLE
+#define MSGQUEUE_MAX_MESSAGES_PER_WORK_RUN 2U
+
+static void msgqueue_work_handler(struct k_work *work);
+static K_WORK_DEFINE(msgqueue_work, msgqueue_work_handler);
+
 static void msgqueue_work_handler(struct k_work *work)
 {
-	process_message_queues();
+	ARG_UNUSED(work);
+	/* Host requests can arrive continuously while the ARC drains a queue. Bound
+	 * one work item and resubmit at the workqueue tail so the 1 ms DVFS/sample
+	 * freshness worker gets a turn on the cooperative system workqueue.
+	 */
+	if (process_message_queues_bounded(MSGQUEUE_MAX_MESSAGES_PER_WORK_RUN)) {
+		k_work_submit(&msgqueue_work);
+	}
 }
-
-static K_WORK_DEFINE(msgqueue_work, msgqueue_work_handler);
 
 static void msgqueue_interrupt_handler(void *arg)
 {

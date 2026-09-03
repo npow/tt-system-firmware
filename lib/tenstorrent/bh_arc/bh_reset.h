@@ -7,6 +7,7 @@
 #define BH_RESET
 
 #include <stdbool.h>
+#include <stdint.h>
 
 void bh_soft_reset_all_tensix(void);
 
@@ -21,5 +22,11 @@ void bh_soft_reset_all_tensix(void);
  * @return true if cable fault mode is active, false otherwise
  */
 bool is_cable_fault_mode(void);
+
+/* Returns the magic-qualified, non-zero DMC cable limit captured before ARC
+ * boot. This lets board-power policy be installed before the later SMBus
+ * initialization handshake.
+ */
+bool bh_get_boot_cable_power_limit(uint16_t *power_limit);
 
 #endif /*BH_RESET*/

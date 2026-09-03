@@ -12,6 +12,9 @@
 #include "gddr.h"
 #include "noc2axi.h"
 #include "reg_mock.h"
+#include "throttler.h"
+#include <tenstorrent/msgqueue.h>
+#include <tenstorrent/smc_msg.h>
 static const uint32_t mrisc_tlb = 13U;
 static const uint32_t mrisc_msg_reg = ARC_NOC0_BASE_ADDR + (mrisc_tlb << NOC_TLB_LOG_SIZE) +
 				      (MRISC_MSG_REGISTER & NOC_TLB_WINDOW_ADDR_MASK);
@@ -95,6 +98,21 @@ ZTEST(gddr, test_mrisc_power_off)
 		zexpect_equal(mrisc_msgs[i], MRISC_MSG_TYPE_PHY_POWERDOWN);
 	}
 	num_mrisc_msgs = 0U;
+}
+
+ZTEST(gddr, test_latched_containment_blocks_gddr_reset_wakeup)
+{
+	union request req = {0};
+	struct response rsp = {0};
+
+	ThrottlerTestResetRuntimePowerGuard();
+	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
+	req.gddr_reset.command_code = TT_SMC_MSG_TOGGLE_GDDR_RESET;
+	zassert_ok(msgqueue_request_push(0, &req));
+	process_message_queues();
+	zassert_ok(msgqueue_response_pop(0, &rsp));
+	zassert_equal(rsp.data[0], 2);
+	ThrottlerTestResetRuntimePowerGuard();
 }
 
 ZTEST_SUITE(gddr, NULL, NULL, NULL, NULL, NULL);

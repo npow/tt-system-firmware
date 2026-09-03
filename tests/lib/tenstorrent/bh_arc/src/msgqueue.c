@@ -17,6 +17,7 @@
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/tt_smbus_regs.h>
 #include <tenstorrent/bh_arc.h>
+#include <tenstorrent/bh_power.h>
 #include "asic_state.h"
 #include "clock_wave.h"
 #include "cm2dm_msg.h"
@@ -279,6 +280,38 @@ ZTEST(msgqueue, test_msgqueue_power_settings_cmd)
 		      CLOCK_CONTROL_STATUS_OFF);
 }
 
+ZTEST(msgqueue, test_runtime_safe_power_state_gates_all_l2cpu_clocks)
+{
+	static const enum clock_control_tt_bh_clock l2cpu_clocks[] = {
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0,
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_1,
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_2,
+		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_3,
+	};
+	const struct device *pll4 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(pll4));
+	bool l2cpu_enabled;
+
+	zassert_true(device_is_ready(pll4));
+	zassert_ok(bh_set_l2cpu_enable(true));
+	ARRAY_FOR_EACH(l2cpu_clocks, i) {
+		zassert_equal(
+			clock_control_get_status(pll4, (clock_control_subsys_t)l2cpu_clocks[i]),
+			CLOCK_CONTROL_STATUS_ON);
+	}
+
+	/* The containment routine must gate L2CPU even though it is independent
+	 * from the Tensix/MRISC path, while leaving management hardware intact.
+	 */
+	zassert_ok(bh_force_safe_power_state());
+	ARRAY_FOR_EACH(l2cpu_clocks, i) {
+		zassert_equal(
+			clock_control_get_status(pll4, (clock_control_subsys_t)l2cpu_clocks[i]),
+			CLOCK_CONTROL_STATUS_OFF);
+	}
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_L2CPU, &l2cpu_enabled));
+	zassert_false(l2cpu_enabled);
+}
+
 ZTEST(msgqueue, test_msgqueue_power_settings_with_go_busy)
 {
 	/* LSB to MSB:
@@ -524,6 +557,28 @@ ZTEST(msgqueue, test_msg_type_test)
 
 	push_msg_success();
 	zexpect_equal(rsp.data[1], 43); /* test_value + 1 */
+}
+
+ZTEST(msgqueue, test_message_work_batch_leaves_pending_requests_for_resubmit)
+{
+	union request request = {0};
+	struct response response = {0};
+
+	for (uint32_t i = 0; i < 3U; i++) {
+		request.test.command_code = TT_SMC_MSG_TEST;
+		request.test.test_value = i;
+		zassert_ok(msgqueue_request_push(0, &request));
+	}
+
+	zassert_true(msgqueue_test_process_message_queues_bounded(2U));
+	for (uint32_t i = 0; i < 2U; i++) {
+		zassert_ok(msgqueue_response_pop(0, &response));
+		zassert_equal(response.data[1], i + 1U);
+	}
+
+	zassert_false(msgqueue_test_process_message_queues_bounded(2U));
+	zassert_ok(msgqueue_response_pop(0, &response));
+	zassert_equal(response.data[1], 3U);
 }
 
 ZTEST(msgqueue, test_msg_type_asic_state)

@@ -6,6 +6,7 @@
 
 #include "chip_info.h"
 #include "cm2dm_msg.h"
+#include "throttler.h"
 #include "init.h"
 #include "irqnum.h"
 #include "noc2axi.h"
@@ -253,14 +254,31 @@ static void CntlInitV2ParamInit(uint8_t pcie_inst, uint64_t board_id, uint32_t v
 	};
 }
 
+#if CONFIG_ARC
+static void PcieErrorInterrupt(void *arg)
+{
+	uint32_t irq_num = POINTER_TO_UINT(arg);
+
+	/* Keep the management link alive after a PCIe error. A full ASIC reset can
+	 * vanish below the host transaction that reported the error and provoke a
+	 * platform reset; compute containment is safe for diagnosis and an explicit
+	 * host reset.
+	 */
+	irq_disable(irq_num);
+#ifndef CONFIG_TT_SMC_RECOVERY
+	ThrottlerRequestRuntimeContainment();
+#endif
+}
+#endif
+
 static void InitResetInterrupt(uint8_t pcie_inst)
 {
 #if CONFIG_ARC
 	if (pcie_inst == 0) {
-		IRQ_CONNECT(IRQNUM_PCIE0_ERR_INTR, 0, ChipResetRequest, IRQNUM_PCIE0_ERR_INTR, 0);
+		IRQ_CONNECT(IRQNUM_PCIE0_ERR_INTR, 0, PcieErrorInterrupt, IRQNUM_PCIE0_ERR_INTR, 0);
 		irq_enable(IRQNUM_PCIE0_ERR_INTR);
 	} else if (pcie_inst == 1) {
-		IRQ_CONNECT(IRQNUM_PCIE1_ERR_INTR, 0, ChipResetRequest, IRQNUM_PCIE1_ERR_INTR, 0);
+		IRQ_CONNECT(IRQNUM_PCIE1_ERR_INTR, 0, PcieErrorInterrupt, IRQNUM_PCIE1_ERR_INTR, 0);
 		irq_enable(IRQNUM_PCIE1_ERR_INTR);
 	}
 #else

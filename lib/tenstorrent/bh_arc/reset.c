@@ -20,6 +20,7 @@
 #include "tensix_init.h"
 #include "aiclk_ppm.h"
 #include "bh_reset.h"
+#include "throttler.h"
 
 #include <tenstorrent/bh_power.h>
 
@@ -64,15 +65,41 @@ void record_init_failure(enum init_stage_id stage)
  * power draw, while maintaining the full NOC mesh and ARC-PCIe path for host communication.
  */
 static bool cable_fault_mode;
+static bool boot_cable_power_limit_valid;
+static uint16_t boot_cable_power_limit;
 
 static const uint8_t kNocRing;
 static const uint8_t kNocTlb;
 static const uint32_t kSoftReset0Addr = 0xFFB121B0; /* NOC address in each tile */
 static const uint32_t kAllRiscSoftReset = 0x47800;
 
+static bool RejectTensixRecoveryAfterPowerFault(struct response *rsp)
+{
+	if (!ThrottlerRuntimePowerFaultLatched()) {
+		return false;
+	}
+
+	/* The latch is only cleared by an ASIC reset. These commands deassert
+	 * reset or un-gate Tensix, so none may run while containment is active.
+	 */
+	rsp->data[0] = 2;
+	LOG_ERR("Refusing Tensix reset/reinit during runtime power containment");
+	return true;
+}
+
 bool is_cable_fault_mode(void)
 {
 	return cable_fault_mode;
+}
+
+bool bh_get_boot_cable_power_limit(uint16_t *power_limit)
+{
+	if (!boot_cable_power_limit_valid || power_limit == NULL) {
+		return false;
+	}
+
+	*power_limit = boot_cable_power_limit;
+	return true;
 }
 
 void bh_soft_reset_all_tensix(void)
@@ -187,6 +214,10 @@ SYS_INIT_APP(DeassertRiscvResets);
  */
 static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct response *rsp)
 {
+	if (RejectTensixRecoveryAfterPowerFault(rsp)) {
+		return 2;
+	}
+
 	/* Assert reset (active low) */
 	RESET_UNIT_TENSIX_RESET_reg_u tensix_reset = {.val = 0};
 
@@ -210,6 +241,10 @@ REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_TENSIX_RESET, ToggleTensixReset);
 static __maybe_unused uint8_t ToggleSingleTensixReset(const union request *req,
 						      struct response *rsp)
 {
+	if (RejectTensixRecoveryAfterPowerFault(rsp)) {
+		return 2;
+	}
+
 	uint8_t noc_x = req->toggle_single_tensix_reset.noc_x;
 	uint8_t noc_y = req->toggle_single_tensix_reset.noc_y;
 
@@ -304,6 +339,10 @@ REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_SINGLE_TENSIX_RESET, ToggleSingleTensixReset)
  */
 static __maybe_unused uint8_t ReinitTensix(const union request *req, struct response *rsp)
 {
+	if (RejectTensixRecoveryAfterPowerFault(rsp)) {
+		return 2;
+	}
+
 	ClearNocTranslation();
 	/* We technically don't have to re-program the entire NOC (only the Tensix NOC portions),
 	 * but it's simpler to reuse the same functions to re-program all of it.
@@ -334,6 +373,9 @@ static int DeassertTileResets(void)
 	 */
 	uint32_t raw_value = ReadReg(DMC_CABLE_POWER_LIMIT_REG_ADDR);
 
+	boot_cable_power_limit_valid = false;
+	boot_cable_power_limit = 0U;
+
 	if (bh_chip_info_is_ubb()) {
 		/* Galaxy boards have no DMC; CPLD never sets cable power limit */
 		LOG_INF("Galaxy board detected, no cable fault check needed");
@@ -349,6 +391,9 @@ static int DeassertTileResets(void)
 			LOG_WRN("Cable fault detected (0W power limit). "
 				"Entering low-power mode - clock-gating all tiles except column 15 "
 				"(contains ARC).");
+		} else {
+			boot_cable_power_limit = cable_power_limit;
+			boot_cable_power_limit_valid = true;
 		}
 	} else {
 		/* Legacy DMC without cable power limit feature - skip cable fault check */

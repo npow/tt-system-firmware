@@ -10,11 +10,13 @@
 #include <stdbool.h>
 
 /* Bounds checks for FMAX and FMIN (in MHz) */
-#define AICLK_FMAX_MAX        1400.0F
-#define AICLK_FMAX_MIN        800.0F
-#define AICLK_FMIN_MAX        1400.0F
-#define AICLK_FMIN_MIN        200.0F
-#define AICLK_RESET_SAFE_FREQ 250.0F
+#define AICLK_FMAX_MAX                 1400.0F
+#define AICLK_FMAX_MIN                 800.0F
+#define AICLK_FMIN_MAX                 1400.0F
+#define AICLK_FMIN_MIN                 200.0F
+#define AICLK_RESET_SAFE_FREQ          250.0F
+/* DVFS runs once per millisecond on production firmware. */
+#define AICLK_POWER_SLEW_UP_MHZ_PER_MS 1U
 
 /**
  * @brief AICLK maximum frequency arbiters
@@ -80,6 +82,11 @@ union aiclk_targ_freq_info {
 };
 
 void aiclk_update_busy(void);
+void SetAiclkPowerSlew(bool enable);
+/* Remove host-only forcing/sweep/floor requests when strict board-power
+ * control becomes active. This does not alter the normal controller ceiling.
+ */
+void ClearAiclkCharacterizationOverrides(void);
 void SetAiclkArbMax(enum aiclk_arb_max arb_max, float freq);
 void SetAiclkArbMin(enum aiclk_arb_min arb_min, float freq);
 void EnableArbMax(enum aiclk_arb_max arb_max, bool enable);
@@ -89,6 +96,13 @@ void DecreaseAiclk(void);
 void IncreaseAiclk(void);
 void InitArbMaxVoltage(void);
 float GetThrottlerArbMax(enum aiclk_arb_max arb_max);
+/**
+ * @brief Force AICLK for characterization or reset-safe operation.
+ *
+ * Runtime power containment rejects all force requests. While strict
+ * board-power policy is active, only 0 (release) and frequencies at or below
+ * @ref AICLK_RESET_SAFE_FREQ are accepted.
+ */
 uint8_t ForceAiclk(uint32_t freq);
 void SetAiclkResetSafe(bool enable);
 uint32_t GetAiclkTarg(void);
@@ -100,6 +114,11 @@ uint32_t get_aiclk_effective_arb_max(enum aiclk_arb_max *effective_max_arb);
 uint32_t get_enabled_arb_min_bitmask(void);
 uint32_t get_enabled_arb_max_bitmask(void);
 union aiclk_targ_freq_info get_targ_aiclk_info(void);
+
+#if defined(CONFIG_ZTEST)
+uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms);
+bool AiclkTestResetSafeEnabled(void);
+#endif
 
 struct response;
 union request;

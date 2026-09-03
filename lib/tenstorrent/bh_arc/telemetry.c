@@ -261,9 +261,9 @@ void UpdateTelemetryKernelThrottler(bool enabled, uint32_t stop_nops_freq)
 	telemetry[TAG_KERNEL_THROTTLER] = (enabled ? 1U : 0U) | ((stop_nops_freq & 0xFFFFU) << 16U);
 }
 
-void UpdateTelemetryRuntimePowerFault(bool latched, uint16_t input_power)
+void UpdateTelemetryRuntimePowerFault(uint8_t status, uint16_t input_power)
 {
-	telemetry[TAG_RUNTIME_POWER_FAULT] = (latched ? 1U : 0U) | ((uint32_t)input_power << 16U);
+	telemetry[TAG_RUNTIME_POWER_FAULT] = (uint32_t)status | ((uint32_t)input_power << 16U);
 }
 
 telemetry_feature_flags_bits_0_t GetActiveFeatures(void)

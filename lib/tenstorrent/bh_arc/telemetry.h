@@ -475,12 +475,20 @@ typedef union {
 
 /** @brief Latched runtime board-power fail-safe status.
  *
- * Bit 0 is set after a host-requested board-power limit could not be met at
- * minimum AICLK while kernel NOP throttling was active. Bits [31:16] contain
- * the board-input power sample, in watts, that caused the fail-safe to trip.
- * The latch is cleared only by an ASIC reset.
+ * Bits [3:0] are runtime board-power state:
+ * - bit 0: containment is latched (cleared only by ASIC reset);
+ * - bit 1: the strict DMC board-power policy is active;
+ * - bit 2: a valid DMC input-power sample is within its freshness deadline;
+ * - bit 3: strict policy is ready to run (strict plus a fresh first sample).
+ *
+ * Bits [31:16] contain the board-input power sample, in watts, that caused
+ * containment to trip.
  */
-#define TAG_RUNTIME_POWER_FAULT 80
+#define TAG_RUNTIME_POWER_FAULT              80
+#define RUNTIME_POWER_FAULT_LATCHED_BIT      (1U << 0)
+#define RUNTIME_POWER_FAULT_STRICT_BIT       (1U << 1)
+#define RUNTIME_POWER_FAULT_SAMPLE_FRESH_BIT (1U << 2)
+#define RUNTIME_POWER_FAULT_POLICY_READY_BIT (1U << 3)
 
 /** @} */ /* end of telemetry_tag group */
 
@@ -503,7 +511,7 @@ void UpdateTelemetryTdpLimit(uint32_t tdp_limit);
 void UpdateTelemetryThermTripCount(uint16_t therm_trip_count);
 void UpdateTelemetryHostAiclkLimit(uint32_t fmax);
 void UpdateTelemetryKernelThrottler(bool enabled, uint32_t stop_nops_freq);
-void UpdateTelemetryRuntimePowerFault(bool latched, uint16_t input_power);
+void UpdateTelemetryRuntimePowerFault(uint8_t status, uint16_t input_power);
 /** @brief Get the current active firmware feature bits from @ref TAG_FW_ACTIVE_CONFIG_0.
  * @ingroup telemetry_feature_capabilities
  *

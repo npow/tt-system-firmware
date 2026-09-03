@@ -18,6 +18,7 @@
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/sys_init_defines.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/misc/bh_fwtable.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/device.h>
@@ -44,17 +45,17 @@ typedef struct {
 } AiclkArb;
 
 typedef struct {
-	uint32_t curr_freq;   /* in MHz */
-	uint32_t targ_freq;   /* in MHz */
-	uint32_t boot_freq;   /* in MHz */
-	uint32_t fmax;        /* in MHz */
-	uint32_t fmin;        /* in MHz */
+	uint32_t curr_freq;           /* in MHz */
+	uint32_t targ_freq;           /* in MHz */
+	uint32_t boot_freq;           /* in MHz */
+	uint32_t fmax;                /* in MHz */
+	uint32_t fmin;                /* in MHz */
 	uint32_t host_requested_fmin; /* Host-requested minimum frequency floor, 0 = disabled */
-	uint32_t forced_freq; /* in MHz, a value of zero means disabled. */
-	bool reset_safe;      /* cap to reset-safe frequency after forced frequency is applied */
-	uint32_t sweep_en;    /* a value of one means enabled, otherwise disabled. */
-	uint32_t sweep_low;   /* in MHz */
-	uint32_t sweep_high;  /* in MHz */
+	uint32_t forced_freq;         /* in MHz, a value of zero means disabled. */
+	bool reset_safe;     /* cap to reset-safe frequency after forced frequency is applied */
+	uint32_t sweep_en;   /* a value of one means enabled, otherwise disabled. */
+	uint32_t sweep_low;  /* in MHz */
+	uint32_t sweep_high; /* in MHz */
 	union aiclk_targ_freq_info lim_arb_info; /*information on the limiting arbiter */
 	AiclkArb arbiter_max[aiclk_arb_max_count];
 	AiclkArb arbiter_min[aiclk_arb_min_count];
@@ -68,6 +69,9 @@ static AiclkPPM aiclk_ppm = {
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 
 static bool last_msg_busy;
+static bool power_slew_enabled;
+static bool power_slew_rise_valid;
+static uint32_t power_slew_last_rise_ms;
 
 static uint32_t final_arbiter_count[aiclk_arb_max_count];
 static uint32_t throttler_frozen_mask;
@@ -92,6 +96,54 @@ void EnableArbMin(enum aiclk_arb_min arb_min, bool enable)
 {
 	aiclk_ppm.arbiter_min[arb_min].enabled = enable;
 }
+
+static uint32_t ApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms)
+{
+	if (!power_slew_enabled || target_freq <= current_freq) {
+		return target_freq;
+	}
+
+	/* Host message handlers call DVFSChange synchronously. Permit a single
+	 * 1 MHz upward move for each uptime millisecond so message bursts cannot
+	 * accelerate the normal 1 ms worker cadence. Do not catch up after work
+	 * is delayed: a delayed pass still makes only one bounded step.
+	 */
+	if (power_slew_rise_valid && power_slew_last_rise_ms == now_ms) {
+		return current_freq;
+	}
+
+	power_slew_last_rise_ms = now_ms;
+	power_slew_rise_valid = true;
+
+	return MIN(target_freq, current_freq + AICLK_POWER_SLEW_UP_MHZ_PER_MS);
+}
+
+void SetAiclkPowerSlew(bool enable)
+{
+	if (power_slew_enabled != enable) {
+		power_slew_rise_valid = false;
+	}
+	power_slew_enabled = enable;
+}
+
+void ClearAiclkCharacterizationOverrides(void)
+{
+	aiclk_ppm.forced_freq = 0;
+	aiclk_ppm.sweep_en = 0;
+	aiclk_ppm.host_requested_fmin = 0;
+}
+
+#if defined(CONFIG_ZTEST)
+uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms)
+{
+	return ApplyPowerSlew(current_freq, target_freq, now_ms);
+}
+
+bool AiclkTestResetSafeEnabled(void)
+{
+	return aiclk_ppm.reset_safe;
+}
+#endif
 
 void CalculateTargAiclk(void)
 {
@@ -161,9 +213,25 @@ void CalculateTargAiclk(void)
 		info.arbiter = 0U;
 	}
 
+	/* A strict board-power cap must still bound characterization overrides.
+	 * Reapply the calculated maximum after sweep/force, before DVFS derives
+	 * the matching voltage request.
+	 */
+	if (power_slew_enabled && aiclk_ppm.targ_freq > max_arb_freq) {
+		aiclk_ppm.targ_freq = max_arb_freq;
+		info.reason = limit_reason_max_arb;
+		info.arbiter = max_arb;
+	}
+
 	if (aiclk_ppm.reset_safe && aiclk_ppm.targ_freq > AICLK_RESET_SAFE_FREQ) {
 		aiclk_ppm.targ_freq = AICLK_RESET_SAFE_FREQ;
 	}
+
+	/* Limit upward voltage/PLL movement to 1 MHz per DVFS millisecond;
+	 * downward changes remain immediate.
+	 */
+	aiclk_ppm.targ_freq =
+		ApplyPowerSlew(aiclk_ppm.curr_freq, aiclk_ppm.targ_freq, k_uptime_get_32());
 
 	aiclk_ppm.lim_arb_info = info;
 	sys_trace_named_event("targ_freq_update", aiclk_ppm.targ_freq,
@@ -253,6 +321,8 @@ static int InitAiclkPPM(void)
 	/* disable forcing of AICLK */
 	aiclk_ppm.forced_freq = 0;
 	aiclk_ppm.reset_safe = false;
+	power_slew_enabled = false;
+	power_slew_rise_valid = false;
 
 	/* disable AICLK sweep */
 	aiclk_ppm.sweep_en = 0;
@@ -279,6 +349,15 @@ uint8_t ForceAiclk(uint32_t freq)
 	if ((freq > AICLK_FMAX_MAX || freq < AICLK_FMIN_MIN) && (freq != 0)) {
 		return 1;
 	}
+	if (ThrottlerRuntimePowerFaultLatched() ||
+	    (ThrottlerStrictRuntimePowerLimitActive() && freq > (uint32_t)AICLK_RESET_SAFE_FREQ)) {
+		/* Force AICLK can otherwise bypass normal arbitration in a non-DVFS
+		 * configuration. Strict mode permits only the reset-safe frequency
+		 * ceiling (and zero to release it); the reset-latched safety state has
+		 * no host override at all.
+		 */
+		return 2;
+	}
 
 	if (dvfs_enabled) {
 		aiclk_ppm.forced_freq = freq;
@@ -298,6 +377,13 @@ uint8_t ForceAiclk(uint32_t freq)
 
 void SetAiclkResetSafe(bool enable)
 {
+	if (!enable && ThrottlerRuntimePowerFaultLatched()) {
+		/* A reset sequence that was in progress when containment latched may
+		 * not remove its low-frequency cap afterwards.
+		 */
+		return;
+	}
+
 	if (aiclk_ppm.reset_safe == enable) {
 		return;
 	}
@@ -404,7 +490,16 @@ uint32_t get_enabled_arb_max_bitmask(void)
  */
 static uint8_t aiclk_busy_handler(const union request *request, struct response *response)
 {
-	last_msg_busy = (request->aiclk_set_speed.command_code == TT_SMC_MSG_AICLK_GO_BUSY);
+	bool busy = request->aiclk_set_speed.command_code == TT_SMC_MSG_AICLK_GO_BUSY;
+
+	/* Long-idle may still lower the requested floor, but GO_BUSY must not
+	 * recreate a high-frequency request after power containment.
+	 */
+	if (busy && ThrottlerRuntimePowerFaultLatched()) {
+		return 2;
+	}
+
+	last_msg_busy = busy;
 	aiclk_update_busy();
 	return 0;
 }
@@ -447,6 +542,9 @@ static uint8_t get_aiclk_handler(const union request *request, struct response *
 static uint8_t SweepAiclkHandler(const union request *request, struct response *response)
 {
 	if (request->command_code == TT_SMC_MSG_AISWEEP_START) {
+		if (ThrottlerStrictRuntimePowerLimitActive()) {
+			return 2;
+		}
 		if (request->aisweep.sweep_low == 0 || request->aisweep.sweep_high == 0) {
 			return 1;
 		}
@@ -505,6 +603,9 @@ static uint8_t handle_char_set_host_fmin(const struct characterisation_set_fmin_
 		aiclk_ppm.host_requested_fmin = 0;
 		LOG_INF("host fmin floor disabled");
 		return 0;
+	}
+	if (ThrottlerStrictRuntimePowerLimitActive()) {
+		return 2;
 	}
 
 	/* Reject if outside valid range [AICLK_FMIN_MIN, AICLK_FMIN_MAX] */

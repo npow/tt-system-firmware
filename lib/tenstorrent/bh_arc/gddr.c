@@ -13,6 +13,7 @@
 #include "noc2axi.h"
 #include "reg.h"
 #include "status_reg.h"
+#include "throttler.h"
 
 #include <stddef.h>
 
@@ -54,13 +55,13 @@ uint8_t get_gddr_mrisc_noc2axi_port(uint8_t gddr_inst)
 	return (gddr_inst == 0) ? 2 : MRISC_FW_NOC2AXI_PORT;
 }
 
-#define MRISC_SETUP_TLB       13
-#define MRISC_L1_ADDR         (1ULL << 37)
-#define MRISC_REG_ADDR        (1ULL << 40)
-#define MRISC_FW_CFG_OFFSET   0x3C00
-#define ARC_NOC0_X            8
-#define ARC_NOC0_Y            0
-#define MRISC_L1_SIZE         (128 * 1024)
+#define MRISC_SETUP_TLB     13
+#define MRISC_L1_ADDR       (1ULL << 37)
+#define MRISC_REG_ADDR      (1ULL << 40)
+#define MRISC_FW_CFG_OFFSET 0x3C00
+#define ARC_NOC0_X          8
+#define ARC_NOC0_Y          0
+#define MRISC_L1_SIZE       (128 * 1024)
 
 #define MRISC_FW_TAG     "memfw"
 #define MRISC_FW_CFG_TAG "memfwcfg"
@@ -725,6 +726,13 @@ static uint8_t toggle_gddr_reset(const union request *req, struct response *rsp)
 	uint32_t gddr_inst = req->gddr_reset.gddr_inst;
 	bool original_mrisc_state;
 	int rc;
+
+	/* This command wakes MRISC before retraining when containment has powered
+	 * it down. Keep the full safe-power state reset-latched.
+	 */
+	if (ThrottlerRuntimePowerFaultLatched()) {
+		return 2;
+	}
 
 	bh_power_state_get(BH_POWER_DOMAIN_MRISC, &original_mrisc_state);
 

@@ -5,6 +5,7 @@
  */
 
 #include <stdbool.h>
+#include <errno.h>
 #include <stdlib.h>
 
 #include <app_version.h>
@@ -291,16 +292,48 @@ void process_cm2dm_message(struct bh_chip *chip)
 
 void ina228_power_update(void)
 {
-	struct sensor_value sensor_val;
+	static k_timepoint_t error_ratelimit;
+	struct sensor_value sensor_val = {0};
+	int ret;
 
-	sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER);
-	sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val);
+	if (ina228 == NULL || !device_is_ready(ina228)) {
+		ret = -ENODEV;
+		goto sensor_error;
+	}
 
-	/* Only use integer part of sensor value */
-	int16_t power = sensor_val.val1 & 0xFFFF;
+	ret = sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER);
+	if (ret != 0) {
+		goto sensor_error;
+	}
+
+	ret = sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val);
+	if (ret != 0) {
+		goto sensor_error;
+	}
+
+	if (sensor_val.val1 < 0 || sensor_val.val1 >= UINT16_MAX || sensor_val.val2 < 0 ||
+	    sensor_val.val2 >= 1000000 || (sensor_val.val1 == 0 && sensor_val.val2 == 0)) {
+		ret = -ERANGE;
+		goto sensor_error;
+	}
+
+	/* The SMBus format is integer watts. Round upward so transport never
+	 * understates the INA228 reading by almost one watt.
+	 */
+	uint16_t power = (uint16_t)sensor_val.val1 + (sensor_val.val2 > 0 ? 1U : 0U);
 
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
-		bh_chip_set_input_power(chip, power);
+		(void)bh_chip_set_input_power(chip, power);
+	}
+	return;
+
+sensor_error:
+	/* Never turn a failed conversion into an arbitrary valid power sample. The
+	 * absence of a sample lets CMFW's freshness watchdog enter containment.
+	 */
+	if (sys_timepoint_expired(error_ratelimit)) {
+		error_ratelimit = sys_timepoint_calc(K_SECONDS(1));
+		LOG_ERR("INA228 power sample unavailable: %d", ret);
 	}
 }
 

@@ -7,6 +7,7 @@
 #ifndef TENSTORRENT_MSGQUEUE_H_
 #define TENSTORRENT_MSGQUEUE_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <zephyr/sys/iterable_sections.h>
@@ -1116,6 +1117,11 @@ struct msgqueue_handler {
 	}
 
 void process_message_queues(void);
+
+#if defined(CONFIG_ZTEST)
+/* Test-only bounded dispatcher used to verify production worker fairness. */
+bool msgqueue_test_process_message_queues_bounded(uint32_t max_messages);
+#endif
 void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler);
 
 int msgqueue_request_push(uint32_t msgqueue_id, const union request *request);

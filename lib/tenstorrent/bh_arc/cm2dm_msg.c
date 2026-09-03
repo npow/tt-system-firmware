@@ -27,6 +27,7 @@
 #include "fan_ctrl.h"
 #include "telemetry.h"
 #include "dvfs.h"
+#include "throttler.h"
 
 typedef struct {
 	atomic_t pending_messages;
@@ -344,9 +345,12 @@ int32_t Dm2CmSendPowerHandler(const uint8_t *data, uint8_t size)
 		return -1;
 	}
 
-	AdjustDVFSTimer();
-
 	power = sys_get_le16(data) + bh_chip_info_additional_board_power();
+	/* Only a complete, accepted SMBus word refreshes strict-policy freshness.
+	 * Invalid payloads leave the watchdog running and lead to containment.
+	 */
+	ThrottlerRecordInputPowerSample(k_uptime_get_32());
+	AdjustDVFSTimer();
 
 	return 0;
 }
