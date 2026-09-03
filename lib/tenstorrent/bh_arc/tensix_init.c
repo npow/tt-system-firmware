@@ -10,6 +10,7 @@
 #include "noc_init.h"
 #include "harvesting.h"
 #include "tensix.h"
+#include "throttler.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -58,6 +59,7 @@ LOG_MODULE_REGISTER(tensix_init, CONFIG_TT_APP_LOG_LEVEL);
 #define COUNTER_L1_ADDR       0x110000 /* L1 address of the atomic counter itself */
 #define NUM_TENSIX_ROWS       10
 #define WIPE_DEST_TIMEOUT_US  10000 /* 10ms timeout */
+#define WIPE_DMA_TIMEOUT_MS   50
 
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 static const struct device *const dma_noc = DEVICE_DT_GET(DT_NODELABEL(dma1));
@@ -126,7 +128,43 @@ void EnableTensixCG(bool broadcast, uint8_t noc_x, uint8_t noc_y)
  * all other non-harvested tensix cores. This approach is faster than iterating over all tensix
  * cores sequentially to clear each l1.
  */
-static void wipe_l1(void)
+static int wait_for_noc_dma(void)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(WIPE_DMA_TIMEOUT_MS));
+	struct dma_status status;
+	int ret;
+
+	do {
+		ret = dma_get_status(dma_noc, 1, &status);
+		if (ret != 0) {
+			return ret;
+		}
+		if (!status.busy) {
+			return 0;
+		}
+		k_busy_wait(10);
+	} while (!sys_timepoint_expired(timeout));
+
+	return -ETIMEDOUT;
+}
+
+static int run_noc_dma(struct dma_config *config, struct tt_bh_dma_noc_coords *coords)
+{
+	int ret = tt_dma_config(dma_noc, 1, config, coords);
+
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = dma_start(dma_noc, 1);
+	if (ret != 0) {
+		return ret;
+	}
+
+	return wait_for_noc_dma();
+}
+
+static int wipe_l1(void)
 {
 	uint64_t addr = 0;
 	uint8_t tensix_x, tensix_y;
@@ -157,8 +195,11 @@ static void wipe_l1(void)
 					      .dest_x = ARC_NOC0_X,
 					      .dest_y = ARC_NOC0_Y};
 
-	tt_dma_config(dma_noc, 1, &config, &coords);
-	dma_start(dma_noc, 1);
+	int ret = run_noc_dma(&config, &coords);
+
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* wipe entire L1 of the chosen tensix */
 	uint32_t offset = sizeof(sram_buffer);
@@ -172,8 +213,10 @@ static void wipe_l1(void)
 		block.dest_address = offset;
 		block.block_size = size;
 
-		tt_dma_config(dma_noc, 1, &config, &coords);
-		dma_start(dma_noc, 1);
+		ret = run_noc_dma(&config, &coords);
+		if (ret != 0) {
+			return ret;
+		}
 
 		offset += offset;
 	}
@@ -184,8 +227,7 @@ static void wipe_l1(void)
 	block.dest_address = addr;
 	block.block_size = TENSIX_L1_SIZE;
 
-	tt_dma_config(dma_noc, 1, &config, &coords);
-	dma_start(dma_noc, 1);
+	return run_noc_dma(&config, &coords);
 }
 
 /**
@@ -304,8 +346,22 @@ static int wipe_dest(void)
 	NOC2AXIWrite32(ring, noc_tlb, TRISC0_RESET_PC, TRISC_WIPE_FW_LOAD_ADDR);
 	NOC2AXIWrite32(ring, noc_tlb, TRISC_RESET_PC_OVERRIDE, 1);
 
-	/* Step 5: Release TRISC 0 from soft reset on all Tensix */
+	/* Step 5: First establish a known soft-reset state while the reset-unit
+	 * hardware hold is still asserted. Only then release the hardware reset and
+	 * run the known TRISC0 wipe image.
+	 */
+	setup_tensix_mcast_tlb(ring, noc_tlb, SOFT_RESET_0);
+	NOC2AXIWrite32(ring, noc_tlb, SOFT_RESET_0, ALL_RISC_SOFT_RESET);
+	unsigned int key = irq_lock();
+
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		return -ECANCELED;
+	}
+	bh_release_tensix_riscs_from_reset();
 	NOC2AXIWrite32(ring, noc_tlb, SOFT_RESET_0, ALL_RISC_SOFT_RESET & ~BIT(12));
+	irq_unlock(key);
 
 	/* Step 6: Wait for all cores to signal completion via atomic counter */
 	uint32_t expected = POPCOUNT(tile_enable.tensix_col_enabled) * NUM_TENSIX_ROWS;
@@ -315,6 +371,7 @@ static int wipe_dest(void)
 	setup_tensix_mcast_tlb(ring, noc_tlb, SOFT_RESET_0);
 	NOC2AXIWrite32(ring, noc_tlb, SOFT_RESET_0, ALL_RISC_SOFT_RESET);
 	NOC2AXIWrite32(ring, noc_tlb, TRISC_RESET_PC_OVERRIDE, 0);
+	bh_hold_tensix_riscs_in_reset();
 
 	if (rc_sync < 0) {
 		LOG_ERR("%s: global_sync failed: %d", __func__, rc_sync);
@@ -359,10 +416,21 @@ static int tensix_init(void)
 	if (is_cable_fault_mode()) {
 		return 0;
 	}
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		bh_hold_tensix_riscs_in_reset();
+		return -ECANCELED;
+	}
 
 	TensixInit();
 
-	wipe_l1();
+	int rc_wipe_l1 = wipe_l1();
+
+	if (rc_wipe_l1 < 0) {
+		LOG_ERR("%s: wipe_l1 failed: %d", __func__, rc_wipe_l1);
+		record_init_failure(INIT_STAGE_TENSIX);
+		return rc_wipe_l1;
+	}
+
 	int rc_wipe_dest = wipe_dest();
 
 	if (rc_wipe_dest < 0) {

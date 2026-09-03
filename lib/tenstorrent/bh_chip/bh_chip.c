@@ -20,12 +20,16 @@ LOG_MODULE_REGISTER(bh_chip, CONFIG_TT_BH_CHIP_LOG_LEVEL);
 
 void bh_chip_cancel_bus_transfer_set(struct bh_chip *chip)
 {
-	smbus_cancel(chip->config.arc.smbus.bus);
+	if (chip->config.arc.smbus.bus != NULL) {
+		(void)smbus_cancel(chip->config.arc.smbus.bus);
+	}
 }
 
 void bh_chip_cancel_bus_transfer_clear(struct bh_chip *chip)
 {
-	smbus_uncancel(chip->config.arc.smbus.bus);
+	if (chip->config.arc.smbus.bus != NULL) {
+		(void)smbus_uncancel(chip->config.arc.smbus.bus);
+	}
 }
 
 cm2dmMessageRet bh_chip_get_cm2dm_message(struct bh_chip *chip)
@@ -149,44 +153,93 @@ int bh_chip_write_logs(struct bh_chip *chip, char *log_data, size_t log_size)
 	return ret;
 }
 
-void bh_chip_assert_asic_reset(const struct bh_chip *chip)
+int bh_chip_assert_asic_reset(const struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.asic_reset, 1);
+	return gpio_pin_set_dt(&chip->config.asic_reset, 1);
 }
 
-void bh_chip_deassert_asic_reset(const struct bh_chip *chip)
+int bh_chip_deassert_asic_reset(const struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.asic_reset, 0);
+	return gpio_pin_set_dt(&chip->config.asic_reset, 0);
 }
 
-void bh_chip_assert_spi_reset(const struct bh_chip *chip)
+int bh_chip_assert_spi_reset(const struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.spi_reset, 1);
+	return gpio_pin_set_dt(&chip->config.spi_reset, 1);
 }
 
-void bh_chip_deassert_spi_reset(const struct bh_chip *chip)
+int bh_chip_deassert_spi_reset(const struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.spi_reset, 0);
+	return gpio_pin_set_dt(&chip->config.spi_reset, 0);
+}
+
+#if defined(CONFIG_ZTEST)
+static bool test_reset_result_forced;
+static int test_reset_result;
+
+void bh_chip_test_force_reset_result(bool enable, int result)
+{
+	test_reset_result_forced = enable;
+	test_reset_result = result;
+}
+#endif
+
+static int latch_reset_failure(struct bh_chip *chip, int error)
+{
+	chip->data.arc_needs_init_msg = false;
+	chip->data.reset_failed = true;
+	chip->data.reset_error = error;
+	bh_chip_cancel_bus_transfer_set(chip);
+
+	return error;
 }
 
 int bh_chip_reset_chip(struct bh_chip *chip, bool force_reset)
 {
-	int ret, ret2;
+	int reset_ret;
+	int bus_ret;
+
+#if defined(CONFIG_ZTEST)
+	if (test_reset_result_forced) {
+		if (test_reset_result != 0) {
+			return latch_reset_failure(chip, test_reset_result);
+		}
+		chip->data.reset_failed = false;
+		chip->data.reset_error = 0;
+		return 0;
+	}
+#endif
 
 	chip->data.last_cm2dm_seq_num_valid = false;
-	ret = bharc_disable_i2cbus(&chip->config.arc);
-	if (ret != 0) {
-		bharc_enable_i2cbus(&chip->config.arc);
-		return ret;
+	chip->data.arc_needs_init_msg = false;
+	bus_ret = bharc_disable_i2cbus(&chip->config.arc);
+	if (bus_ret != 0) {
+		int restore_ret = bharc_enable_i2cbus(&chip->config.arc);
+
+		if (restore_ret != 0) {
+			LOG_ERR("ARC I2C disable failed (%d) and restore failed (%d)", bus_ret,
+				restore_ret);
+		}
+		return latch_reset_failure(chip, bus_ret);
 	}
 
-	ret2 = jtag_bootrom_reset_sequence(chip, force_reset, chip->data.cable_power_limit);
+	reset_ret = jtag_bootrom_reset_sequence(chip, force_reset, chip->data.cable_power_limit);
 
-	ret = bharc_enable_i2cbus(&chip->config.arc);
-	if (ret != 0) {
-		return ret;
+	bus_ret = bharc_enable_i2cbus(&chip->config.arc);
+	if (reset_ret != 0) {
+		if (bus_ret != 0) {
+			LOG_ERR("Reset failed (%d) and ARC I2C re-enable failed (%d)", reset_ret,
+				bus_ret);
+		}
+		return latch_reset_failure(chip, reset_ret);
 	}
-	return ret2;
+	if (bus_ret != 0) {
+		return latch_reset_failure(chip, bus_ret);
+	}
+
+	chip->data.reset_failed = false;
+	chip->data.reset_error = 0;
+	return 0;
 }
 
 void therm_trip_detected(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
@@ -223,19 +276,48 @@ int therm_trip_gpio_setup(struct bh_chip *chip)
 	return ret;
 }
 
-void pgood_change_detected(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+static bool record_pgood_sample(struct bh_chip *chip, int sample)
 {
-	struct bh_chip *chip = CONTAINER_OF(cb, struct bh_chip, pgood_cb);
+	if (sample < 0) {
+		chip->data.pgood_read_error = sample;
+		LOG_ERR("Failed to read PGOOD: %d", sample);
+		return false;
+	}
+	if (sample != 0 && sample != 1) {
+		chip->data.pgood_read_error = -ERANGE;
+		LOG_ERR("Invalid PGOOD value: %d", sample);
+		return false;
+	}
 
-	/* Sample PGOOD to see if it rose or fell */
-	/* TODO: could setup rising interrupt only after falling triggered */
-	if (gpio_pin_get_dt(&chip->config.pgood)) {
+	chip->data.pgood_read_error = 0;
+	if (sample == 1) {
 		chip->data.pgood_rise_triggered = true;
 	} else {
 		chip->data.pgood_fall_triggered = true;
 	}
+
+	return true;
+}
+
+void pgood_change_detected(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	struct bh_chip *chip = CONTAINER_OF(cb, struct bh_chip, pgood_cb);
+	int sample = gpio_pin_get_dt(&chip->config.pgood);
+
+	/* Sample PGOOD to see if it rose or fell */
+	/* TODO: could setup rising interrupt only after falling triggered */
+	if (!record_pgood_sample(chip, sample)) {
+		return;
+	}
 	tt_event_post(TT_EVENT_PGOOD);
 }
+
+#if defined(CONFIG_ZTEST)
+void bh_chip_test_record_pgood_sample(struct bh_chip *chip, int sample)
+{
+	(void)record_pgood_sample(chip, sample);
+}
+#endif
 
 int pgood_gpio_setup(struct bh_chip *chip)
 {
@@ -261,15 +343,21 @@ int pgood_gpio_setup(struct bh_chip *chip)
 	return ret;
 }
 
-void handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_led)
+int handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_led)
 {
+	int ret = 0;
+
 	if (chip->data.pgood_fall_triggered && !chip->data.pgood_severe_fault) {
 		int64_t current_uptime_ms = k_uptime_get();
 		/* Assert board fault */
-		gpio_pin_set_dt(&board_fault_led, 1);
+		ret = gpio_pin_set_dt(&board_fault_led, 1);
 		/* Report over SMBus - to add later */
 		/* Assert ASIC reset */
-		bh_chip_assert_asic_reset(chip);
+		int reset_ret = bh_chip_assert_asic_reset(chip);
+
+		if (ret == 0) {
+			ret = reset_ret;
+		}
 		/* If pgood went down again within 1 second */
 		if (chip->data.pgood_last_trip_ms != 0 &&
 		    current_uptime_ms - chip->data.pgood_last_trip_ms < 1000) {
@@ -281,15 +369,21 @@ void handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_le
 	}
 	if (chip->data.pgood_rise_triggered && !chip->data.pgood_severe_fault) {
 		/* Follow out of reset procedure */
-		bh_chip_reset_chip(chip, true);
+		ret = bh_chip_reset_chip(chip, true);
+		chip->data.pgood_rise_triggered = false;
+		if (ret != 0) {
+			(void)gpio_pin_set_dt(&board_fault_led, 1);
+			return ret;
+		}
 		/*
 		 * Ensure the board fault led will not be deasserted post powercycle during
 		 * assembly test
 		 */
 		if (!IS_ENABLED(CONFIG_TT_ASSEMBLY_TEST)) {
 			/* Clear board fault */
-			gpio_pin_set_dt(&board_fault_led, 0);
+			ret = gpio_pin_set_dt(&board_fault_led, 0);
 		}
-		chip->data.pgood_rise_triggered = false;
 	}
+
+	return ret;
 }

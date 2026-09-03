@@ -13,6 +13,7 @@
 #include "noc2axi.h"
 #include "reg.h"
 #include "status_reg.h"
+#include "throttler.h"
 
 #include <stddef.h>
 
@@ -64,6 +65,7 @@ uint8_t get_gddr_mrisc_noc2axi_port(uint8_t gddr_inst)
 
 #define MRISC_FW_TAG     "memfw"
 #define MRISC_FW_CFG_TAG "memfwcfg"
+#define GDDR_WIPE_DMA_TIMEOUT_MS 50
 
 LOG_MODULE_REGISTER(gddr, CONFIG_TT_APP_LOG_LEVEL);
 
@@ -172,6 +174,16 @@ static void ReleaseMriscReset(uint8_t gddr_inst)
 
 	volatile uint32_t *soft_reset_0 = GetTlbWindowAddr(0, MRISC_SETUP_TLB, kSoftReset0Addr);
 	*soft_reset_0 &= ~(1 << 11); /* Clear bit corresponding to MRISC reset */
+}
+
+static void ReleaseMriscHardwareReset(uint8_t gddr_inst)
+{
+	RESET_UNIT_DDR_RESET_reg_u ddr_reset = {
+		.val = ReadReg(RESET_UNIT_DDR_RESET_REG_ADDR),
+	};
+
+	ddr_reset.f.ddr_risc_reset_n |= 0x7U << (3U * gddr_inst);
+	WriteReg(RESET_UNIT_DDR_RESET_REG_ADDR, ddr_reset.val);
 }
 
 static void SetAxiEnable(uint8_t gddr_inst, uint8_t noc2axi_port, bool axi_enable)
@@ -382,8 +394,84 @@ static int CheckHwMemtestResult(uint8_t gddr_inst, k_timepoint_t timeout)
 	return 0;
 }
 
-/* This function assumes that tensix L1s have already been cleared */
-static void wipe_l1(void)
+static void HoldGddrInstanceInReset(uint8_t gddr_inst)
+{
+	RESET_UNIT_DDR_RESET_reg_u ddr_reset = {
+		.val = ReadReg(RESET_UNIT_DDR_RESET_REG_ADDR),
+	};
+
+	ddr_reset.f.ddr_reset_n &= ~BIT(gddr_inst);
+	ddr_reset.f.ddr_risc_reset_n &= ~(0x7U << (3U * gddr_inst));
+	WriteReg(RESET_UNIT_DDR_RESET_REG_ADDR, ddr_reset.val);
+	gddr_telemetry_version_ok &= ~BIT(gddr_inst);
+}
+
+static void HoldAllGddrInReset(void)
+{
+	RESET_UNIT_DDR_RESET_reg_u ddr_reset = {
+		.val = ReadReg(RESET_UNIT_DDR_RESET_REG_ADDR),
+	};
+
+	ddr_reset.f.ddr_reset_n = 0U;
+	ddr_reset.f.ddr_risc_reset_n = 0U;
+	WriteReg(RESET_UNIT_DDR_RESET_REG_ADDR, ddr_reset.val);
+	gddr_telemetry_version_ok = 0U;
+}
+
+#if defined(CONFIG_ZTEST)
+void GddrTestHoldInstanceInReset(uint8_t gddr_inst)
+{
+	if (gddr_inst < NUM_GDDR) {
+		HoldGddrInstanceInReset(gddr_inst);
+	}
+}
+#endif
+
+static int FailGddrInit(enum init_stage_id stage, int error)
+{
+	HoldAllGddrInReset();
+	record_init_failure(stage);
+	return error != 0 ? error : -EIO;
+}
+
+static int WaitForGddrWipeDma(void)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(GDDR_WIPE_DMA_TIMEOUT_MS));
+	struct dma_status status;
+	int ret;
+
+	do {
+		ret = dma_get_status(dma_noc, 1, &status);
+		if (ret != 0) {
+			return ret;
+		}
+		if (!status.busy) {
+			return 0;
+		}
+		k_busy_wait(10);
+	} while (!sys_timepoint_expired(timeout));
+
+	return -ETIMEDOUT;
+}
+
+static int RunGddrWipeDma(struct dma_config *config, struct tt_bh_dma_noc_coords *coords)
+{
+	int ret = tt_dma_config(dma_noc, 1, config, coords);
+
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = dma_start(dma_noc, 1);
+	if (ret != 0) {
+		return ret;
+	}
+
+	return WaitForGddrWipeDma();
+}
+
+/* This function assumes that tensix L1s have already been cleared. */
+static int wipe_l1(void)
 {
 	uint8_t noc_id = 0;
 	uint64_t addr = 0;
@@ -416,11 +504,16 @@ static void wipe_l1(void)
 						 &coords.dest_y);
 
 				/* AXI enable must not be set, using MRISC address 0 */
-				tt_dma_config(dma_noc, 1, &config, &coords);
-				dma_start(dma_noc, 1);
+				int ret = RunGddrWipeDma(&config, &coords);
+
+				if (ret != 0) {
+					return ret;
+				}
 			}
 		}
 	}
+
+	return 0;
 }
 
 static int InitMrisc(void)
@@ -437,8 +530,17 @@ static int InitMrisc(void)
 	if (is_cable_fault_mode()) {
 		return 0;
 	}
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		HoldAllGddrInReset();
+		return -ECANCELED;
+	}
 
-	wipe_l1();
+	int rc = wipe_l1();
+
+	if (rc != 0) {
+		LOG_ERR("%s() failed: %d", "wipe_l1", rc);
+		return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
+	}
 
 	/* Load MRISC (DRAM RISC) FW to all DRAMs in the middle NOC node */
 
@@ -451,7 +553,6 @@ static int InitMrisc(void)
 
 	uint32_t dram_mask = GetDramMask();
 
-	int rc;
 	tt_boot_fs_fd tag_fd;
 	size_t image_size;
 	size_t spi_address;
@@ -461,18 +562,18 @@ static int InitMrisc(void)
 	rc = tt_boot_fs_find_fd_by_tag(flash, MRISC_FW_TAG, &tag_fd);
 	if (rc < 0) {
 		LOG_ERR("%s (%s) failed: %d", "tt_boot_fs_find_fd_by_tag", MRISC_FW_TAG, rc);
-		record_init_failure(INIT_STAGE_MRISC_LOAD);
-		return rc;
+		return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
 	}
 	image_size = tag_fd.flags.f.image_size;
 	spi_address = tag_fd.spi_addr;
 
 	for (uint8_t gddr_inst = 0; gddr_inst < NUM_GDDR; gddr_inst++) {
 		if (IS_BIT_SET(dram_mask, gddr_inst)) {
-			if (LoadMriscFw(gddr_inst, buf, SCRATCHPAD_SIZE, spi_address, image_size)) {
-				LOG_ERR("%s(%d) failed: %d", "LoadMriscFw", gddr_inst, -EIO);
-				record_init_failure(INIT_STAGE_MRISC_LOAD);
-				return -EIO;
+			rc = LoadMriscFw(gddr_inst, buf, SCRATCHPAD_SIZE, spi_address,
+					 image_size);
+			if (rc != 0) {
+				LOG_ERR("%s(%d) failed: %d", "LoadMriscFw", gddr_inst, rc);
+				return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
 			}
 		}
 	}
@@ -480,8 +581,7 @@ static int InitMrisc(void)
 	rc = tt_boot_fs_find_fd_by_tag(flash, MRISC_FW_CFG_TAG, &tag_fd);
 	if (rc < 0) {
 		LOG_ERR("%s (%s) failed: %d", "tt_boot_fs_find_fd_by_tag", MRISC_FW_CFG_TAG, rc);
-		record_init_failure(INIT_STAGE_MRISC_LOAD);
-		return rc;
+		return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
 	}
 	image_size = tag_fd.flags.f.image_size;
 	spi_address = tag_fd.spi_addr;
@@ -494,8 +594,7 @@ static int InitMrisc(void)
 	rc = flash_read(flash, spi_address, buf, image_size);
 	if (rc < 0) {
 		LOG_ERR("%s() failed: %d", "flash_read", rc);
-		record_init_failure(INIT_STAGE_MRISC_LOAD);
-		return rc;
+		return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
 	}
 
 	uint32_t gddr_speed = GetGddrSpeedFromCfg(buf);
@@ -505,26 +604,43 @@ static int InitMrisc(void)
 		gddr_speed = MIN_GDDR_SPEED;
 	}
 
-	if (clock_control_set_rate(
-		    pll_dev_3, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_GDDRMEMCLK,
-		    (clock_control_subsys_rate_t)(gddr_speed / GDDR_SPEED_TO_MEMCLK_RATIO))) {
-		LOG_ERR("%s(%d) failed: %d", "SetGddrMemClk", gddr_speed, -EIO);
-		record_init_failure(INIT_STAGE_MRISC_LOAD);
-		return -EIO;
+	rc = clock_control_set_rate(
+		pll_dev_3, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_GDDRMEMCLK,
+		(clock_control_subsys_rate_t)(gddr_speed / GDDR_SPEED_TO_MEMCLK_RATIO));
+	if (rc != 0) {
+		LOG_ERR("%s(%d) failed: %d", "SetGddrMemClk", gddr_speed, rc);
+		return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
 	}
 
 	for (uint8_t gddr_inst = 0; gddr_inst < NUM_GDDR; gddr_inst++) {
 		if (IS_BIT_SET(dram_mask, gddr_inst)) {
-			if (LoadMriscFwCfg(gddr_inst, buf, SCRATCHPAD_SIZE, spi_address,
-					   image_size)) {
-				LOG_ERR("%s(%d) failed: %d", "LoadMriscFwCfg", gddr_inst, -EIO);
-				record_init_failure(INIT_STAGE_MRISC_LOAD);
-				return -EIO;
+			rc = LoadMriscFwCfg(gddr_inst, buf, SCRATCHPAD_SIZE, spi_address,
+					    image_size);
+			if (rc != 0) {
+				LOG_ERR("%s(%d) failed: %d", "LoadMriscFwCfg", gddr_inst, rc);
+				return FailGddrInit(INIT_STAGE_MRISC_LOAD, rc);
 			}
 			MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
+		}
+	}
+
+	/* A PCIe fault IRQ can latch containment while the images are being loaded.
+	 * Do not let the final reset-unit RMW resurrect MRISC execution afterward.
+	 */
+	unsigned int key = irq_lock();
+
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		HoldAllGddrInReset();
+		irq_unlock(key);
+		return FailGddrInit(INIT_STAGE_MRISC_LOAD, -ECANCELED);
+	}
+	for (uint8_t gddr_inst = 0; gddr_inst < NUM_GDDR; gddr_inst++) {
+		if (IS_BIT_SET(dram_mask, gddr_inst)) {
+			ReleaseMriscHardwareReset(gddr_inst);
 			ReleaseMriscReset(gddr_inst);
 		}
 	}
+	irq_unlock(key);
 
 	return 0;
 }
@@ -574,7 +690,7 @@ static int CheckGddrHwTest(void)
 	int any_error = 0;
 
 	for (uint8_t gddr_inst = 0; gddr_inst < NUM_GDDR; gddr_inst++) {
-		if (IS_BIT_SET(tile_enable.gddr_enabled, gddr_inst)) {
+		if (IS_BIT_SET(GetDramMask(), gddr_inst)) {
 			int error = StartHwMemtest(gddr_inst, 26, 0, 0);
 
 			if (error == -ENOTSUP) {
@@ -624,6 +740,10 @@ static int gddr_training(void)
 	if (is_cable_fault_mode()) {
 		return 0;
 	}
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		HoldAllGddrInReset();
+		return -ECANCELED;
+	}
 
 	bool init_errors = false;
 	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(MRISC_INIT_TIMEOUT));
@@ -646,11 +766,10 @@ static int gddr_training(void)
 		/* this is needed to securely wipe DRAM */
 		if (CheckGddrHwTest() < 0) {
 			LOG_ERR("GDDR HW test failed");
-			record_init_failure(INIT_STAGE_GDDR_TRAIN);
-			return -EIO;
+			return FailGddrInit(INIT_STAGE_GDDR_TRAIN, -EIO);
 		}
 	} else {
-		record_init_failure(INIT_STAGE_GDDR_TRAIN);
+		return FailGddrInit(INIT_STAGE_GDDR_TRAIN, -EIO);
 	}
 
 	return 0;
@@ -659,14 +778,22 @@ static int gddr_training(void)
 static int32_t mrisc_message(uint32_t op_code, uint32_t instance_mask, uint32_t timeout_ms,
 			     const char *op_desc)
 {
+	/* Validate every target before publishing any command. Otherwise one busy
+	 * instance can leave a prefix of the requested set in a different power
+	 * state even though the caller receives an error.
+	 */
 	for (uint8_t gddr_inst = 0U; gddr_inst < NUM_GDDR; gddr_inst++) {
 		if (IS_BIT_SET(instance_mask, gddr_inst)) {
-
 			int ret = check_mrisc_busy(gddr_inst);
 
 			if (ret != 0) {
 				return ret;
 			}
+		}
+	}
+
+	for (uint8_t gddr_inst = 0U; gddr_inst < NUM_GDDR; gddr_inst++) {
+		if (IS_BIT_SET(instance_mask, gddr_inst)) {
 			MriscRegWrite32(gddr_inst, MRISC_MSG_REGISTER, op_code);
 		}
 	}
@@ -693,7 +820,6 @@ int32_t set_mrisc_power_setting(bool on)
 	return mrisc_message(op_code, GetDramMask(), MRISC_POWER_SETTING_TIMEOUT_MS,
 			     "power_setting");
 }
-
 SYS_INIT_APP(gddr_training);
 
 static void assert_mrisc_soft_reset(uint8_t gddr_inst)
@@ -726,8 +852,6 @@ static uint8_t toggle_gddr_reset(const union request *req, struct response *rsp)
 	bool original_mrisc_state;
 	int rc;
 
-	bh_power_state_get(BH_POWER_DOMAIN_MRISC, &original_mrisc_state);
-
 	if (gddr_inst >= NUM_GDDR) {
 		rsp->data[1] = GDDR_RESET_ERR_INVALID_INST;
 		return 1;
@@ -743,53 +867,86 @@ static uint8_t toggle_gddr_reset(const union request *req, struct response *rsp)
 		return 1;
 	}
 
+	if (bh_power_state_get(BH_POWER_DOMAIN_MRISC, &original_mrisc_state) != 0) {
+		rsp->data[1] = GDDR_RESET_ERR_POWERDOWN;
+		return 1;
+	}
+
+	if (bh_reset_safe_aiclk_acquire() != 0) {
+		rsp->data[1] = GDDR_RESET_ERR_AICLK;
+		return 1;
+	}
+
 	gddr_bist.complete &= ~BIT(gddr_inst);
 	gddr_bist.failed &= ~BIT(gddr_inst);
 
 	if (!original_mrisc_state) {
-		rc = set_mrisc_power_setting(true);
+		rc = mrisc_message(MRISC_MSG_TYPE_PHY_WAKEUP, BIT(gddr_inst),
+				   MRISC_POWER_SETTING_TIMEOUT_MS, "power_setting");
 		if (rc < 0) {
 			rsp->data[1] = GDDR_RESET_ERR_POWERDOWN;
-			return 1;
+			goto fail;
 		}
 	}
 
 	assert_mrisc_soft_reset(gddr_inst);
 
 	MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
+	unsigned int key = irq_lock();
+
+	if (!ThrottlerComputePowerPolicyReady()) {
+		irq_unlock(key);
+		rsp->data[1] = GDDR_RESET_ERR_AICLK;
+		goto fail;
+	}
 	ReleaseMriscReset(gddr_inst);
+	irq_unlock(key);
 
 	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(MRISC_INIT_TIMEOUT));
 
 	rc = CheckGddrTraining(gddr_inst, timeout);
 	if (rc < 0) {
 		rsp->data[1] = GDDR_RESET_ERR_TRAINING;
-		return 1;
+		goto fail;
 	}
 
 	rc = StartHwMemtest(gddr_inst, 26, 0, 0);
 	if (rc < 0) {
 		rsp->data[1] = GDDR_RESET_ERR_BIST;
-		return 1;
+		goto fail;
 	}
 
 	timeout = sys_timepoint_calc(K_MSEC(MRISC_MEMTEST_TIMEOUT));
 	rc = CheckHwMemtestResult(gddr_inst, timeout);
 	if (rc < 0) {
 		rsp->data[1] = GDDR_RESET_ERR_BIST;
-		return 1;
+		goto fail;
 	}
 
 	if (!original_mrisc_state) {
-		rc = set_mrisc_power_setting(false);
+		rc = mrisc_message(MRISC_MSG_TYPE_PHY_POWERDOWN, BIT(gddr_inst),
+				   MRISC_POWER_SETTING_TIMEOUT_MS, "power_setting");
 		if (rc < 0) {
 			rsp->data[1] = GDDR_RESET_ERR_POWERDOWN;
-			return 1;
+			goto fail;
 		}
+	}
+
+	if (bh_reset_safe_aiclk_release() != 0) {
+		rsp->data[1] = GDDR_RESET_ERR_AICLK;
+		goto fail;
 	}
 
 	rsp->data[1] = 0;
 	return 0;
+
+fail:
+	if (!original_mrisc_state) {
+		(void)mrisc_message(MRISC_MSG_TYPE_PHY_POWERDOWN, BIT(gddr_inst),
+				    MRISC_POWER_SETTING_TIMEOUT_MS, "power_setting");
+	}
+	HoldGddrInstanceInReset(gddr_inst);
+	return 1;
 }
 
 #ifndef CONFIG_TT_SMC_RECOVERY

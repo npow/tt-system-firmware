@@ -568,6 +568,7 @@ enum gddr_reset_err {
 	GDDR_RESET_ERR_TRAINING = 4,
 	GDDR_RESET_ERR_BIST = 5,
 	GDDR_RESET_ERR_POWERDOWN = 6,
+	GDDR_RESET_ERR_AICLK = 7,
 };
 
 /** @brief Host request to reset and reinitialize one or more ETH tiles
@@ -609,6 +610,7 @@ enum eth_reset_err {
 	ETH_RESET_ERR_CFG_LOOKUP = 6,
 	ETH_RESET_ERR_CFG_SIZE = 7,
 	ETH_RESET_ERR_CFG_LOAD = 8,
+	ETH_RESET_ERR_AICLK = 9,
 };
 
 /** @brief Host request to trigger a chip reset
@@ -1116,6 +1118,8 @@ struct msgqueue_handler {
 	}
 
 void process_message_queues(void);
+/** Process pending messages on the serialized system workqueue and wait. */
+int process_message_queues_sync(void);
 void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler);
 
 int msgqueue_request_push(uint32_t msgqueue_id, const union request *request);

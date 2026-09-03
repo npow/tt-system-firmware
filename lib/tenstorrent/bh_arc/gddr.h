@@ -104,4 +104,8 @@ struct gddr_bist_info get_gddr_bist_info(void);
  */
 int32_t set_mrisc_power_setting(bool on);
 
+#if defined(CONFIG_ZTEST)
+void GddrTestHoldInstanceInReset(uint8_t gddr_inst);
+#endif
+
 #endif

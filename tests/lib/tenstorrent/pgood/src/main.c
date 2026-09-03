@@ -20,6 +20,38 @@ const struct device *gpio_emul = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 static const struct gpio_dt_spec board_fault_led =
 	GPIO_DT_SPEC_GET(DT_PATH(board_fault_led), gpios);
 
+ZTEST(pgood, test_pgood_read_error_does_not_fabricate_edge)
+{
+	test_chip.data.pgood_rise_triggered = false;
+	test_chip.data.pgood_fall_triggered = false;
+	test_chip.data.pgood_read_error = 0;
+
+	bh_chip_test_record_pgood_sample(&test_chip, -EIO);
+	zassert_false(test_chip.data.pgood_rise_triggered);
+	zassert_false(test_chip.data.pgood_fall_triggered);
+	zassert_equal(test_chip.data.pgood_read_error, -EIO);
+
+	bh_chip_test_record_pgood_sample(&test_chip, 2);
+	zassert_false(test_chip.data.pgood_rise_triggered);
+	zassert_false(test_chip.data.pgood_fall_triggered);
+	zassert_equal(test_chip.data.pgood_read_error, -ERANGE);
+}
+
+ZTEST(pgood, test_failed_pgood_recovery_stays_faulted)
+{
+	test_chip.data.pgood_rise_triggered = true;
+	test_chip.data.pgood_severe_fault = false;
+	test_chip.data.reset_failed = false;
+	bh_chip_test_force_reset_result(true, -EIO);
+
+	zassert_equal(handle_pgood_event(&test_chip, board_fault_led), -EIO);
+	zassert_true(test_chip.data.reset_failed);
+	zassert_equal(test_chip.data.reset_error, -EIO);
+	zassert_false(test_chip.data.pgood_rise_triggered);
+
+	bh_chip_test_force_reset_result(false, 0);
+}
+
 ZTEST(pgood, test_pgood)
 {
 	/* Start with PGOOD high */

@@ -10,6 +10,7 @@
 #include <zephyr/drivers/i2c.h>
 
 #include "gddr.h"
+#include "init.h"
 #include "noc2axi.h"
 #include "reg_mock.h"
 static const uint32_t mrisc_tlb = 13U;
@@ -95,6 +96,22 @@ ZTEST(gddr, test_mrisc_power_off)
 		zexpect_equal(mrisc_msgs[i], MRISC_MSG_TYPE_PHY_POWERDOWN);
 	}
 	num_mrisc_msgs = 0U;
+}
+
+ZTEST(gddr, test_failed_reset_holds_gddr_instance_in_hardware_reset)
+{
+	RESET_UNIT_DDR_RESET_reg_u initial = {.val = UINT32_MAX};
+	RESET_UNIT_DDR_RESET_reg_u expected = initial;
+	uint8_t instance = 3U;
+
+	ReadReg_fake.return_val = initial.val;
+	GddrTestHoldInstanceInReset(instance);
+
+	expected.f.ddr_reset_n &= ~BIT(instance);
+	expected.f.ddr_risc_reset_n &= ~(0x7U << (3U * instance));
+	zassert_equal(WriteReg_fake.call_count, 1U);
+	zassert_equal(WriteReg_fake.arg0_val, RESET_UNIT_DDR_RESET_REG_ADDR);
+	zassert_equal(WriteReg_fake.arg1_val, expected.val);
 }
 
 ZTEST_SUITE(gddr, NULL, NULL, NULL, NULL, NULL);

@@ -5,6 +5,7 @@
  */
 
 #include "avs.h"
+#include "init.h"
 #include "regulator.h"
 
 #include <tenstorrent/sys_init_defines.h>
@@ -50,6 +51,8 @@ static const struct device *const pll_dev_1 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL
 #define AVS_RAIL_SEL_BROADCAST               0xf
 #define AVS_ERR_RB_DATA                      0xffff
 #define AVSCLK_FREQ_MHZ                      20
+#define AVS_FIFO_TIMEOUT_CYCLES              WAIT_1MS
+#define AVS_FIFO_WAIT_MAX_POLLS              50000U
 
 /* command code, command group macros */
 /* 0: defined by AVS spec, 1: vendor specific  */
@@ -87,25 +90,23 @@ typedef enum {
 	AVSRead = 3,
 } AVSReadWriteType;
 
-static void WaitCmdFifoNotFull(void)
+static bool WaitForFifo(uint32_t status_mask)
 {
-	uint32_t cmd_fifo_vacant_slots = 0;
+	uint64_t start = TimerTimestamp();
 
-	do {
-		cmd_fifo_vacant_slots = ReadReg(APB2AVSBUS_AVS_FIFOS_STATUS_REG_ADDR) &
-					GET_AVS_FIELD_MASK(FIFOS_STATUS, CMD_FIFO_VACANT_SLOTS);
-	} while (cmd_fifo_vacant_slots == 0);
-}
+	for (uint32_t polls = 0; polls < AVS_FIFO_WAIT_MAX_POLLS; polls++) {
+		if ((ReadReg(APB2AVSBUS_AVS_FIFOS_STATUS_REG_ADDR) & status_mask) != 0U) {
+			return true;
+		}
+		if (TimerTimestamp() - start >= AVS_FIFO_TIMEOUT_CYCLES) {
+			return false;
+		}
+	}
 
-static void WaitRxFifoNotEmpty(void)
-{
-	uint32_t readback_fifo_occupied_slots = 0;
-
-	do {
-		readback_fifo_occupied_slots =
-			ReadReg(APB2AVSBUS_AVS_FIFOS_STATUS_REG_ADDR) &
-			GET_AVS_FIELD_MASK(FIFOS_STATUS, READBACK_FIFO_OCCUPIED_SLOTS);
-	} while (readback_fifo_occupied_slots == 0);
+	/* The poll bound is independent of the reference timer. It prevents a
+	 * broken timer and a wedged AVS controller from hanging the DVFS worker.
+	 */
+	return false;
 }
 
 /* Assume users do not program max_retries while reading from the RX FIFO. */
@@ -118,7 +119,10 @@ static AVSStatus ReadRxFifo(uint16_t *response)
 	AVSStatus slave_ack = AVSOk;
 
 	do {
-		WaitRxFifoNotEmpty();
+		if (!WaitForFifo(GET_AVS_FIELD_MASK(FIFOS_STATUS, READBACK_FIFO_OCCUPIED_SLOTS))) {
+			slave_ack = AVSTimeout;
+			break;
+		}
 		readback_data = ReadReg(APB2AVSBUS_AVS_READBACK_REG_ADDR);
 		slave_ack = readback_data >> GET_AVS_FIELD_SHIFT(READBACK, SLAVE_ACK);
 		num_tries++;
@@ -136,10 +140,13 @@ static AVSStatus ReadRxFifo(uint16_t *response)
 	return slave_ack;
 }
 
-static void SendCmd(uint16_t cmd_data, uint8_t rail_sel, uint8_t cmd_code, uint8_t cmd_grp,
-		    AVSReadWriteType r_or_w)
+static AVSStatus SendCmd(uint16_t cmd_data, uint8_t rail_sel, uint8_t cmd_code, uint8_t cmd_grp,
+			 AVSReadWriteType r_or_w)
 {
-	WaitCmdFifoNotFull();
+	if (!WaitForFifo(GET_AVS_FIELD_MASK(FIFOS_STATUS, CMD_FIFO_VACANT_SLOTS))) {
+		return AVSTimeout;
+	}
+
 	uint32_t cmd_data_pos = cmd_data << GET_AVS_FIELD_SHIFT(CMD, CMD_DATA);
 	uint32_t rail_sel_pos = (rail_sel << GET_AVS_FIELD_SHIFT(CMD, RAIL_SEL)) &
 				GET_AVS_FIELD_MASK(CMD, RAIL_SEL);
@@ -151,12 +158,29 @@ static void SendCmd(uint16_t cmd_data, uint8_t rail_sel, uint8_t cmd_code, uint8
 
 	WriteReg(APB2AVSBUS_AVS_CMD_REG_ADDR,
 		 cmd_data_pos | rail_sel_pos | cmd_code_pos | cmd_grp_pos | r_or_w_pos);
+
+	return AVSOk;
+}
+
+static AVSStatus SendCmdAndRead(uint16_t cmd_data, uint8_t rail_sel, uint8_t cmd_code,
+				uint8_t cmd_grp, AVSReadWriteType r_or_w, uint16_t *response)
+{
+	AVSStatus status = SendCmd(cmd_data, rail_sel, cmd_code, cmd_grp, r_or_w);
+
+	if (status != AVSOk) {
+		if (response != NULL) {
+			*response = AVS_ERR_RB_DATA;
+		}
+		return status;
+	}
+
+	return ReadRxFifo(response);
 }
 
 /* Program CFG_0, CFG_1 registers and interrupt settings. */
 /* Use default max_retries, resync_interval, clk_divide_value, and clk_divider_duty_cycle_numerator
  */
-void AVSInit(void)
+static int AVSInit(void)
 {
 	APB2AVSBUS_AVS_CFG_1_reg_u avs_cfg_1;
 
@@ -171,8 +195,12 @@ void AVSInit(void)
 	 */
 	uint32_t apb_clk_freq = 0;
 
-	clock_control_get_rate(pll_dev_1, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_APBCLK,
-			       &apb_clk_freq);
+	int ret = clock_control_get_rate(
+		pll_dev_1, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_APBCLK, &apb_clk_freq);
+
+	if (ret != 0 || apb_clk_freq == 0U) {
+		return ret != 0 ? ret : -EIO;
+	}
 	avs_cfg_1.f.clk_divider_value = DIV_ROUND_UP(apb_clk_freq, AVSCLK_FREQ_MHZ);
 	avs_cfg_1.f.avs_clock_select = 1;
 	WriteReg(APB2AVSBUS_AVS_CFG_1_REG_ADDR, avs_cfg_1.val);
@@ -186,18 +214,22 @@ void AVSInit(void)
 
 	/* Enable all interrupts. */
 	WriteReg(APB2AVSBUS_AVS_INTERRUPT_MASK_REG_ADDR, 0);
+	return 0;
 }
 
 AVSStatus AVSReadVoltage(uint8_t rail_sel, uint16_t *voltage_in_mV)
 {
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_VOLTAGE, AVSRead);
-	return ReadRxFifo(voltage_in_mV);
+	return SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_VOLTAGE, AVSRead, voltage_in_mV);
 }
 
 AVSStatus AVSWriteVoltage(uint16_t voltage_in_mV, uint8_t rail_sel)
 {
-	SendCmd(voltage_in_mV, rail_sel, AVS_CMD_VOLTAGE, AVSCommitWrite);
-	AVSStatus status = ReadRxFifo(NULL);
+	AVSStatus status = SendCmd(voltage_in_mV, rail_sel, AVS_CMD_VOLTAGE, AVSCommitWrite);
+
+	if (status != AVSOk) {
+		return status;
+	}
+	status = ReadRxFifo(NULL);
 
 	/* 150us to cover voltage switch from 0.65V to 0.95V with 50us of margin */
 	WaitUs(150);
@@ -206,9 +238,9 @@ AVSStatus AVSWriteVoltage(uint16_t voltage_in_mV, uint8_t rail_sel)
 
 AVSStatus AVSReadVoutTransRate(uint8_t rail_sel, uint8_t *rise_rate, uint8_t *fall_rate)
 {
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_VOUT_TRANS_RATE, AVSRead);
 	uint16_t trans_rate;
-	AVSStatus status = ReadRxFifo(&trans_rate);
+	AVSStatus status = SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_VOUT_TRANS_RATE,
+					  AVSRead, &trans_rate);
 	*rise_rate = trans_rate >> 8;
 	*fall_rate = trans_rate & 0xff;
 	return status;
@@ -218,59 +250,55 @@ AVSStatus AVSWriteVoutTransRate(uint8_t rise_rate, uint8_t fall_rate, uint8_t ra
 {
 	uint16_t trans_rate = (rise_rate << 8) | fall_rate;
 
-	SendCmd(trans_rate, rail_sel, AVS_CMD_VOUT_TRANS_RATE, AVSCommitWrite);
-	return ReadRxFifo(NULL);
+	return SendCmdAndRead(trans_rate, rail_sel, AVS_CMD_VOUT_TRANS_RATE, AVSCommitWrite, NULL);
 }
 
 /* Returns current in A */
 AVSStatus AVSReadCurrent(uint8_t rail_sel, float *current_in_A)
 {
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_CURRENT_READ, AVSRead);
 	uint16_t current_in_10mA;
-	AVSStatus status = ReadRxFifo(&current_in_10mA);
+	AVSStatus status = SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_CURRENT_READ, AVSRead,
+					  &current_in_10mA);
 	*current_in_A = current_in_10mA * 0.01f;
 	return status;
 }
 
 AVSStatus AVSReadTemp(uint8_t rail_sel, float *temp_in_C)
 {
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_TEMP_READ, AVSRead);
 	uint16_t temp; /* 1LSB = 0.1degC  */
-	AVSStatus status = ReadRxFifo(&temp);
+	AVSStatus status =
+		SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_TEMP_READ, AVSRead, &temp);
 	*temp_in_C = temp * 0.1;
 	return status;
 }
 
 AVSStatus AVSForceVoltageReset(uint8_t rail_sel)
 {
-	SendCmd(AVS_FORCE_RESET_DATA, rail_sel, AVS_CMD_FORCE_RESET, AVSCommitWrite);
-	return ReadRxFifo(NULL);
+	return SendCmdAndRead(AVS_FORCE_RESET_DATA, rail_sel, AVS_CMD_FORCE_RESET, AVSCommitWrite,
+			      NULL);
 }
 
 /* This command is not supported by MAX20816, but will be ACKed. */
 AVSStatus AVSReadPowerMode(uint8_t rail_sel, AVSPwrMode *power_mode)
 {
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_POWER_MODE, AVSRead);
-	return ReadRxFifo((uint16_t *)power_mode);
+	return SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_POWER_MODE, AVSRead,
+			      (uint16_t *)power_mode);
 }
 
 /* This command is not supported by MAX20816, but will be ACKed. */
 AVSStatus AVSWritePowerMode(AVSPwrMode power_mode, uint8_t rail_sel)
 {
-	SendCmd(power_mode, rail_sel, AVS_CMD_POWER_MODE, AVSCommitWrite);
-	return ReadRxFifo(NULL);
+	return SendCmdAndRead(power_mode, rail_sel, AVS_CMD_POWER_MODE, AVSCommitWrite, NULL);
 }
 
 AVSStatus AVSReadStatus(uint8_t rail_sel, uint16_t *status)
 {
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_STATUS, AVSRead);
-	return ReadRxFifo(status);
+	return SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_STATUS, AVSRead, status);
 }
 
 AVSStatus AVSWriteStatus(uint16_t status, uint8_t rail_sel)
 {
-	SendCmd(status, rail_sel, AVS_CMD_STATUS, AVSCommitWrite);
-	return ReadRxFifo(NULL);
+	return SendCmdAndRead(status, rail_sel, AVS_CMD_STATUS, AVSCommitWrite, NULL);
 }
 
 /* For AVSBus version read, the rail_sel is broadcast. */
@@ -278,16 +306,16 @@ AVSStatus AVSWriteStatus(uint16_t status, uint8_t rail_sel)
 /* Any other PMBus versions are not supported by the AVS controller. */
 AVSStatus AVSReadVersion(uint16_t *version)
 {
-	SendCmd(AVS_RD_CMD_DATA, AVS_RAIL_SEL_BROADCAST, AVS_CMD_VERSION_READ, AVSRead);
-	return ReadRxFifo(version);
+	return SendCmdAndRead(AVS_RD_CMD_DATA, AVS_RAIL_SEL_BROADCAST, AVS_CMD_VERSION_READ,
+			      AVSRead, version);
 }
 
 AVSStatus AVSReadSystemInputCurrent(uint16_t *response)
 {
 	uint8_t rail_sel = 0x0; /* Rail A and Rail B return the same data. */
 
-	SendCmd(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_SYS_INPUT_CURRENT_READ, AVSRead);
-	return ReadRxFifo(response);
+	return SendCmdAndRead(AVS_RD_CMD_DATA, rail_sel, AVS_CMD_SYS_INPUT_CURRENT_READ, AVSRead,
+			      response);
 	/* TODO: need to figure the formula to calculate the system input current */
 	/* System Input Current (read only) returns the ADC output of voltage at IINSEN pin. */
 	/* The raw ADC data is decoded to determine the VIINSEN voltage: */
@@ -308,8 +336,14 @@ static int avs_init(void)
 	}
 
 	/* Initiate AVS interface and switch vout control to AVSBus */
-	AVSInit();
-	SwitchVoutControl(AVSVoutCommand);
+	if (AVSInit() != 0) {
+		record_init_failure(INIT_STAGE_REGULATOR);
+		return -EIO;
+	}
+	if (SwitchVoutControl(AVSVoutCommand) != 0) {
+		record_init_failure(INIT_STAGE_REGULATOR);
+		return -EIO;
+	}
 
 	return 0;
 }

@@ -56,42 +56,37 @@ struct jtag_api {
 
 static inline int jtag_tick(const struct device *dev, uint32_t count)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->tick(dev, count);
+	return api->tick != NULL ? api->tick(dev, count) : -ENOSYS;
 }
 
 static inline int jtag_read_id(const struct device *dev, uint32_t *id)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL || id == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->read_id(dev, id);
+	return api->read_id != NULL ? api->read_id(dev, id) : -ENOSYS;
 }
 
 static inline int jtag_reset(const struct device *dev)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->reset(dev);
+	return api->reset != NULL ? api->reset(dev) : -ENOSYS;
 }
 
 static ALWAYS_INLINE int jtag_update_ir(const struct device *dev, uint32_t count,
 					const uint8_t *data)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL || (data == NULL && count > 0)) {
 		return -EINVAL;
 	}
@@ -99,15 +94,14 @@ static ALWAYS_INLINE int jtag_update_ir(const struct device *dev, uint32_t count
 	if (count == 0) {
 		return 0;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->update_ir(dev, count, data);
+	return api->update_ir != NULL ? api->update_ir(dev, count, data) : -ENOSYS;
 }
 
 static ALWAYS_INLINE int jtag_update_dr(const struct device *dev, bool idle, uint32_t count,
 					const uint8_t *data_in, uint8_t *data_out)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL || (data_in == NULL && count > 0)) {
 		return -EINVAL;
 	}
@@ -115,64 +109,65 @@ static ALWAYS_INLINE int jtag_update_dr(const struct device *dev, bool idle, uin
 	if (count == 0) {
 		return 0;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->update_dr(dev, idle, count, data_in, data_out);
+	return api->update_dr != NULL ? api->update_dr(dev, idle, count, data_in, data_out)
+				      : -ENOSYS;
 }
 
 static inline int jtag_setup(const struct device *dev)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->setup(dev);
+	return api->setup != NULL ? api->setup(dev) : -ENOSYS;
 }
 
 static inline int jtag_teardown(const struct device *dev)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->teardown(dev);
+	return api->teardown != NULL ? api->teardown(dev) : -ENOSYS;
 }
 
 static inline int jtag_axi_read32(const struct device *dev, uint32_t addr, uint32_t *value)
 {
-	const struct jtag_api *api = dev->api;
-
-	if (dev == NULL) {
+	if (dev == NULL || value == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->axi_read32(dev, addr, value);
+	return api->axi_read32 != NULL ? api->axi_read32(dev, addr, value) : -ENOSYS;
 }
 
 static inline int jtag_axi_write32(const struct device *dev, uint32_t addr, uint32_t value)
 {
-	const struct jtag_api *api = dev->api;
-
 	if (dev == NULL) {
 		return -EINVAL;
 	}
+	const struct jtag_api *api = dev->api;
 
-	return api->axi_write32(dev, addr, value);
+	return api->axi_write32 != NULL ? api->axi_write32(dev, addr, value) : -ENOSYS;
 }
 
 static inline int jtag_axi_block_write(const struct device *dev, uint32_t addr,
 				       const uint32_t *value, uint32_t len)
 {
-	const struct jtag_api *api = dev->api;
-
-	if (dev == NULL) {
+	if (dev == NULL || (value == NULL && len > 0U)) {
 		return -EINVAL;
 	}
+	if (len == 0U) {
+		return 0;
+	}
+	const struct jtag_api *api = dev->api;
 
-	return api->axi_block_write(dev, addr, value, len);
+	return api->axi_block_write != NULL ? api->axi_block_write(dev, addr, value, len)
+					    : -ENOSYS;
 }
 
 #ifdef __cplusplus

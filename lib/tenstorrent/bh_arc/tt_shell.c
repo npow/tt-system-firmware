@@ -23,6 +23,16 @@
 
 LOG_MODULE_REGISTER(tt_shell, CONFIG_LOG_DEFAULT_LEVEL);
 
+static bool direct_power_mutation_blocked(const struct shell *sh)
+{
+	/* Direct setters bypass message-queue serialization, reset-safe staging,
+	 * and transactional rollback. Mission firmware therefore exposes power
+	 * mutation only through `tt msg`; telemetry remains directly readable.
+	 */
+	shell_error(sh, "Direct power mutation is unavailable; use tt msg");
+	return true;
+}
+
 static int parse_u32_arg(const char *arg, uint32_t *value)
 {
 	char *endptr;
@@ -41,6 +51,10 @@ static int parse_u32_arg(const char *arg, uint32_t *value)
 static int l2cpu_enable_handler(const struct shell *sh, size_t argc, char **argv)
 {
 	bool on = false;
+
+	if (direct_power_mutation_blocked(sh)) {
+		return -EPERM;
+	}
 
 	if (strcmp(argv[1], "off") == 0) {
 		on = false;
@@ -67,6 +81,10 @@ static int tensix_enable_handler(const struct shell *sh, size_t argc, char **arg
 {
 	bool on = false;
 
+	if (direct_power_mutation_blocked(sh)) {
+		return -EPERM;
+	}
+
 	if (strcmp(argv[1], "off") == 0) {
 		on = false;
 
@@ -92,6 +110,10 @@ static int mrisc_power_handler(const struct shell *sh, size_t argc, char **argv)
 {
 	bool on = false;
 
+	if (direct_power_mutation_blocked(sh)) {
+		return -EPERM;
+	}
+
 	if (strcmp(argv[1], "off") == 0) {
 		on = false;
 
@@ -116,6 +138,10 @@ static int mrisc_power_handler(const struct shell *sh, size_t argc, char **argv)
 static int asic_state_handler(const struct shell *sh, size_t argc, char **argv)
 {
 	if (argc == 2U) {
+		if (direct_power_mutation_blocked(sh)) {
+			return -EPERM;
+		}
+
 		AsicState state = (AsicState)atoi(argv[1]);
 
 		if (state == A0State || state == A3State) {
@@ -193,7 +219,11 @@ static int msg_handler(const struct shell *sh, size_t argc, char **argv)
 		return ret;
 	}
 
-	process_message_queues();
+	ret = process_message_queues_sync();
+	if (ret != 0) {
+		shell_error(sh, "Failed to process queued request (%d)", ret);
+		return ret;
+	}
 
 	ret = msgqueue_response_pop(0, &response);
 	if (ret != 0) {

@@ -12,6 +12,7 @@
 #include "asic_state.h"
 #include "smbus_target.h"
 #include "fan_ctrl.h"
+#include "init.h"
 
 #include <stdint.h>
 
@@ -156,22 +157,28 @@ static const struct smbus_cmd_registration smbus_cmds[] = {
 
 static int InitSmbusTarget(void)
 {
-	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEPB);
+	int ret;
 
+	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEPB);
 
 	if (!device_is_ready(smbus_target)) {
 		printk("SMBUS target device not ready\n");
-		return 0;
+		record_init_failure(INIT_STAGE_CABLE_FAULT);
+		return -ENODEV;
 	}
 
-	if (i2c_target_driver_register(smbus_target) < 0) {
+	ret = i2c_target_driver_register(smbus_target);
+	if (ret < 0) {
 		printk("Failed to register i2c target driver\n");
-		return 0;
+		record_init_failure(INIT_STAGE_CABLE_FAULT);
+		return ret;
 	}
 
-	if (smbus_target_register_cmds(smbus_target, smbus_cmds, ARRAY_SIZE(smbus_cmds)) < 0) {
+	ret = smbus_target_register_cmds(smbus_target, smbus_cmds, ARRAY_SIZE(smbus_cmds));
+	if (ret < 0) {
 		printk("Failed to register SMBUS target commands\n");
-		return 0;
+		record_init_failure(INIT_STAGE_CABLE_FAULT);
+		return ret;
 	}
 
 	return 0;

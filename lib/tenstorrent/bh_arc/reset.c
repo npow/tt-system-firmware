@@ -20,6 +20,7 @@
 #include "tensix_init.h"
 #include "aiclk_ppm.h"
 #include "bh_reset.h"
+#include "throttler.h"
 
 #include <tenstorrent/bh_power.h>
 
@@ -46,7 +47,50 @@ static const struct device *const pll_devs[] = {DT_INST_FOREACH_STATUS_OKAY(PLL_
 
 LOG_MODULE_REGISTER(InitHW, CONFIG_TT_APP_LOG_LEVEL);
 
+#define TENSIX_RISC_RESET_REGISTER_COUNT 8U
+
 uint32_t error_status0;
+
+void bh_hold_tensix_riscs_in_reset(void)
+{
+	for (uint32_t i = 0; i < TENSIX_RISC_RESET_REGISTER_COUNT; i++) {
+		WriteReg(RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + i * sizeof(uint32_t), 0U);
+	}
+}
+
+void bh_release_tensix_riscs_from_reset(void)
+{
+	for (uint32_t i = 0; i < TENSIX_RISC_RESET_REGISTER_COUNT; i++) {
+		WriteReg(RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + i * sizeof(uint32_t),
+			 UINT32_MAX);
+	}
+}
+
+static void HoldSecondaryRiscsInReset(void)
+{
+	RESET_UNIT_ETH_RESET_reg_u eth_reset = {
+		.val = ReadReg(RESET_UNIT_ETH_RESET_REG_ADDR),
+	};
+	RESET_UNIT_DDR_RESET_reg_u ddr_reset = {
+		.val = ReadReg(RESET_UNIT_DDR_RESET_REG_ADDR),
+	};
+
+	eth_reset.f.eth_risc_reset_n = 0U;
+	WriteReg(RESET_UNIT_ETH_RESET_REG_ADDR, eth_reset.val);
+	ddr_reset.f.ddr_risc_reset_n = 0U;
+	WriteReg(RESET_UNIT_DDR_RESET_REG_ADDR, ddr_reset.val);
+}
+
+static int HoldProgrammableRiscResetsEarly(void)
+{
+	if (IS_ENABLED(CONFIG_ARC)) {
+		bh_hold_tensix_riscs_in_reset();
+		HoldSecondaryRiscsInReset();
+	}
+
+	return 0;
+}
+SYS_INIT(HoldProgrammableRiscResetsEarly, EARLY, 0);
 
 void record_init_failure(enum init_stage_id stage)
 {
@@ -57,6 +101,13 @@ void record_init_failure(enum init_stage_id stage)
 	error_status0 |= BIT(stage);
 
 	WriteReg(STATUS_ERROR_STATUS0_REG_ADDR, error_status0);
+	/* Initialization failures are safety failures: host readiness is not enough
+	 * to guarantee that no stale workload is resident. Hold every programmable
+	 * tile RISC in hardware reset immediately and leave release to a complete
+	 * ASIC reset.
+	 */
+	bh_hold_tensix_riscs_in_reset();
+	HoldSecondaryRiscsInReset();
 }
 
 /* Cable fault mode: true when DMC reports 0W power limit (no cable or improper installation).
@@ -64,6 +115,8 @@ void record_init_failure(enum init_stage_id stage)
  * power draw, while maintaining the full NOC mesh and ARC-PCIe path for host communication.
  */
 static bool cable_fault_mode;
+static bool boot_cable_power_limit_valid;
+static uint16_t boot_cable_power_limit;
 
 static const uint8_t kNocRing;
 static const uint8_t kNocTlb;
@@ -74,6 +127,64 @@ bool is_cable_fault_mode(void)
 {
 	return cable_fault_mode;
 }
+
+bool bh_get_boot_cable_power_limit(uint16_t *power_limit)
+{
+	if (!boot_cable_power_limit_valid || power_limit == NULL) {
+		return false;
+	}
+
+	*power_limit = boot_cable_power_limit;
+	return true;
+}
+
+int bh_reset_safe_aiclk_acquire(void)
+{
+	int ret = SetAiclkResetSafe(true);
+
+	if (ret != 0) {
+		LOG_ERR("Failed to enable reset-safe AICLK: %d", ret);
+		return ret;
+	}
+
+	uint32_t current_aiclk = GetAiclkCurrent();
+
+	if (current_aiclk > (uint32_t)AICLK_RESET_SAFE_FREQ) {
+		LOG_ERR("Reset-safe AICLK verification failed: %u MHz", current_aiclk);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+int bh_reset_safe_aiclk_release(void)
+{
+	int ret;
+
+	if (!ThrottlerComputePowerPolicyReady()) {
+		LOG_WRN("Retaining reset-safe AICLK until the power policy is ready");
+		return -EPERM;
+	}
+
+	ret = SetAiclkResetSafe(false);
+	if (ret != 0) {
+		/* SetAiclkResetSafe updates its logical state before applying DVFS.
+		 * Reassert the ceiling so a failed release cannot unlock later clocks.
+		 */
+		(void)SetAiclkResetSafe(true);
+	}
+
+	return ret;
+}
+
+#if defined(CONFIG_ZTEST)
+void bh_test_set_boot_cable_power_limit(bool valid, uint16_t power_limit)
+{
+	boot_cable_power_limit_valid = valid;
+	boot_cable_power_limit = power_limit;
+	cable_fault_mode = !valid || power_limit == 0U;
+}
+#endif
 
 void bh_soft_reset_all_tensix(void)
 {
@@ -137,6 +248,8 @@ SYS_INIT_APP(AssertSoftResets);
 /* L2CPU is skipped due to JIRA issues BH-25 and BH-28 */
 static int DeassertRiscvResets(void)
 {
+	int ret;
+
 	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEP7);
 
 	if (IS_ENABLED(CONFIG_TT_SMC_RECOVERY) || !IS_ENABLED(CONFIG_ARC)) {
@@ -150,32 +263,29 @@ static int DeassertRiscvResets(void)
 
 	/* Go back to PLL bypass, since RISCV resets need to be deasserted at low speed */
 	ARRAY_FOR_EACH(pll_devs, i) {
-		clock_control_configure(pll_devs[i], NULL,
-					(void *)CLOCK_CONTROL_TT_BH_CONFIG_BYPASS);
+		ret = clock_control_configure(pll_devs[i], NULL,
+					      (void *)CLOCK_CONTROL_TT_BH_CONFIG_BYPASS);
+		if (ret != 0) {
+			record_init_failure(INIT_STAGE_REGULATOR);
+			return ret;
+		}
 	}
-	/* Deassert RISC reset from reset_unit */
-
-	for (uint32_t i = 0; i < 8; i++) {
-		WriteReg(RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + i * 4, 0xffffffff);
-	}
-
-	RESET_UNIT_ETH_RESET_reg_u eth_reset;
-
-	eth_reset.val = ReadReg(RESET_UNIT_ETH_RESET_REG_ADDR);
-	eth_reset.f.eth_risc_reset_n = 0x3fff;
-	WriteReg(RESET_UNIT_ETH_RESET_REG_ADDR, eth_reset.val);
-
-	RESET_UNIT_DDR_RESET_reg_u ddr_reset;
-
-	ddr_reset.val = ReadReg(RESET_UNIT_DDR_RESET_REG_ADDR);
-	ddr_reset.f.ddr_risc_reset_n = 0xffffff;
-	WriteReg(RESET_UNIT_DDR_RESET_REG_ADDR, ddr_reset.val);
+	/* Keep every programmable tile RISC in hardware reset. Each boot loader
+	 * releases only the target RISC after installing known firmware; Tensix is
+	 * held again after its wipe until init_end establishes the strict policy.
+	 */
+	bh_hold_tensix_riscs_in_reset();
+	HoldSecondaryRiscsInReset();
 
 	ARRAY_FOR_EACH(pll_devs, i) {
-		clock_control_set_rate(pll_devs[i],
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_INIT_STATE,
-				       (clock_control_subsys_rate_t)-1);
-	};
+		ret = clock_control_set_rate(
+			pll_devs[i], (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_INIT_STATE,
+			(clock_control_subsys_rate_t)-1);
+		if (ret != 0) {
+			record_init_failure(INIT_STAGE_REGULATOR);
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -187,6 +297,14 @@ SYS_INIT_APP(DeassertRiscvResets);
  */
 static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct response *rsp)
 {
+	ARG_UNUSED(req);
+
+	if (bh_reset_safe_aiclk_acquire() != 0) {
+		rsp->data[0] = 1U;
+		return 1;
+	}
+	bh_hold_tensix_riscs_in_reset();
+
 	/* Assert reset (active low) */
 	RESET_UNIT_TENSIX_RESET_reg_u tensix_reset = {.val = 0};
 
@@ -194,12 +312,43 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 		WriteReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + i * 4, tensix_reset.val);
 	}
 
-	/* Deassert reset */
-	tensix_reset.val = 0xffffffff;
+	/* Deasserting tile reset makes its NOC endpoint accessible, but hardware
+	 * RISC reset remains asserted until a known soft-reset state is installed.
+	 */
+	unsigned int key = irq_lock();
+
+	if (!ThrottlerComputePowerPolicyReady()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		rsp->data[0] = 1U;
+		return 1;
+	}
+
+	tensix_reset.val = UINT32_MAX;
 	for (uint32_t i = 0; i < 8; i++) {
 		WriteReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + i * 4, tensix_reset.val);
 	}
+	irq_unlock(key);
+	bh_soft_reset_all_tensix();
 
+	/* Serialize the executable-core release with containment. */
+	key = irq_lock();
+	if (!ThrottlerComputePowerPolicyReady()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		rsp->data[0] = 1U;
+		return 1;
+	}
+	bh_release_tensix_riscs_from_reset();
+	irq_unlock(key);
+
+	if (bh_reset_safe_aiclk_release() != 0) {
+		bh_hold_tensix_riscs_in_reset();
+		rsp->data[0] = 1U;
+		return 1;
+	}
+
+	rsp->data[0] = 0U;
 	return 0;
 }
 
@@ -235,10 +384,26 @@ static __maybe_unused uint8_t ToggleSingleTensixReset(const union request *req,
 
 	uint32_t tile_addr = RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 4 * reg_index;
 	uint32_t risc_addr = RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + 4 * reg_index;
+	bool power_state;
+	unsigned int key;
 
-	SetAiclkResetSafe(true);
+	if (bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &power_state) != 0 ||
+	    bh_reset_safe_aiclk_acquire() != 0) {
+		rsp->data[0] = 1U;
+		return 1;
+	}
 
-	/* RISC reset assert */
+	/* Serialize the first RISC read-modify-write too. A containment IRQ between
+	 * an unlocked read and write could otherwise restore every other bit from a
+	 * stale pre-fault value while merely trying to assert this target's reset.
+	 */
+	key = irq_lock();
+	if (!ThrottlerComputePowerPolicyReady()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		rsp->data[0] = 1U;
+		return 1;
+	}
 	uint32_t risc_val = sys_read32(risc_addr);
 
 	sys_write32(risc_val & ~BIT(bit_index), risc_addr);
@@ -247,9 +412,20 @@ static __maybe_unused uint8_t ToggleSingleTensixReset(const union request *req,
 	uint32_t tensix_val = sys_read32(tile_addr);
 
 	sys_write32(tensix_val & ~BIT(bit_index), tile_addr);
+	irq_unlock(key);
 
-	/* Tile reset deassert */
+	/* Tile reset deassert is safe only while the containment latch is clear;
+	 * target RISC hardware reset remains asserted across this transition.
+	 */
+	key = irq_lock();
+	if (!ThrottlerComputePowerPolicyReady()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		rsp->data[0] = 1U;
+		return 1;
+	}
 	sys_write32(tensix_val | BIT(bit_index), tile_addr);
+	irq_unlock(key);
 
 	/* The init functions use NOC2AXITlbSetup with
 	 * physical NOC coordinates; disable ARC translation first to
@@ -267,24 +443,38 @@ static __maybe_unused uint8_t ToggleSingleTensixReset(const union request *req,
 
 	RestoreArcNocTranslation();
 
-	/* RISC reset deassert */
-	sys_write32(risc_val | BIT(bit_index), risc_addr);
+	/* Re-read and serialize the final RISC release with the IRQ-side power
+	 * latch. A stale pre-reset snapshot must never overwrite a containment
+	 * write of zero to this register.
+	 */
+	key = irq_lock();
 
-	SetAiclkResetSafe(false);
+	if (!ThrottlerComputePowerPolicyReady()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		rsp->data[0] = 1U;
+		return 1;
+	}
+	risc_val = sys_read32(risc_addr);
+	sys_write32(risc_val | BIT(bit_index), risc_addr);
+	irq_unlock(key);
 
 	tensix_inject_instruction(TENSIX_INSTRUCTION_UNPACR, 0, false, noc_x, noc_y);
 
 	/* NocInitSingleTile un-gates the tile clock.
 	 * If tensix was in low power, clock gate this tile.
 	 */
-	bool power_state;
-
-	bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &power_state);
 	if (!power_state) {
 		/* ARC NOC translation has been restored above, so (like the
 		 * tensix_inject_instruction call) use the logical coordinates.
 		 */
 		SetSingleTileClockGate(noc_x, noc_y, true);
+	}
+
+	if (bh_reset_safe_aiclk_release() != 0) {
+		bh_hold_tensix_riscs_in_reset();
+		rsp->data[0] = 1U;
+		return 1;
 	}
 
 	rsp->data[0] = 0;
@@ -304,16 +494,57 @@ REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_SINGLE_TENSIX_RESET, ToggleSingleTensixReset)
  */
 static __maybe_unused uint8_t ReinitTensix(const union request *req, struct response *rsp)
 {
+	ARG_UNUSED(req);
+
+	int ret = bh_reset_safe_aiclk_acquire();
+
+	if (ret != 0) {
+		rsp->data[0] = 1U;
+		return 1;
+	}
+	bh_hold_tensix_riscs_in_reset();
+
 	ClearNocTranslation();
 	/* We technically don't have to re-program the entire NOC (only the Tensix NOC portions),
 	 * but it's simpler to reuse the same functions to re-program all of it.
 	 */
-	NocInit();
-	TensixInit();
-	if (bh_chip_info_feature_noc_translation_en()) {
-		InitNocTranslationFromHarvesting();
+	ret = NocInit();
+	if (ret != 0) {
+		bh_hold_tensix_riscs_in_reset();
+		rsp->data[0] = 1U;
+		return 1;
 	}
 
+	TensixInit();
+	if (bh_chip_info_feature_noc_translation_en()) {
+		ret = InitNocTranslationFromHarvesting();
+		if (ret != 0) {
+			bh_hold_tensix_riscs_in_reset();
+			rsp->data[0] = 1U;
+			return 1;
+		}
+	}
+
+	unsigned int key = irq_lock();
+
+	if (!ThrottlerComputePowerPolicyReady()) {
+		bh_hold_tensix_riscs_in_reset();
+		irq_unlock(key);
+		rsp->data[0] = 1U;
+		return 1;
+	}
+	bh_release_tensix_riscs_from_reset();
+	irq_unlock(key);
+	/* TensixInit's workaround was issued while hardware reset was asserted. */
+	tensix_inject_instruction(TENSIX_INSTRUCTION_UNPACR, 0, true, 0, 0);
+
+	if (bh_reset_safe_aiclk_release() != 0) {
+		bh_hold_tensix_riscs_in_reset();
+		rsp->data[0] = 1U;
+		return 1;
+	}
+
+	rsp->data[0] = 0U;
 	return 0;
 }
 #ifndef CONFIG_TT_SMC_RECOVERY
@@ -322,28 +553,39 @@ REGISTER_MESSAGE(TT_SMC_MSG_REINIT_TENSIX, ReinitTensix);
 
 static int DeassertTileResets(void)
 {
+	int ret;
+
 	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEP3);
 
 	if (!IS_ENABLED(CONFIG_ARC)) {
 		return 0;
 	}
 
-	/* Read cable power limit with magic marker check for backward compatibility.
-	 * - If magic marker present: new DMC, check power limit (0 = cable fault)
-	 * - If magic marker absent: legacy DMC, skip cable fault detection
+	/* An SMC-only restart does not reset the ASIC reset-unit state. Reassert
+	 * every programmable-RISC hold before policy or tile-reset changes.
 	 */
+	bh_hold_tensix_riscs_in_reset();
+	HoldSecondaryRiscsInReset();
+
+	/* Read the DMC policy before enabling any host-facing runtime interface. */
 	uint32_t raw_value = ReadReg(DMC_CABLE_POWER_LIMIT_REG_ADDR);
 
-	if (bh_chip_info_is_ubb()) {
-		/* Galaxy boards have no DMC; CPLD never sets cable power limit */
-		LOG_INF("Galaxy board detected, no cable fault check needed");
+	cable_fault_mode = false;
+	boot_cable_power_limit_valid = false;
+	boot_cable_power_limit = 0;
+
+	if (!bh_chip_info_board_power_policy_required()) {
+		/* Galaxy and zero-limit lab variants have no DMC input-power sensor.
+		 * Their on-chip rail policy remains active, but no cable magic is expected.
+		 */
+		LOG_INF("Board power policy not required; skipping DMC cable check");
 	} else if ((raw_value & CABLE_POWER_LIMIT_MAGIC_MASK) == CABLE_POWER_LIMIT_MAGIC) {
-		/* New DMC with cable power limit feature */
-		uint16_t cable_power_limit = raw_value & CABLE_POWER_LIMIT_VALUE_MASK;
+		boot_cable_power_limit = raw_value & CABLE_POWER_LIMIT_VALUE_MASK;
+		boot_cable_power_limit_valid = true;
 
-		LOG_INF("Cable Power Limit: %u", cable_power_limit);
+		LOG_INF("Cable Power Limit: %u", boot_cable_power_limit);
 
-		if (cable_power_limit == 0) {
+		if (boot_cable_power_limit == 0) {
 			cable_fault_mode = true;
 			record_init_failure(INIT_STAGE_CABLE_FAULT);
 			LOG_WRN("Cable fault detected (0W power limit). "
@@ -351,14 +593,22 @@ static int DeassertTileResets(void)
 				"(contains ARC).");
 		}
 	} else {
-		/* Legacy DMC without cable power limit feature - skip cable fault check */
-		LOG_INF("Legacy DMC detected (no cable power feature), skipping cable fault check");
+		/* A missing policy is indistinguishable from an old or failed DMC. Keep
+		 * compute contained instead of booting with no electrical limit.
+		 */
+		cable_fault_mode = true;
+		record_init_failure(INIT_STAGE_CABLE_FAULT);
+		LOG_WRN("No valid DMC cable power policy; entering low-power mode");
 	}
 
 	/* Put all PLLs back into bypass, since tile resets need to be deasserted at low speed */
 	ARRAY_FOR_EACH(pll_devs, i) {
-		clock_control_configure(pll_devs[i], NULL,
-					(void *)CLOCK_CONTROL_TT_BH_CONFIG_BYPASS);
+		ret = clock_control_configure(pll_devs[i], NULL,
+					      (void *)CLOCK_CONTROL_TT_BH_CONFIG_BYPASS);
+		if (ret != 0) {
+			record_init_failure(INIT_STAGE_REGULATOR);
+			return ret;
+		}
 	}
 
 	/* Always deassert NOC, system, and PCIe resets - needed for ARC-PCIe communication */

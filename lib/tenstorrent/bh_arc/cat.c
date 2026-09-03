@@ -6,6 +6,7 @@
 
 #include "cat.h"
 #include "cm2dm_msg.h"
+#include "init.h"
 #include "reg.h"
 #include "telemetry.h"
 #include "timer.h"
@@ -15,7 +16,6 @@
 #include <tenstorrent/post_code.h>
 #include <tenstorrent/sys_init_defines.h>
 #include <zephyr/kernel.h>
-#include <zephyr/sys/util.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/init.h>
 #include <zephyr/sys/util.h>
@@ -94,13 +94,21 @@ static void WaitCATUpdate(void)
 
 static const struct device *gpio1 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(gpio1));
 
-static void EnableCAT(uint8_t trim_code, bool shutdown_on_trip)
+static int EnableCAT(uint8_t trim_code, bool shutdown_on_trip)
 {
 	/* CAT output is not stable during initialization,
 	 * disable therm trip GPIO and PLL bypass to avoid false therm trip indication
 	 */
 
-	gpio_pin_configure(gpio1, 15, GPIO_DISCONNECTED);
+	if (gpio1 == NULL || !device_is_ready(gpio1)) {
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure(gpio1, 15, GPIO_DISCONNECTED);
+
+	if (ret != 0) {
+		return ret;
+	}
 
 	RESET_UNIT_CATMON_THERM_TRIP_CNTL_reg_u cat_cntl;
 
@@ -115,11 +123,16 @@ static void EnableCAT(uint8_t trim_code, bool shutdown_on_trip)
 
 	if (shutdown_on_trip) {
 		/* CAT initialization complete, enable therm trip GPIO and PLL bypass */
-		gpio_pin_configure(gpio1, 15, GPIO_OUTPUT);
+		ret = gpio_pin_configure(gpio1, 15, GPIO_OUTPUT);
+		if (ret != 0) {
+			return ret;
+		}
 		cat_cntl.f.pll_therm_trip_bypass_catmon_en = 1;
 		cat_cntl.f.pll_therm_trip_bypass_thermb_en = 1;
 		WriteReg(RESET_UNIT_CATMON_THERM_TRIP_CNTL_REG_ADDR, cat_cntl.val);
 	}
+
+	return 0;
 }
 
 static int CATEarlyInit(void)
@@ -128,8 +141,12 @@ static int CATEarlyInit(void)
 		return 0;
 	}
 
-	EnableCAT(TempToTrimCode(CAT_EARLY_TRIP_TEMP), true);
-	return 0;
+	int ret = EnableCAT(TempToTrimCode(CAT_EARLY_TRIP_TEMP), true);
+
+	if (ret != 0) {
+		record_init_failure(INIT_STAGE_THERMAL);
+	}
+	return ret;
 }
 SYS_INIT_APP(CATEarlyInit);
 
@@ -141,7 +158,9 @@ SYS_INIT_APP(CATEarlyInit);
  */
 static float CalibrateCAT(void)
 {
-	EnableCAT(0, false);
+	if (EnableCAT(0, false) != 0) {
+		return DEFAULT_CALIBRATION;
+	}
 
 	/* Not possible that it's already 196C. */
 	if (ReadReg(RESET_UNIT_CATMON_THERM_TRIP_STATUS_REG_ADDR)) {
@@ -176,11 +195,15 @@ static float CalibrateCAT(void)
 	float avg_tmp;
 	const struct sensor_decoder_api *decoder;
 
-	sensor_get_decoder(pvt, &decoder);
-	sensor_read(&cat_ts_avg_iodev, &cat_ts_avg_ctx, cat_ts_avg_buf, sizeof(cat_ts_avg_buf));
-
-	decoder->decode(cat_ts_avg_buf, (struct sensor_chan_spec){SENSOR_CHAN_PVT_TT_BH_TS_AVG, 0},
-			NULL, 1, &avg_tmp);
+	if (!device_is_ready(pvt) || sensor_get_decoder(pvt, &decoder) != 0 || decoder == NULL ||
+	    sensor_read(&cat_ts_avg_iodev, &cat_ts_avg_ctx, cat_ts_avg_buf,
+			sizeof(cat_ts_avg_buf)) != 0 ||
+	    decoder->decode(cat_ts_avg_buf,
+			    (struct sensor_chan_spec){SENSOR_CHAN_PVT_TT_BH_TS_AVG, 0}, NULL, 1,
+			    &avg_tmp) <= 0) {
+		LOG_ERR("CATMON calibration sensor read failed; using conservative default");
+		return DEFAULT_CALIBRATION;
+	}
 
 	float catmon_error = catmon_temp - avg_tmp;
 
@@ -203,8 +226,12 @@ static int CATInit(void)
 
 	float catmon_error = CalibrateCAT();
 
-	EnableCAT(TempToTrimCode(T_J_SHUTDOWN + catmon_error), true);
-	return 0;
+	int ret = EnableCAT(TempToTrimCode(T_J_SHUTDOWN + catmon_error), true);
+
+	if (ret != 0) {
+		record_init_failure(INIT_STAGE_THERMAL);
+	}
+	return ret;
 }
 SYS_INIT_APP(CATInit);
 

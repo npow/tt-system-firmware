@@ -47,6 +47,7 @@
 #define GDDR_IO_RAIL_VOLTAGE           1.35f   /* V - fixed IO rail supply */
 #define READ_POUT                      0x96
 #define READ_POUT_DATA_BYTE_SIZE       2
+#define MAX20816_VOLTAGE_TOLERANCE_MV  10U
 #define OPERATION                      0x1
 #define OPERATION_DATA_BYTE_SIZE       1
 #define PMBUS_CMD_BYTE_SIZE            1
@@ -96,33 +97,48 @@ static float ConvertGddrIoCurrentToFloat(uint16_t value)
 /* The function returns the core current in A. */
 float GetVcoreCurrent(void)
 {
-	I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t iout;
+	uint16_t iout = 0;
+	uint32_t status = I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
 
-	I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&iout,
-		     READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status == 0U) {
+		status = I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE,
+				      (uint8_t *)&iout, READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	}
+	if (status != 0U) {
+		return FLT_MAX;
+	}
 	return ConvertLinear11ToFloat(iout);
 }
 
 /* The function returns the GDDR west IO rail current in A. */
 float GetGddrWestIoCurrent(void)
 {
-	I2CInit(I2CMst, GDDRIO_WEST_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t iout;
+	uint16_t iout = 0;
+	uint32_t status = I2CInit(I2CMst, GDDRIO_WEST_ADDR, I2CFastMode, PMBUS_MST_ID);
 
-	I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&iout,
-		     READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status == 0U) {
+		status = I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE,
+				      (uint8_t *)&iout, READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	}
+	if (status != 0U) {
+		return FLT_MAX;
+	}
 	return ConvertGddrIoCurrentToFloat(iout);
 }
 
 /* The function returns the GDDR east IO rail current in A. */
 float GetGddrEastIoCurrent(void)
 {
-	I2CInit(I2CMst, GDDRIO_EAST_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t iout;
+	uint16_t iout = 0;
+	uint32_t status = I2CInit(I2CMst, GDDRIO_EAST_ADDR, I2CFastMode, PMBUS_MST_ID);
 
-	I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&iout,
-		     READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status == 0U) {
+		status = I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE,
+				      (uint8_t *)&iout, READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	}
+	if (status != 0U) {
+		return FLT_MAX;
+	}
 	return ConvertGddrIoCurrentToFloat(iout);
 }
 
@@ -141,119 +157,211 @@ float GetGddrEastIoPower(void)
 /* The function returns the core power in W. */
 float GetVcorePower(void)
 {
-	I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t pout;
+	uint16_t pout = 0;
+	uint32_t status = I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
 
-	I2CReadBytes(PMBUS_MST_ID, READ_POUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&pout,
-		     READ_POUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status == 0U) {
+		status = I2CReadBytes(PMBUS_MST_ID, READ_POUT, PMBUS_CMD_BYTE_SIZE,
+				      (uint8_t *)&pout, READ_POUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	}
+	if (status != 0U) {
+		return FLT_MAX;
+	}
 	return ConvertLinear11ToFloat(pout);
 }
 
-static void set_max20730(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
+static int set_max20730(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+	uint32_t status = I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	float vref = voltage_in_mv / (1 + rfb1 / rfb2);
 	uint16_t vout_cmd = vref * LINEAR_FORMAT_CONSTANT * 0.001f;
 
-	I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		      VOUT_COMMAND_DATA_BYTE_SIZE);
+	if (status == 0U) {
+		status = I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE,
+				       (uint8_t *)&vout_cmd, VOUT_COMMAND_DATA_BYTE_SIZE);
+	}
 
 	/* delay to flush i2c transaction and voltage change */
-	WaitUs(250);
+	if (status == 0U) {
+		WaitUs(250);
+	}
+	return status == 0U ? 0 : -EIO;
 }
 
-static void set_mpm3695(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
+static int set_mpm3695(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+	uint32_t status = I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	uint16_t vout_cmd = voltage_in_mv * 0.5f / SCALE_LOOP / (1 + rfb1 / rfb2);
 
-	I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		      VOUT_COMMAND_DATA_BYTE_SIZE);
+	if (status == 0U) {
+		status = I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE,
+				       (uint8_t *)&vout_cmd, VOUT_COMMAND_DATA_BYTE_SIZE);
+	}
 
 	/* delay to flush i2c transaction and voltage change */
-	WaitUs(250);
+	if (status == 0U) {
+		WaitUs(250);
+	}
+	return status == 0U ? 0 : -EIO;
 }
 
 /* Set MAX20816 voltage using I2C, MAX20816 is used for Vcore and Vcorem */
-static void i2c_set_max20816(uint32_t slave_addr, uint32_t voltage_in_mv)
+static int i2c_set_max20816(uint32_t slave_addr, uint32_t voltage_in_mv)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+	uint32_t status = I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	uint16_t vout_cmd = 2 * voltage_in_mv;
 
-	I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		      VOUT_COMMAND_DATA_BYTE_SIZE);
+	if (status == 0U) {
+		status = I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE,
+				       (uint8_t *)&vout_cmd, VOUT_COMMAND_DATA_BYTE_SIZE);
+	}
 
 	/* 100us to flush the tx of i2c + 150us to cover voltage switch from 0.65V to 0.95V with
 	 * 50us of margin
 	 */
-	WaitUs(250);
+	if (status == 0U) {
+		WaitUs(250);
+	}
+	return status == 0U ? 0 : -EIO;
 }
 
 /* Returns MAX20816 output volage in mV. */
-static float i2c_get_max20816(uint32_t slave_addr)
+static int i2c_get_max20816(uint32_t slave_addr, uint32_t *voltage_in_mv)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+	if (voltage_in_mv == NULL) {
+		return -EINVAL;
+	}
+
+	uint32_t status = I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	uint16_t vout_cmd = 0;
 
-	I2CReadBytes(PMBUS_MST_ID, READ_VOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		     READ_VOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status == 0U) {
+		status = I2CReadBytes(PMBUS_MST_ID, READ_VOUT, PMBUS_CMD_BYTE_SIZE,
+				      (uint8_t *)&vout_cmd, READ_VOUT_DATA_BYTE_SIZE,
+				      PMBUS_FLIP_BYTES);
+	}
 
-	return vout_cmd * 0.5f;
+	if (status != 0U) {
+		return -EIO;
+	}
+
+	/* READ_VOUT is reported in 0.5 mV units. Round to the nearest whole mV
+	 * rather than silently understating the rail.
+	 */
+	*voltage_in_mv = DIV_ROUND_CLOSEST((uint32_t)vout_cmd, 2U);
+	return 0;
 }
 
-void set_vcore(uint32_t voltage_in_mv)
+static int verify_max20816_voltage(uint32_t slave_addr, uint32_t requested_mv)
 {
-	if (vout_cmd_source == AVSVoutCommand) {
-		AVSWriteVoltage(voltage_in_mv, AVS_VCORE_RAIL);
-	} else {
-		i2c_set_max20816(P0V8_VCORE_ADDR, voltage_in_mv);
+	uint32_t observed_mv;
+	int ret = i2c_get_max20816(slave_addr, &observed_mv);
+
+	if (ret != 0) {
+		return ret;
 	}
+
+	uint32_t error_mv = observed_mv > requested_mv ? observed_mv - requested_mv
+						       : requested_mv - observed_mv;
+
+	if (error_mv > MAX20816_VOLTAGE_TOLERANCE_MV) {
+		LOG_ERR("Regulator %#x voltage verification failed: requested %u mV, read %u mV",
+			slave_addr, requested_mv, observed_mv);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+int set_vcore(uint32_t voltage_in_mv)
+{
+	int ret;
+
+	if (vout_cmd_source == AVSVoutCommand) {
+		ret = AVSWriteVoltage(voltage_in_mv, AVS_VCORE_RAIL) == AVSOk ? 0 : -EIO;
+	} else {
+		ret = i2c_set_max20816(P0V8_VCORE_ADDR, voltage_in_mv);
+	}
+
+	return ret == 0 ? verify_max20816_voltage(P0V8_VCORE_ADDR, voltage_in_mv) : ret;
 }
 
 uint32_t get_vcore(void)
 {
-	return i2c_get_max20816(P0V8_VCORE_ADDR);
+	uint32_t voltage_in_mv;
+
+	return i2c_get_max20816(P0V8_VCORE_ADDR, &voltage_in_mv) == 0 ? voltage_in_mv : UINT32_MAX;
 }
 
-void set_vcorem(uint32_t voltage_in_mv)
+int set_vcorem(uint32_t voltage_in_mv)
 {
-	i2c_set_max20816(P0V8_VCOREM_ADDR, voltage_in_mv);
+	int ret = i2c_set_max20816(P0V8_VCOREM_ADDR, voltage_in_mv);
+
+	return ret == 0 ? verify_max20816_voltage(P0V8_VCOREM_ADDR, voltage_in_mv) : ret;
 }
 
 uint32_t get_vcorem(void)
 {
-	return i2c_get_max20816(P0V8_VCOREM_ADDR);
+	uint32_t voltage_in_mv;
+
+	return i2c_get_max20816(P0V8_VCOREM_ADDR, &voltage_in_mv) == 0 ? voltage_in_mv : UINT32_MAX;
 }
 
 /* Set GDDR VDDR voltage for corner parts before DRAM training */
-void set_gddr_vddr(PcbType board_type, uint32_t voltage_in_mv)
+int set_gddr_vddr(PcbType board_type, uint32_t voltage_in_mv)
 {
 	if (board_type == PcbTypeOrionSLT) {
-		set_max20730(CB_GDDR_VDDR_WEST_ADDR, voltage_in_mv, CB_GDDR_VDDR_FB1,
-			     CB_GDDR_VDDR_FB2);
-		set_max20730(CB_GDDR_VDDR_EAST_ADDR, voltage_in_mv, CB_GDDR_VDDR_FB1,
-			     CB_GDDR_VDDR_FB2);
-	} else {
-		set_mpm3695(GDDR_VDDR_ADDR, voltage_in_mv, GDDR_VDDR_FB1, GDDR_VDDR_FB2);
+		int ret = set_max20730(CB_GDDR_VDDR_WEST_ADDR, voltage_in_mv, CB_GDDR_VDDR_FB1,
+				       CB_GDDR_VDDR_FB2);
+
+		if (ret != 0) {
+			return ret;
+		}
+		return set_max20730(CB_GDDR_VDDR_EAST_ADDR, voltage_in_mv, CB_GDDR_VDDR_FB1,
+				    CB_GDDR_VDDR_FB2);
 	}
+
+	return set_mpm3695(GDDR_VDDR_ADDR, voltage_in_mv, GDDR_VDDR_FB1, GDDR_VDDR_FB2);
 }
 
-void SwitchVoutControl(enum VoltageCmdSource source)
+int SwitchVoutControl(enum VoltageCmdSource source)
 {
-	I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
-	struct OperationBits operation;
+	if (source < VoutCommand || source > AVSVoutCommand) {
+		return -EINVAL;
+	}
 
-	I2CReadBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
-		     OPERATION_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	uint32_t status = I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
+	struct OperationBits operation = {0};
+
+	if (status == 0U) {
+		status = I2CReadBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE,
+				      (uint8_t *)&operation, OPERATION_DATA_BYTE_SIZE,
+				      PMBUS_FLIP_BYTES);
+	}
+	if (status != 0U) {
+		return -EIO;
+	}
 	operation.transition_control =
 		1; /* copy vout command when control is passed from AVSBus to PMBus */
 	operation.voltage_command_source = source;
-	I2CWriteBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
-		      OPERATION_DATA_BYTE_SIZE);
+	status = I2CWriteBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
+			       OPERATION_DATA_BYTE_SIZE);
+	if (status != 0U) {
+		return -EIO;
+	}
 
 	/* 100us to flush the tx of i2c */
 	WaitUs(100);
+
+	struct OperationBits verify = {0};
+
+	status = I2CReadBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&verify,
+			      OPERATION_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status != 0U || verify.voltage_command_source != source) {
+		return -EIO;
+	}
 	vout_cmd_source = source;
+	return 0;
 }
 
 uint32_t RegulatorInit(PcbType board_type)
@@ -284,7 +392,12 @@ uint32_t RegulatorInit(PcbType board_type)
 			const struct regulator_config *regulator_config =
 				regulators_config->regulator_config + i;
 
-			I2CInit(I2CMst, regulator_config->address, I2CFastMode, PMBUS_MST_ID);
+			i2c_error = I2CInit(I2CMst, regulator_config->address, I2CFastMode,
+					    PMBUS_MST_ID);
+			if (i2c_error != 0U) {
+				aggregate_i2c_errors |= i2c_error;
+				continue;
+			}
 
 			for (uint32_t j = 0; j < regulator_config->count; j++) {
 				const struct regulator_data *regulator_data =
@@ -348,11 +461,9 @@ static uint8_t set_voltage_handler(const union request *request, struct response
 
 	switch (slave_addr) {
 	case P0V8_VCORE_ADDR:
-		set_vcore(voltage_in_mv);
-		return 0;
+		return set_vcore(voltage_in_mv) == 0 ? 0 : 1;
 	case P0V8_VCOREM_ADDR:
-		set_vcorem(voltage_in_mv);
-		return 0;
+		return set_vcorem(voltage_in_mv) == 0 ? 0 : 1;
 	default:
 		return 1;
 	}
@@ -409,8 +520,7 @@ static uint8_t switch_vout_control_handler(const union request *request, struct 
 {
 	uint32_t source = request->switch_vout_control.source;
 
-	SwitchVoutControl(source);
-	return 0;
+	return SwitchVoutControl(source) == 0 ? 0 : 1;
 }
 
 REGISTER_MESSAGE(TT_SMC_MSG_SET_VOLTAGE, set_voltage_handler);

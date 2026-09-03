@@ -12,26 +12,94 @@
 
 bool dvfs_enabled;
 
-void DVFSChange(void)
+static void CalculateDvfsTargets(void)
 {
-	CalculateThrottlers();
+	uint32_t targ_freq;
+	uint32_t aiclk_voltage;
+
 	CalculateTargAiclk();
-
-	uint32_t targ_freq = GetAiclkTarg();
-	uint32_t aiclk_voltage = VFCurve(targ_freq);
-
+	targ_freq = GetAiclkTarg();
+	aiclk_voltage = VFCurve(targ_freq);
 	VoltageArbRequest(VoltageReqAiclk, aiclk_voltage);
-
 	CalculateTargVoltage();
+}
 
-	DecreaseAiclk();
-	VoltageChange();
-	IncreaseAiclk();
+static void SelectRuntimeContainmentTargets(void)
+{
+	LatchAiclkPowerFault();
+	LatchVoltagePowerFault();
+	CalculateDvfsTargets();
+}
+
+int DVFSChange(void)
+{
+	bool containment_path;
+	int ret;
+
+	CalculateThrottlers();
+	containment_path = ThrottlerRuntimePowerFaultLatched();
+	if (containment_path) {
+		SelectRuntimeContainmentTargets();
+	} else {
+		CalculateDvfsTargets();
+	}
+
+	ret = DecreaseAiclk();
+
+	if (ret != 0) {
+		/* Never lower voltage unless the physical clock decrease completed. */
+		ThrottlerRetryRuntimeContainment();
+		return ret;
+	}
+
+	/* A fault IRQ may have arrived after the first target calculation or while
+	 * the PLL driver had interrupts masked. Since the latch is irreversible,
+	 * one fresh containment calculation and downclock closes every such race.
+	 */
+	if (!containment_path && ThrottlerRuntimePowerFaultLatched()) {
+		containment_path = true;
+		SelectRuntimeContainmentTargets();
+		ret = DecreaseAiclk();
+		if (ret != 0) {
+			ThrottlerRetryRuntimeContainment();
+			return ret;
+		}
+	}
+
+	ret = VoltageChange();
+	if (ret != 0) {
+		/* Never raise AICLK unless the voltage transaction completed. */
+		ThrottlerRetryRuntimeContainment();
+		return ret;
+	}
+
+	/* If the IRQ arrived during the preemptible regulator transaction, its
+	 * immediate RISC hold is active and VoltageChange() has preserved VF order.
+	 * Do not consume the stale high AICLK target; the queued containment pass
+	 * will recalculate and downclock it.
+	 */
+	if (!containment_path && ThrottlerRuntimePowerFaultLatched()) {
+		LatchAiclkPowerFault();
+		LatchVoltagePowerFault();
+		ThrottlerRetryRuntimeContainment();
+		return -EPERM;
+	}
+	if (containment_path) {
+		return 0;
+	}
+
+	ret = IncreaseAiclk();
+	if (ret != 0) {
+		ThrottlerRetryRuntimeContainment();
+		return ret;
+	}
+
+	return 0;
 }
 
 static void dvfs_work_handler(struct k_work *work)
 {
-	DVFSChange();
+	(void)DVFSChange();
 }
 static K_WORK_DEFINE(dvfs_worker, dvfs_work_handler);
 
@@ -41,13 +109,23 @@ static void dvfs_timer_handler(struct k_timer *timer)
 }
 static K_TIMER_DEFINE(dvfs_timer, dvfs_timer_handler, NULL);
 
-void InitDVFS(void)
+int InitDVFS(void)
 {
 	InitVFCurve();
-	InitVoltagePPM();
+	int ret = InitVoltagePPM();
+
+	if (ret != 0) {
+		/* Voltage control cannot be trusted. Stop compute before publishing
+		 * initialization failure to the host.
+		 */
+		ThrottlerRequestRuntimeContainment();
+		return ret;
+	}
 	InitArbMaxVoltage();
 	InitThrottlers();
 	dvfs_enabled = true;
+	ThrottlerEnableRuntimeContainmentWorker();
+	return 0;
 }
 
 #define DVFS_MSEC 1

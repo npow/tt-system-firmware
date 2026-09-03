@@ -13,6 +13,7 @@ typedef enum {
 	AVSResourceUnavailable = 1, /* retry */
 	AVSBadCrc = 2,              /* retry */
 	AVSGoodCrcBadData = 3,      /* no retry */
+	AVSTimeout = 4,             /* local controller/FIFO timeout */
 } AVSStatus;
 
 typedef enum {

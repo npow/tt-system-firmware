@@ -29,6 +29,11 @@ bool bh_chip_info_is_ubb(void)
 	return tt_bh_fwtable_get_board_type(fwtable_dev) == BOARDTYPE_UBB;
 }
 
+bool bh_chip_info_board_power_policy_required(void)
+{
+	return tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit != 0U;
+}
+
 uint32_t bh_chip_info_additional_board_power(void)
 {
 	return tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.additional_board_power;

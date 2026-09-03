@@ -6,6 +6,7 @@
 
 #include "aiclk_ppm.h"
 #include "dvfs.h"
+#include "init.h"
 #include "telemetry.h"
 #include "throttler.h"
 #include "voltage.h"
@@ -44,17 +45,17 @@ typedef struct {
 } AiclkArb;
 
 typedef struct {
-	uint32_t curr_freq;   /* in MHz */
-	uint32_t targ_freq;   /* in MHz */
-	uint32_t boot_freq;   /* in MHz */
-	uint32_t fmax;        /* in MHz */
-	uint32_t fmin;        /* in MHz */
+	uint32_t curr_freq;           /* in MHz */
+	uint32_t targ_freq;           /* in MHz */
+	uint32_t boot_freq;           /* in MHz */
+	uint32_t fmax;                /* in MHz */
+	uint32_t fmin;                /* in MHz */
 	uint32_t host_requested_fmin; /* Host-requested minimum frequency floor, 0 = disabled */
-	uint32_t forced_freq; /* in MHz, a value of zero means disabled. */
-	bool reset_safe;      /* cap to reset-safe frequency after forced frequency is applied */
-	uint32_t sweep_en;    /* a value of one means enabled, otherwise disabled. */
-	uint32_t sweep_low;   /* in MHz */
-	uint32_t sweep_high;  /* in MHz */
+	uint32_t forced_freq;         /* in MHz, a value of zero means disabled. */
+	bool reset_safe;     /* cap to reset-safe frequency after forced frequency is applied */
+	uint32_t sweep_en;   /* a value of one means enabled, otherwise disabled. */
+	uint32_t sweep_low;  /* in MHz */
+	uint32_t sweep_high; /* in MHz */
 	union aiclk_targ_freq_info lim_arb_info; /*information on the limiting arbiter */
 	AiclkArb arbiter_max[aiclk_arb_max_count];
 	AiclkArb arbiter_min[aiclk_arb_min_count];
@@ -68,10 +69,27 @@ static AiclkPPM aiclk_ppm = {
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 
 static bool last_msg_busy;
+static bool power_slew_enabled;
+static bool power_slew_timestamp_valid;
+static uint32_t last_power_slew_ms;
+#if defined(CONFIG_ZTEST)
+static void (*reset_safe_pre_clear_hook)(void);
+static void (*aiclk_raise_pre_commit_hook)(void);
+#endif
 
 static uint32_t final_arbiter_count[aiclk_arb_max_count];
 static uint32_t throttler_frozen_mask;
 static uint32_t throttler_overflow_mask;
+
+static void ResetAiclkRuntimeOverrides(void)
+{
+	aiclk_ppm.forced_freq = 0U;
+	aiclk_ppm.reset_safe = aiclk_ppm.reset_safe || error_status0 != 0U ||
+			       ThrottlerRuntimePowerFaultLatched();
+	power_slew_enabled = false;
+	power_slew_timestamp_valid = false;
+	aiclk_ppm.sweep_en = 0U;
+}
 
 void SetAiclkArbMax(enum aiclk_arb_max arb_max, float freq)
 {
@@ -92,6 +110,46 @@ void EnableArbMin(enum aiclk_arb_min arb_min, bool enable)
 {
 	aiclk_ppm.arbiter_min[arb_min].enabled = enable;
 }
+
+static uint32_t ApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms)
+{
+	if (!power_slew_enabled || target_freq <= current_freq) {
+		return target_freq;
+	}
+
+	/* Message handlers can cause extra DVFS passes between timer ticks. Do not
+	 * let those calls multiply the configured rise rate.
+	 */
+	if (power_slew_timestamp_valid && last_power_slew_ms == now_ms) {
+		return current_freq;
+	}
+
+	power_slew_timestamp_valid = true;
+	last_power_slew_ms = now_ms;
+	/* The reset-safe point is below the board-qualified operating range. Move
+	 * directly to configured Fmin, then slew every increase above that preload
+	 * ceiling. This avoids turning each safe reset into a 500+ ms startup delay.
+	 */
+	if (current_freq < aiclk_ppm.fmin && target_freq >= aiclk_ppm.fmin) {
+		return aiclk_ppm.fmin;
+	}
+	return MIN(target_freq, current_freq + AICLK_POWER_SLEW_UP_MHZ_PER_MS);
+}
+
+void SetAiclkPowerSlew(bool enable)
+{
+	if (enable && !power_slew_enabled) {
+		power_slew_timestamp_valid = false;
+	}
+	power_slew_enabled = enable;
+}
+
+#if defined(CONFIG_ZTEST)
+uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms)
+{
+	return ApplyPowerSlew(current_freq, target_freq, now_ms);
+}
+#endif
 
 void CalculateTargAiclk(void)
 {
@@ -161,35 +219,144 @@ void CalculateTargAiclk(void)
 		info.arbiter = 0U;
 	}
 
+	/* Characterisation controls normally override arbitration. Once strict
+	 * board-power control is active, no forced frequency, sweep, or host minimum
+	 * may bypass a safety maximum. Re-apply the already calculated maximum last.
+	 */
+	if (power_slew_enabled && aiclk_ppm.targ_freq > max_arb_freq) {
+		aiclk_ppm.targ_freq = max_arb_freq;
+		info.reason = limit_reason_max_arb;
+		info.arbiter = max_arb;
+	}
+
 	if (aiclk_ppm.reset_safe && aiclk_ppm.targ_freq > AICLK_RESET_SAFE_FREQ) {
 		aiclk_ppm.targ_freq = AICLK_RESET_SAFE_FREQ;
 	}
+
+	/* A strict board-power policy must constrain the voltage request as well as
+	 * the eventual PLL update. Limit the target here, before DVFS derives Vcore
+	 * from it, so an idle-to-busy transition cannot request high-clock voltage
+	 * in a single control tick. Downward changes remain immediate.
+	 */
+	aiclk_ppm.targ_freq =
+		ApplyPowerSlew(aiclk_ppm.curr_freq, aiclk_ppm.targ_freq, k_uptime_get_32());
 
 	aiclk_ppm.lim_arb_info = info;
 	sys_trace_named_event("targ_freq_update", aiclk_ppm.targ_freq,
 			      aiclk_ppm.lim_arb_info.u32_all);
 }
 
-void DecreaseAiclk(void)
+static int ReadAiclkRate(uint32_t *freq)
 {
-	if (aiclk_ppm.targ_freq < aiclk_ppm.curr_freq) {
-		clock_control_set_rate(pll_dev_0,
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-				       (clock_control_subsys_rate_t)aiclk_ppm.targ_freq);
-		aiclk_ppm.curr_freq = aiclk_ppm.targ_freq;
-		sys_trace_named_event("aiclk_update", aiclk_ppm.curr_freq, aiclk_ppm.targ_freq);
+	if (freq == NULL) {
+		return -EINVAL;
 	}
+
+	return clock_control_get_rate(
+		pll_dev_0, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK, freq);
 }
 
-void IncreaseAiclk(void)
+uint32_t GetAiclkCurrent(void)
 {
-	if (aiclk_ppm.targ_freq > aiclk_ppm.curr_freq) {
-		clock_control_set_rate(pll_dev_0,
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-				       (clock_control_subsys_rate_t)aiclk_ppm.targ_freq);
-		aiclk_ppm.curr_freq = aiclk_ppm.targ_freq;
-		sys_trace_named_event("aiclk_update", aiclk_ppm.curr_freq, aiclk_ppm.targ_freq);
+	uint32_t freq;
+
+	return ReadAiclkRate(&freq) == 0 ? freq : UINT32_MAX;
+}
+
+static int SetAiclkRateChecked(uint32_t target_freq, bool decreasing)
+{
+	unsigned int key = 0U;
+
+	/* Hand the final fault check directly to the PLL driver's IRQ-masked
+	 * transaction. This closes the check-to-MMIO window without adding material
+	 * IRQ latency: the driver already holds a spinlock for the whole update.
+	 */
+	if (!decreasing) {
+		key = irq_lock();
+#if defined(CONFIG_ZTEST)
+		if (aiclk_raise_pre_commit_hook != NULL) {
+			void (*hook)(void) = aiclk_raise_pre_commit_hook;
+
+			aiclk_raise_pre_commit_hook = NULL;
+			hook();
+		}
+#endif
+		if (ThrottlerRuntimePowerFaultLatched()) {
+			irq_unlock(key);
+			return -EPERM;
+		}
 	}
+
+	int ret = clock_control_set_rate(pll_dev_0,
+					 (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
+					 (clock_control_subsys_rate_t)target_freq);
+
+	if (!decreasing) {
+		irq_unlock(key);
+	}
+
+	if (ret != 0) {
+		return ret;
+	}
+
+	uint32_t actual_freq;
+
+	ret = ReadAiclkRate(&actual_freq);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* The integer PLL divider can round down. A downclock is safe only once
+	 * hardware is at or below the requested ceiling. An upclock must never
+	 * overshoot the voltage-qualified target.
+	 */
+	if (actual_freq > target_freq) {
+		LOG_ERR("AICLK %s verification failed: requested %u MHz, read %u MHz",
+			decreasing ? "decrease" : "increase", target_freq, actual_freq);
+		return -EIO;
+	}
+
+	/* Keep the logical command point so sub-divider 1 MHz slew increments
+	 * accumulate; the physical rate remains independently verified above.
+	 */
+	aiclk_ppm.curr_freq = target_freq;
+	sys_trace_named_event("aiclk_update", actual_freq, target_freq);
+	if (!decreasing && ThrottlerRuntimePowerFaultLatched()) {
+		/* On a future multi-core target, or when a pending IRQ runs at the
+		 * unlock boundary, report the completed raise as stale so the caller
+		 * skips all later work and drives the containment retry.
+		 */
+		return -EPERM;
+	}
+	return 0;
+}
+
+int DecreaseAiclk(void)
+{
+	uint32_t actual_freq = GetAiclkCurrent();
+
+	if (actual_freq == UINT32_MAX) {
+		return -EIO;
+	}
+	if (aiclk_ppm.targ_freq < actual_freq) {
+		return SetAiclkRateChecked(aiclk_ppm.targ_freq, true);
+	}
+
+	return 0;
+}
+
+int IncreaseAiclk(void)
+{
+	uint32_t actual_freq = GetAiclkCurrent();
+
+	if (actual_freq == UINT32_MAX) {
+		return -EIO;
+	}
+	if (aiclk_ppm.targ_freq > actual_freq) {
+		return SetAiclkRateChecked(aiclk_ppm.targ_freq, false);
+	}
+
+	return 0;
 }
 
 float GetThrottlerArbMax(enum aiclk_arb_max arb_max)
@@ -235,8 +402,18 @@ static int InitAiclkPPM(void)
 	}
 
 	/* Initialize some AICLK tracking variables */
-	clock_control_get_rate(pll_dev_0, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-			       &aiclk_ppm.boot_freq);
+	int ret = clock_control_get_rate(pll_dev_0,
+					 (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
+					 &aiclk_ppm.boot_freq);
+
+	if (ret != 0 ||
+	    !IN_RANGE(aiclk_ppm.boot_freq, (uint32_t)AICLK_FMIN_MIN, (uint32_t)AICLK_FMAX_MAX)) {
+		LOG_ERR("Invalid boot AICLK readback: ret %d, rate %u MHz", ret,
+			aiclk_ppm.boot_freq);
+		record_init_failure(INIT_STAGE_REGULATOR);
+		ThrottlerRequestRuntimeContainment();
+		return ret != 0 ? ret : -ERANGE;
+	}
 
 	aiclk_ppm.curr_freq = aiclk_ppm.boot_freq;
 	aiclk_ppm.targ_freq = aiclk_ppm.curr_freq;
@@ -250,12 +427,11 @@ static int InitAiclkPPM(void)
 			      AICLK_FMIN_MIN, AICLK_FMIN_MAX);
 	}
 
-	/* disable forcing of AICLK */
-	aiclk_ppm.forced_freq = 0;
-	aiclk_ppm.reset_safe = false;
-
-	/* disable AICLK sweep */
-	aiclk_ppm.sweep_en = 0;
+	/* Disable host/characterisation overrides. An earlier init fault or PCIe
+	 * containment request may already have selected the reset-safe ceiling;
+	 * priority-102 initialization must never clear that retained safety state.
+	 */
+	ResetAiclkRuntimeOverrides();
 
 	for (int i = 0; i < aiclk_arb_max_count; i++) {
 		aiclk_ppm.arbiter_max[i].value = aiclk_ppm.fmax;
@@ -276,35 +452,111 @@ SYS_INIT_APP(InitAiclkPPM);
 
 uint8_t ForceAiclk(uint32_t freq)
 {
+	if (ThrottlerRuntimePowerFaultLatched()) {
+		/* Clearing an override remains idempotent, but a fault latch can never
+		 * be escaped by installing a new forced clock.
+		 */
+		aiclk_ppm.forced_freq = 0;
+		return freq == 0U ? 0U : 1U;
+	}
+
 	if ((freq > AICLK_FMAX_MAX || freq < AICLK_FMIN_MIN) && (freq != 0)) {
 		return 1;
 	}
 
 	if (dvfs_enabled) {
 		aiclk_ppm.forced_freq = freq;
-		DVFSChange();
+		return DVFSChange() == 0 ? 0 : 1;
 	} else {
+		/* Before application init starts, this path is used to establish the
+		 * boot clock. Once init has started, disabled DVFS means initialization
+		 * failed (or is incomplete), so no caller may program the PLL directly.
+		 */
+		if (BhArcInitializationStarted()) {
+			aiclk_ppm.forced_freq = 0;
+			return freq == 0U ? 0U : 1U;
+		}
+
 		/* restore to boot frequency */
 		if (freq == 0) {
 			freq = aiclk_ppm.boot_freq;
 		}
 
-		clock_control_set_rate(pll_dev_0,
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-				       (clock_control_subsys_rate_t)freq);
+		if (SetAiclkRateChecked(freq, freq < GetAiclkCurrent()) != 0) {
+			return 1;
+		}
 	}
 	return 0;
 }
 
-void SetAiclkResetSafe(bool enable)
+void LatchAiclkPowerFault(void)
 {
-	if (aiclk_ppm.reset_safe == enable) {
-		return;
+	/* Do not call DVFSChange() here. Runtime power faults are detected from
+	 * CalculateThrottlers(), which already runs inside DVFSChange(). The outer
+	 * transaction will lower AICLK before lowering VCORE.
+	 *
+	 * Clear every host/characterisation override as defense in depth. The
+	 * reset-safe ceiling remains dominant until the ASIC restarts.
+	 */
+	aiclk_ppm.forced_freq = 0;
+	aiclk_ppm.sweep_en = 0;
+	aiclk_ppm.host_requested_fmin = 0;
+	aiclk_ppm.reset_safe = true;
+}
+
+int SetAiclkResetSafe(bool enable)
+{
+	unsigned int key = irq_lock();
+
+#if defined(CONFIG_ZTEST)
+	/* Inject a latch at the exact former check-to-clear boundary. Real IRQs are
+	 * masked here; the hook makes that race deterministic in native tests.
+	 */
+	if (!enable && reset_safe_pre_clear_hook != NULL) {
+		void (*hook)(void) = reset_safe_pre_clear_hook;
+
+		reset_safe_pre_clear_hook = NULL;
+		hook();
+	}
+#endif
+
+	if (!enable && ThrottlerRuntimePowerFaultLatched()) {
+		irq_unlock(key);
+		LOG_WRN("Refusing to clear reset-safe AICLK while power fault is latched");
+		return -EPERM;
 	}
 
 	aiclk_ppm.reset_safe = enable;
-	DVFSChange();
+	irq_unlock(key);
+	return DVFSChange();
 }
+
+#if defined(CONFIG_ZTEST)
+bool AiclkTestResetSafeEnabled(void)
+{
+	return aiclk_ppm.reset_safe;
+}
+
+void AiclkTestSetResetSafePreClearHook(void (*hook)(void))
+{
+	reset_safe_pre_clear_hook = hook;
+}
+
+void AiclkTestSetRaisePreCommitHook(void (*hook)(void))
+{
+	aiclk_raise_pre_commit_hook = hook;
+}
+
+void AiclkTestSetTarget(uint32_t target_freq)
+{
+	aiclk_ppm.targ_freq = target_freq;
+}
+
+void AiclkTestReinitializeRuntimeOverrides(void)
+{
+	ResetAiclkRuntimeOverrides();
+}
+#endif
 
 uint32_t GetAiclkTarg(void)
 {

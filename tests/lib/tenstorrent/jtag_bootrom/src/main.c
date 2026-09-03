@@ -36,7 +36,7 @@ static void before(void *arg)
 	const size_t patch_len = get_bootcode_len();
 
 	zassert_ok(jtag_bootrom_init(&test_chip));
-	zassert_ok(jtag_bootrom_reset_asic(&test_chip));
+	zassert_ok(jtag_setup(test_chip.config.jtag));
 
 	if (IS_ENABLED(CONFIG_JTAG_EMUL)) {
 		jtag_emul_setup(test_chip.config.jtag, (uint32_t *)sram, patch_len);
@@ -47,7 +47,7 @@ static void after(void *arg)
 {
 	ARG_UNUSED(arg);
 
-	jtag_bootrom_teardown(&test_chip);
+	zassert_ok(jtag_bootrom_teardown(&test_chip));
 }
 
 ZTEST_SUITE(jtag_bootrom, NULL, NULL, before, after, NULL);

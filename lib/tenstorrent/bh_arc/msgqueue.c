@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <errno.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 
@@ -18,6 +19,11 @@
 #include "status_reg.h"
 #include "reg.h"
 #include "irqnum.h"
+
+#ifndef CONFIG_TT_SMC_RECOVERY
+#include <tenstorrent/bh_power.h>
+#include "throttler.h"
+#endif
 
 #define MSGHANDLER_COMPAT_MASK 0x1
 
@@ -300,10 +306,111 @@ static void report_scratch_only_message(struct response *response)
 	response->data[0] = MESSAGE_QUEUE_STATUS_SCRATCH_ONLY;
 }
 
+/* Until the board-power controller has a real limit and a fresh input-power
+ * sample, and after a runtime fault, the host may observe the card but may not
+ * increase its power or reinitialize a compute domain. Keep this gate in the
+ * common dispatcher so new or legacy tools cannot bypass it.
+ */
+static bool power_policy_allows_request(const union request *request)
+{
+#ifdef CONFIG_TT_SMC_RECOVERY
+	ARG_UNUSED(request);
+	return true;
+#else
+	/* These legacy/raw controls bypass the VF curve or can directly alter the
+	 * regulator/clock control mode. A valid board-power policy cannot make
+	 * those operations safe, so normal firmware never exposes them to host
+	 * workloads.
+	 */
+	switch (request->command_code) {
+	case TT_SMC_MSG_SET_VOLTAGE:
+	case TT_SMC_MSG_SWITCH_VOUT_CONTROL:
+	case TT_SMC_MSG_I2C_MESSAGE:
+	case TT_SMC_MSG_SWITCH_CLK_SCHEME:
+	case TT_SMC_MSG_FORCE_VDD:
+		return false;
+	default:
+		break;
+	}
+
+	if (ThrottlerBoardPowerPolicyStrict()) {
+		if (request->command_code == TT_SMC_MSG_FORCE_FAN_SPEED ||
+		    request->command_code == TT_SMC_MSG_SET_TDP_LIMIT ||
+		    request->command_code == TT_SMC_MSG_DEBUG_NOC_TRANSLATION ||
+		    request->command_code == TT_SMC_MSG_PCIE_DMA_HOST_TO_CHIP_TRANSFER ||
+		    request->command_code == TT_SMC_MSG_PCIE_DMA_CHIP_TO_HOST_TRANSFER) {
+			return false;
+		}
+
+		if (request->command_code == TT_SMC_MSG_CHARACTERISATION) {
+			switch (request->characterisation_msg.submsg_ID) {
+			case TT_SUB_MSG_SET_HOST_REQUESTED_FMIN:
+				break;
+			case TT_SUB_MSG_SET_KERNEL_THROTTLER_ENABLED:
+				if (request->characterisation_msg.submsg_data
+					    .throttler_enabled.enabled != 1U) {
+					return false;
+				}
+				break;
+			case TT_SUB_MSG_SET_KERNEL_THROTTLER_STOP_NOPS_FREQ:
+				if (request->characterisation_msg.submsg_data
+					    .throttler_stop_freq.frequency != 0U) {
+					return false;
+				}
+				break;
+			default:
+				return false;
+			}
+		}
+	}
+
+	if (ThrottlerComputePowerPolicyReady()) {
+		return true;
+	}
+
+	switch (request->command_code) {
+	case TT_SMC_MSG_GET_VOLTAGE:
+	case TT_SMC_MSG_REPORT_SCRATCH_ONLY:
+	case TT_SMC_MSG_READ_EEPROM:
+	case TT_SMC_MSG_READ_TS:
+	case TT_SMC_MSG_READ_PD:
+	case TT_SMC_MSG_READ_VM:
+	case TT_SMC_MSG_GET_FREQ_CURVE_FROM_VOLTAGE:
+	case TT_SMC_MSG_GET_AICLK:
+	case TT_SMC_MSG_TRIGGER_RESET:
+	case TT_SMC_MSG_TEST:
+	case TT_SMC_MSG_GET_VOLTAGE_CURVE_FROM_FREQ:
+	case TT_SMC_MSG_GET_DRAM_TEMPERATURE:
+	case TT_SMC_MSG_SET_LAST_SERIAL:
+	case TT_SMC_MSG_PING_DM:
+		return true;
+	case TT_SMC_MSG_COUNTER:
+		return request->counter.command == COUNTER_CMD_GET;
+	case TT_SMC_MSG_AICLK_GO_LONG_IDLE:
+	case TT_SMC_MSG_AISWEEP_STOP:
+		return true;
+	case TT_SMC_MSG_SET_WDT_TIMEOUT:
+		/* Disabling autonomous recovery is always safe. A nonzero timeout is
+		 * admitted above only after the complete compute policy is ready.
+		 */
+		return request->set_wdt_timeout.timeout_ms == 0U;
+	case TT_SMC_MSG_POWER_SETTING:
+		return bh_power_setting_is_safe_after_fault(&request->power_setting);
+	default:
+		return false;
+	}
+#endif
+}
+
 /* Run a single message. */
 static void process_queued_message(struct message_queue *queue, const union request *request,
 				   struct response *response)
 {
+	if (!power_policy_allows_request(request)) {
+		response->data[0] = MSG_ERROR_REPLY;
+		return;
+	}
+
 	switch (request->command_code) {
 	case TT_SMC_MSG_SET_LAST_SERIAL:
 		handle_set_last_serial(queue, request);
@@ -323,11 +430,19 @@ static void process_queued_message(struct message_queue *queue, const union requ
 /* Run all the outstanding messages in a single queue. */
 static void process_message_queue(struct message_queue *queue)
 {
-
 	uint32_t request_rptr;
 	uint32_t response_wptr;
+	/* Snapshot a finite batch. A host that keeps replenishing the ring must not
+	 * monopolize the system workqueue and starve the 1 ms power controller.
+	 */
+	uint32_t pending =
+		(queue->header.request_queue_wptr - queue->header.request_queue_rptr) %
+		MSG_QUEUE_POINTER_WRAP;
 
-	while (start_next_message(queue, &request_rptr, &response_wptr)) {
+	for (uint32_t processed = 0; processed < MIN(pending, MSG_QUEUE_SIZE); processed++) {
+		if (!start_next_message(queue, &request_rptr, &response_wptr)) {
+			break;
+		}
 		union request request = (union request){0};
 		struct response response = (struct response){0};
 
@@ -400,6 +515,23 @@ static void msgqueue_work_handler(struct k_work *work)
 
 static K_WORK_DEFINE(msgqueue_work, msgqueue_work_handler);
 
+int process_message_queues_sync(void)
+{
+	struct k_work_sync sync;
+	int ret;
+
+	if (k_is_in_isr()) {
+		return -EWOULDBLOCK;
+	}
+
+	ret = k_work_submit(&msgqueue_work);
+	if (ret < 0) {
+		return ret;
+	}
+	(void)k_work_flush(&msgqueue_work, &sync);
+	return 0;
+}
+
 static void msgqueue_interrupt_handler(void *arg)
 {
 	(void)(arg);
@@ -432,12 +564,19 @@ static void msgqueue_msi_interrupt_handler(void *arg)
 	bool msi_for_msgqueue = false;
 
 	/* MSI catcher generates SLVERR if you read from an empty FIFO. */
-	while (msi_catcher_nonempty()) {
+	for (uint32_t entries = 0; entries < 64U && msi_catcher_nonempty(); entries++) {
 		uint32_t msi_data = msi_catcher_pop();
 
 		if (msi_data == 0) {
 			msi_for_msgqueue = true;
 		}
+	}
+	if (msi_catcher_nonempty()) {
+		/* The hardware FIFO has 64 entries. If a producer refilled it while
+		 * this ISR drained it, flush instead of staying in interrupt context
+		 * indefinitely.
+		 */
+		msi_catcher_flush();
 	}
 
 	if (msi_for_msgqueue) {
@@ -451,6 +590,12 @@ static void msgqueue_msi_overflow_handler(void *arg)
 
 	msi_catcher_flush();
 	k_work_submit(&msgqueue_work);
+}
+#else
+int process_message_queues_sync(void)
+{
+	process_message_queues();
+	return 0;
 }
 #endif
 

@@ -33,6 +33,8 @@ int jtag_bootrom_reset_sequence(struct bh_chip *chip, bool force_reset, uint16_t
 {
 	const uint32_t *const patch = (const uint32_t *)bootcode;
 	const size_t patch_len = get_bootcode_len();
+	bool jtag_active = false;
+	int ret;
 
 #ifdef CONFIG_JTAG_LOAD_ON_PRESET
 	if (force_reset) {
@@ -44,37 +46,71 @@ int jtag_bootrom_reset_sequence(struct bh_chip *chip, bool force_reset, uint16_t
 
 	/* Need to be able to send an i2c transaction to set the straps on the p300 */
 	bh_chip_cancel_bus_transfer_clear(chip);
-	int ret = jtag_bootrom_reset_asic(chip);
+	ret = jtag_bootrom_reset_asic(chip);
 
-	if (ret) {
+	if (ret != 0) {
 		return ret;
 	}
+	jtag_active = true;
 
 	if (DT_HAS_COMPAT_STATUS_OKAY(zephyr_gpio_emul) && IS_ENABLED(CONFIG_JTAG_VERIFY_WRITE)) {
 		jtag_bootrom_emul_setup((uint32_t *)sram, patch_len);
 	}
 
-	jtag_bootrom_patch_offset(chip, patch, patch_len, 0x80);
+	ret = jtag_bootrom_patch_offset(chip, patch, patch_len, 0x80);
+	if (ret != 0) {
+		goto out;
+	}
 
 	LOG_DBG("load sequence finished at %lld us", k_cyc_to_us_floor64(k_cycle_get_64()));
 
-	if (jtag_bootrom_verify(chip->config.jtag, patch, patch_len) != 0) {
-		printk("Bootrom verification failed\n");
+	ret = jtag_bootrom_verify(chip->config.jtag, patch, patch_len);
+	if (ret != 0) {
+		LOG_ERR("Bootrom verification failed: %d", ret);
+		goto out;
 	}
 
-	jtag_bootrom_set_cable_power_limit(chip, cable_power_limit);
+	ret = jtag_bootrom_set_cable_power_limit(chip, cable_power_limit);
+	if (ret != 0) {
+		goto out;
+	}
 
 #ifdef CONFIG_JTAG_LOAD_ON_PRESET
 	if (chip->data.trigger_reset) {
-		jtag_bootrom_soft_reset_arc(chip);
+		ret = jtag_bootrom_soft_reset_arc(chip);
+		if (ret != 0) {
+			goto out;
+		}
 		chip->data.trigger_reset = false;
 	}
 #else
-	jtag_bootrom_soft_reset_arc(chip);
+	ret = jtag_bootrom_soft_reset_arc(chip);
+	if (ret != 0) {
+		goto out;
+	}
 #endif
 
-	jtag_bootrom_teardown(chip);
+out:
+	if (jtag_active) {
+		int teardown_ret = jtag_bootrom_teardown(chip);
 
-	LOG_DBG("reset sequence finished at %lld us", k_cyc_to_us_floor64(k_cycle_get_64()));
-	return 0;
+		if (ret == 0) {
+			ret = teardown_ret;
+		}
+	}
+	if (ret != 0) {
+		int asic_hold_ret = bh_chip_assert_asic_reset(chip);
+		int spi_hold_ret = bh_chip_assert_spi_reset(chip);
+
+		if (asic_hold_ret != 0 || spi_hold_ret != 0) {
+			LOG_ERR("Failed to confirm reset hold (ASIC %d, SPI %d)", asic_hold_ret,
+				spi_hold_ret);
+		}
+	}
+
+	if (ret == 0) {
+		LOG_DBG("reset sequence finished at %lld us",
+			k_cyc_to_us_floor64(k_cycle_get_64()));
+	}
+	return ret;
 }

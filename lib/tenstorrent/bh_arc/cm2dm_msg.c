@@ -16,6 +16,7 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
+#include <zephyr/sys/util.h>
 #include <tenstorrent/smc_msg.h>
 #include <tenstorrent/msgqueue.h>
 
@@ -27,6 +28,9 @@
 #include "fan_ctrl.h"
 #include "telemetry.h"
 #include "dvfs.h"
+#ifndef CONFIG_TT_SMC_RECOVERY
+#include "throttler.h"
+#endif
 
 typedef struct {
 	atomic_t pending_messages;
@@ -41,7 +45,10 @@ typedef struct {
 
 static Cm2DmMsgState cm2dm_msg_state;
 K_SEM_DEFINE(dmfw_ping_sem, 0, 1);
-static uint16_t power;
+static InputPowerSample input_power_sample;
+#if defined(CONFIG_ZTEST)
+static void (*input_power_post_snapshot_hook)(void);
+#endif
 static uint16_t telemetry_reg;
 static struct {
 	uint8_t chip_reset_asic_called: 1;
@@ -346,17 +353,84 @@ int32_t Dm2CmSendPowerHandler(const uint8_t *data, uint8_t size)
 
 	AdjustDVFSTimer();
 
-	power = sys_get_le16(data) + bh_chip_info_additional_board_power();
+	uint32_t measured_power = sys_get_le16(data) + bh_chip_info_additional_board_power();
+	uint16_t clamped_power = MIN(measured_power, UINT16_MAX);
+	uint32_t sample_time_ms = k_uptime_get_32();
+
+	/* This handler runs in the SMBus ISR. Crossing an installed effective
+	 * limit must hold Tensix reset immediately; clock/voltage work is deferred.
+	 * Publish the watchdog timestamp before the telemetry snapshot so its timer
+	 * cannot report a stale sample in the narrow boundary between the two.
+	 */
+#ifndef CONFIG_TT_SMC_RECOVERY
+	ThrottlerObserveInputPowerFromIsr(clamped_power, sample_time_ms);
+#endif
+
+	unsigned int key = irq_lock();
+
+	input_power_sample.power = clamped_power;
+	input_power_sample.updated_ms = sample_time_ms;
+	input_power_sample.valid = true;
+	irq_unlock(key);
 
 	return 0;
 }
 
 /* TODO: Put these somewhere else? */
 
+bool GetInputPowerSample(uint32_t max_age_ms, InputPowerSample *sample)
+{
+	if (sample == NULL) {
+		return false;
+	}
+
+	unsigned int key = irq_lock();
+
+	*sample = input_power_sample;
+#if defined(CONFIG_ZTEST)
+	/* A one-shot hook lets the unit test publish an interrupt-style update at
+	 * the exact old-snapshot/new-publication boundary.
+	 */
+	void (*post_snapshot_hook)(void) = input_power_post_snapshot_hook;
+
+	input_power_post_snapshot_hook = NULL;
+#endif
+	irq_unlock(key);
+
+#if defined(CONFIG_ZTEST)
+	if (post_snapshot_hook != NULL) {
+		post_snapshot_hook();
+	}
+#endif
+
+	return sample->valid &&
+	       (uint32_t)(k_uptime_get_32() - sample->updated_ms) <= max_age_ms;
+}
+
 uint16_t GetInputPower(void)
 {
-	return power;
+	InputPowerSample sample;
+
+	(void)GetInputPowerSample(UINT32_MAX, &sample);
+	return sample.power;
 }
+
+bool InputPowerSampleIsFresh(uint32_t max_age_ms)
+{
+	InputPowerSample sample;
+
+	return GetInputPowerSample(max_age_ms, &sample);
+}
+
+#if defined(CONFIG_ZTEST)
+void InputPowerTestSetPostSnapshotHook(void (*hook)(void))
+{
+	unsigned int key = irq_lock();
+
+	input_power_post_snapshot_hook = hook;
+	irq_unlock(key);
+}
+#endif
 
 int32_t Dm2CmSendFanRPMHandler(const uint8_t *data, uint8_t size)
 {

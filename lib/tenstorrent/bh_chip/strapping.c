@@ -9,11 +9,14 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 
-void bh_chip_set_straps(struct bh_chip *chip)
+int bh_chip_set_straps(struct bh_chip *chip)
 {
-	int ret;
+	int result;
 
-	bharc_enable_i2cbus(&chip->config.arc);
+	result = bharc_enable_i2cbus(&chip->config.arc);
+	if (result != 0) {
+		return result;
+	}
 	const struct gpio_dt_spec straps[] = {
 		chip->config.strapping.gpio6,
 		chip->config.strapping.gpio38,
@@ -23,11 +26,20 @@ void bh_chip_set_straps(struct bh_chip *chip)
 
 	ARRAY_FOR_EACH_PTR(straps, strap_ptr) {
 		if (strap_ptr->port != NULL) {
-			ret = gpio_pin_configure_dt(strap_ptr, GPIO_OUTPUT_ACTIVE);
+			int ret = gpio_pin_configure_dt(strap_ptr, GPIO_OUTPUT_ACTIVE);
+
 			if (ret < 0) {
+				int recover_ret;
+
 				printk("Failed to configure strap %s: %d", strap_ptr->port->name,
 				       ret);
-				i2c_recover_bus(chip->config.arc.i2c_dev);
+				recover_ret = chip->config.arc.i2c_dev != NULL
+						      ? i2c_recover_bus(chip->config.arc.i2c_dev)
+						      : -ENODEV;
+				if (recover_ret != 0) {
+					printk("Failed to recover strap I2C bus: %d\n",
+					       recover_ret);
+				}
 				ret = gpio_pin_configure_dt(strap_ptr, GPIO_OUTPUT_ACTIVE);
 				if (ret < 0) {
 					printk("Failed to configure strap after i2c recover %s: "
@@ -39,14 +51,23 @@ void bh_chip_set_straps(struct bh_chip *chip)
 					       strap_ptr->port->name);
 				}
 			}
+			if (ret != 0 && result == 0) {
+				result = ret;
+			}
 		}
 	}
-	bharc_disable_i2cbus(&chip->config.arc);
+	int ret = bharc_disable_i2cbus(&chip->config.arc);
+
+	return result != 0 ? result : ret;
 }
 
-void bh_chip_unset_straps(struct bh_chip *chip)
+int bh_chip_unset_straps(struct bh_chip *chip)
 {
-	bharc_enable_i2cbus(&chip->config.arc);
+	int result = bharc_enable_i2cbus(&chip->config.arc);
+
+	if (result != 0) {
+		return result;
+	}
 	const struct gpio_dt_spec straps[] = {
 		chip->config.strapping.gpio6,
 		chip->config.strapping.gpio38,
@@ -56,10 +77,16 @@ void bh_chip_unset_straps(struct bh_chip *chip)
 
 	ARRAY_FOR_EACH_PTR(straps, strap_ptr) {
 		if (strap_ptr->port != NULL) {
-			gpio_pin_configure_dt(strap_ptr, GPIO_INPUT);
+			int ret = gpio_pin_configure_dt(strap_ptr, GPIO_INPUT);
+
+			if (ret != 0 && result == 0) {
+				result = ret;
+			}
 		}
 	}
-	bharc_disable_i2cbus(&chip->config.arc);
+	int ret = bharc_disable_i2cbus(&chip->config.arc);
+
+	return result != 0 ? result : ret;
 }
 
 #ifdef CONFIG_GPIO_PCA_SERIES_INIT_PRIORITY
@@ -69,20 +96,32 @@ BUILD_ASSERT(CONFIG_TT_I2C_STRAP_INIT_PRIORITY < CONFIG_GPIO_PCA_SERIES_INIT_PRI
 
 int i2c_straps(void)
 {
+	int first_error = 0;
+
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		/* Enable I2C bus connection for strapping */
-		bharc_enable_i2cbus(&chip->config.arc);
+		int ret = bharc_enable_i2cbus(&chip->config.arc);
+
+		if (first_error == 0 && ret != 0) {
+			first_error = ret;
+		}
 	}
-	return 0;
+	return first_error;
 }
 
 int deinit_i2c_straps(void)
 {
+	int first_error = 0;
+
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		/* Disable I2C bus connection for strapping */
-		bharc_disable_i2cbus(&chip->config.arc);
+		int ret = bharc_disable_i2cbus(&chip->config.arc);
+
+		if (first_error == 0 && ret != 0) {
+			first_error = ret;
+		}
 	}
-	return 0;
+	return first_error;
 }
 
 SYS_INIT(i2c_straps, POST_KERNEL, CONFIG_TT_I2C_STRAP_INIT_PRIORITY);

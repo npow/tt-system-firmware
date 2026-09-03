@@ -4,13 +4,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/ztest.h>
 
 #include "aiclk_ppm.h"
+#include "bh_reset.h"
+#include "cm2dm_msg.h"
+#include "init.h"
+#include "telemetry_internal.h"
+#include "throttler.h"
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/smc_msg.h>
 static uint32_t fmax;
 static uint32_t fmin;
+
+static void refresh_input_power(void)
+{
+	uint8_t data[2];
+
+	sys_put_le16(100U, data);
+	zassert_ok(Dm2CmSendPowerHandler(data, sizeof(data)));
+}
 
 static void *aiclk_ppm_setup(void)
 {
@@ -18,6 +32,13 @@ static void *aiclk_ppm_setup(void)
 	fmin = GetAiclkFmin();
 
 	zassert_not_equal(fmin, fmax, "Fmin and Fmax values should not be equal");
+	ThrottlerTestResetRuntimePowerGuard();
+	ThrottlerTestPrepareForInit();
+	bh_test_set_boot_cable_power_limit(true, 300U);
+	refresh_input_power();
+	TelemetryInternalTestSetVcorePower(20.0F, true);
+	InitThrottlers();
+	zassert_true(ThrottlerPrepareComputeRelease());
 
 	return NULL;
 }
@@ -25,6 +46,8 @@ static void *aiclk_ppm_setup(void)
 static void reset_arb(void *fixture)
 {
 	(void)fixture;
+	refresh_input_power();
+	SetAiclkPowerSlew(false);
 
 	/* Reset all arbiter values and disable */
 	for (int i = 0; i < aiclk_arb_max_count; i++) {
@@ -35,6 +58,43 @@ static void reset_arb(void *fixture)
 		SetAiclkArbMin(i, fmin);
 		EnableArbMin(i, false);
 	}
+}
+
+ZTEST(aiclk_ppm, test_power_slew_limits_increases_but_not_decreases)
+{
+	uint32_t preload_result;
+
+	SetAiclkPowerSlew(true);
+
+	preload_result = AiclkTestApplyPowerSlew(250, 1350, 9);
+	zassert_equal(preload_result, MAX(fmin, 251U), "preload %u, Fmin %u",
+		      preload_result, fmin);
+	zassert_equal(AiclkTestApplyPowerSlew(800, 1350, 10), 800 + AICLK_POWER_SLEW_UP_MHZ_PER_MS);
+	/* Extra DVFS calls within one millisecond cannot accelerate the ramp. */
+	zassert_equal(AiclkTestApplyPowerSlew(801, 1350, 10), 801);
+	zassert_equal(AiclkTestApplyPowerSlew(801, 1350, 11), 801 + AICLK_POWER_SLEW_UP_MHZ_PER_MS);
+	zassert_equal(AiclkTestApplyPowerSlew(1000, 900, 11), 900);
+	zassert_equal(AiclkTestApplyPowerSlew(1349, 1350, 12), 1350);
+
+	SetAiclkPowerSlew(false);
+	zassert_equal(AiclkTestApplyPowerSlew(800, 1350, 12), 1350);
+}
+
+ZTEST(aiclk_ppm, test_aiclk_initialization_preserves_prior_containment)
+{
+	uint32_t saved_error_status = error_status0;
+
+	refresh_input_power();
+	zassert_ok(SetAiclkResetSafe(false));
+	zassert_false(AiclkTestResetSafeEnabled());
+
+	error_status0 = BIT(INIT_STAGE_PCIE);
+	AiclkTestReinitializeRuntimeOverrides();
+	zassert_true(AiclkTestResetSafeEnabled());
+
+	error_status0 = saved_error_status;
+	refresh_input_power();
+	zassert_ok(SetAiclkResetSafe(false));
 }
 
 static void set_busy(bool busy)
@@ -531,6 +591,23 @@ ZTEST(aiclk_ppm, test_msg_type_force_aiclk)
 	msgqueue_response_pop(0, &rsp);
 
 	zassert_equal(rsp.data[0], 0);
+}
+
+ZTEST(aiclk_ppm, test_board_power_safety_max_overrides_forced_aiclk)
+{
+	uint32_t safety_max = fmin + 50U;
+
+	SetAiclkArbMax(aiclk_arb_max_doppler_slow, safety_max);
+	EnableArbMax(aiclk_arb_max_doppler_slow, true);
+	SetAiclkPowerSlew(true);
+
+	zassert_ok(ForceAiclk(fmax));
+	CalculateTargAiclk();
+	zassert_true(GetAiclkTarg() <= safety_max,
+		     "forced AICLK bypassed board-power safety maximum");
+
+	SetAiclkPowerSlew(false);
+	zassert_ok(ForceAiclk(0));
 }
 
 ZTEST(aiclk_ppm, test_msg_type_get_aiclk)

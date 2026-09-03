@@ -22,4 +22,9 @@ int LoadEthFwCfg(uint32_t eth_inst, uint32_t ring, uint8_t *buf, uint32_t eth_en
 		 size_t spi_address, size_t image_size);
 void ReleaseEthReset(uint32_t eth_inst, uint32_t ring);
 
+#if defined(CONFIG_ZTEST)
+/** Test-only helper to exercise fail-closed ETH hardware reset handling. */
+void EthTestHoldMaskInReset(uint32_t mask);
+#endif
+
 #endif

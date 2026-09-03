@@ -64,9 +64,12 @@ static uint8_t i2c_message_handler(const union request *request, struct response
 	uint8_t *write_data_ptr = (uint8_t *)request->i2c_message.write_data;
 	uint8_t *read_data_ptr = (uint8_t *)&response->data[1];
 
-	I2CInit(I2CMst, I2C_slave_address, I2CStandardMode, I2C_mst_id);
-	uint32_t status = I2CTransaction(I2C_mst_id, write_data_ptr, num_write_bytes, read_data_ptr,
-					 num_read_bytes);
+	uint32_t status = I2CInit(I2CMst, I2C_slave_address, I2CStandardMode, I2C_mst_id);
+
+	if (status == 0U) {
+		status = I2CTransaction(I2C_mst_id, write_data_ptr, num_write_bytes, read_data_ptr,
+					num_read_bytes);
+	}
 
 	return status != 0;
 }

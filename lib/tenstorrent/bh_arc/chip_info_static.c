@@ -34,6 +34,14 @@ bool bh_chip_info_is_ubb(void)
 #endif
 }
 
+bool bh_chip_info_board_power_policy_required(void)
+{
+	/* Recovery never releases workload RISCs and must remain available when the
+	 * SPI policy tables or DMC sensor are absent.
+	 */
+	return false;
+}
+
 uint32_t bh_chip_info_additional_board_power(void)
 {
 	return 0;

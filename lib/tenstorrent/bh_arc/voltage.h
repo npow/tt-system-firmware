@@ -25,10 +25,16 @@ typedef struct {
 
 extern VoltageArbiter voltage_arbiter;
 
-void VoltageChange(void);
+int VoltageChange(void);
 void VoltageArbRequest(VoltageRequestor req, uint32_t voltage);
 void CalculateTargVoltage(void);
 int InitVoltagePPM(void);
 uint8_t ForceVdd(uint32_t voltage);
+/** Clear voltage overrides before the active DVFS transaction enters containment. */
+void LatchVoltagePowerFault(void);
+
+#if defined(CONFIG_ZTEST)
+void VoltageTestSetVcoreHook(int (*hook)(uint32_t voltage));
+#endif
 
 #endif

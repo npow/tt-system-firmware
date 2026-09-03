@@ -6,6 +6,7 @@
 #ifndef CM2DM_MSG_H
 #define CM2DM_MSG_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <zephyr/toolchain.h>
 #include <tenstorrent/bh_arc.h>
@@ -28,7 +29,22 @@ int32_t Dm2CmPingHandler(const uint8_t *data, uint8_t size);
 int32_t Dm2CmSendCurrentHandler(const uint8_t *data, uint8_t size);
 int32_t Dm2CmSendPowerHandler(const uint8_t *data, uint8_t size);
 int32_t GetInputCurrent(void);
+
+typedef struct {
+	uint16_t power;
+	uint32_t updated_ms;
+	bool valid;
+} InputPowerSample;
+
+/* Copy power, timestamp, and validity as one interrupt-safe observation. The
+ * return value reports whether that copied sample is no older than max_age_ms.
+ */
+bool GetInputPowerSample(uint32_t max_age_ms, InputPowerSample *sample);
 uint16_t GetInputPower(void);
+bool InputPowerSampleIsFresh(uint32_t max_age_ms);
+#if defined(CONFIG_ZTEST)
+void InputPowerTestSetPostSnapshotHook(void (*hook)(void));
+#endif
 int32_t Dm2CmSendFanRPMHandler(const uint8_t *data, uint8_t size);
 int32_t SMBusTelemRegHandler(const uint8_t *data, uint8_t size);
 int32_t SMBusTelemDataHandler(uint8_t *data, uint8_t *size);

@@ -39,6 +39,13 @@ struct bh_pci_property {
  */
 bool bh_chip_info_is_ubb(void);
 
+/* True when this board has a declared whole-board input-power policy and the
+ * corresponding DMC sensor path. Zero-limit lab/UBB variants fall back to the
+ * independent on-chip rail controllers instead of waiting for a sample that
+ * their hardware cannot produce.
+ */
+bool bh_chip_info_board_power_policy_required(void);
+
 /* Extra board power budget, in W, added to host-reported power. */
 uint32_t bh_chip_info_additional_board_power(void);
 

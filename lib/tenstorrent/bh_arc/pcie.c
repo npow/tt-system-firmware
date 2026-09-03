@@ -15,6 +15,10 @@
 #include "status_reg.h"
 #include "timer.h"
 
+#ifndef CONFIG_TT_SMC_RECOVERY
+#include "throttler.h"
+#endif
+
 #include <stdbool.h>
 
 #include <tenstorrent/post_code.h>
@@ -45,6 +49,11 @@
 #define CMN_A_REG_MAP_BASE_ADDR         0xFFFFFFFFE1000000LL
 #define SERDES_SS_0_A_REG_MAP_BASE_ADDR 0xFFFFFFFFE0000000LL
 #define PCIE_SII_A_REG_MAP_BASE_ADDR    0xFFFFFFFFF0000000LL
+
+/* Also bound link training by iteration count so a stopped reference timer
+ * cannot wedge the only SMC core indefinitely during initialization.
+ */
+#define PCIE_LINK_TRAIN_MAX_POLLS 1000000U
 
 #define PCIE_SII_A_NOC_TLB_DATA_62__REG_OFFSET 0x0000022C
 #define PCIE_SII_A_NOC_TLB_DATA_0__REG_OFFSET  0x00000134
@@ -253,14 +262,29 @@ static void CntlInitV2ParamInit(uint8_t pcie_inst, uint64_t board_id, uint32_t v
 	};
 }
 
+static void PcieErrorInterrupt(void *arg)
+{
+	uint32_t irq_num = POINTER_TO_UINT(arg);
+
+	/* A PCIe error must never escalate into an unsolicited full-ASIC reset:
+	 * that can disappear below an in-flight host transaction and provoke a
+	 * platform reset. Disable the asserted source and contain compute while
+	 * preserving ARC/NoC/PCIe for diagnosis and an explicit host reset.
+	 */
+	irq_disable(irq_num);
+#ifndef CONFIG_TT_SMC_RECOVERY
+	ThrottlerRequestRuntimeContainment();
+#endif
+}
+
 static void InitResetInterrupt(uint8_t pcie_inst)
 {
 #if CONFIG_ARC
 	if (pcie_inst == 0) {
-		IRQ_CONNECT(IRQNUM_PCIE0_ERR_INTR, 0, ChipResetRequest, IRQNUM_PCIE0_ERR_INTR, 0);
+		IRQ_CONNECT(IRQNUM_PCIE0_ERR_INTR, 0, PcieErrorInterrupt, IRQNUM_PCIE0_ERR_INTR, 0);
 		irq_enable(IRQNUM_PCIE0_ERR_INTR);
 	} else if (pcie_inst == 1) {
-		IRQ_CONNECT(IRQNUM_PCIE1_ERR_INTR, 0, ChipResetRequest, IRQNUM_PCIE1_ERR_INTR, 0);
+		IRQ_CONNECT(IRQNUM_PCIE1_ERR_INTR, 0, PcieErrorInterrupt, IRQNUM_PCIE1_ERR_INTR, 0);
 		irq_enable(IRQNUM_PCIE1_ERR_INTR);
 	}
 #else
@@ -374,22 +398,28 @@ static PCIeInitStatus PCIeInitComm(const struct CntlInitV2Param *param)
 	return status;
 }
 
-static void TogglePerst(void)
+static int TogglePerst(void)
 {
 	/* GPIO34 is TRISTATE of level shifter, GPIO37 is PERST input to the level shifter */
-	gpio_pin_configure(gpio3, 2, GPIO_OUTPUT);
-	gpio_pin_configure(gpio3, 5, GPIO_OUTPUT);
-	gpio_pin_configure(gpio3, 7, GPIO_OUTPUT);
+	if (!device_is_ready(gpio3) || gpio_pin_configure(gpio3, 2, GPIO_OUTPUT) != 0 ||
+	    gpio_pin_configure(gpio3, 5, GPIO_OUTPUT) != 0 ||
+	    gpio_pin_configure(gpio3, 7, GPIO_OUTPUT) != 0) {
+		return -EIO;
+	}
 
 	/* put device into reset for 1 ms */
-	gpio_pin_set(gpio3, 2, 1);
-	gpio_pin_set(gpio3, 5, 0);
-	gpio_pin_set(gpio3, 7, 0);
+	if (gpio_pin_set(gpio3, 2, 1) != 0 || gpio_pin_set(gpio3, 5, 0) != 0 ||
+	    gpio_pin_set(gpio3, 7, 0) != 0) {
+		return -EIO;
+	}
 	WaitMs(1);
 
 	/* take device out of reset */
-	gpio_pin_set(gpio3, 5, 1);
-	gpio_pin_set(gpio3, 7, 1);
+	if (gpio_pin_set(gpio3, 5, 1) != 0 || gpio_pin_set(gpio3, 7, 1) != 0) {
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static PCIeInitStatus PollForLinkUp(uint8_t pcie_inst)
@@ -400,12 +430,15 @@ static PCIeInitStatus PollForLinkUp(uint8_t pcie_inst)
 	uint64_t end_time = TimerTimestamp() + 500 * WAIT_1MS;
 	bool training_done = false;
 
-	do {
+	for (uint32_t polls = 0; polls < PCIE_LINK_TRAIN_MAX_POLLS; polls++) {
 		PCIE_SII_LTSSM_STATE_reg_u ltssm_state;
 
 		ltssm_state.val = ReadSiiReg(PCIE_SII_A_LTSSM_STATE_REG_OFFSET);
 		training_done = ltssm_state.f.smlh_link_up_sync && ltssm_state.f.rdlh_link_up_sync;
-	} while (!training_done && TimerTimestamp() < end_time);
+		if (training_done || TimerTimestamp() >= end_time) {
+			break;
+		}
+	}
 
 	if (!training_done) {
 		return PCIeLinkTrainTimeout;
@@ -417,7 +450,9 @@ static PCIeInitStatus PollForLinkUp(uint8_t pcie_inst)
 static PCIeInitStatus PCIeInit(const struct CntlInitV2Param *param)
 {
 	if ((PCIeDeviceType)param->device_type == RootComplex) {
-		TogglePerst();
+		if (TogglePerst() != 0) {
+			return PCIeLinkTrainTimeout;
+		}
 	}
 
 	PCIeInitStatus status = PCIeInitComm(param);
@@ -435,7 +470,9 @@ static PCIeInitStatus PCIeInit(const struct CntlInitV2Param *param)
 		SetupInboundTlbs();
 
 		/* re-initialize PCIe link */
-		TogglePerst();
+		if (TogglePerst() != 0) {
+			return PCIeLinkTrainTimeout;
+		}
 		status = PCIeInitComm(param);
 	}
 
@@ -460,22 +497,32 @@ static int pcie_init(void)
 	struct bh_pci_property pci0_property_table;
 	struct bh_pci_property pci1_property_table;
 	struct CntlInitV2Param param;
+	PCIeInitStatus status;
 
 	bh_chip_info_pci_property(0, &pci0_property_table);
 	bh_chip_info_pci_property(1, &pci1_property_table);
 
 	if (pci0_property_table.pcie_mode != BH_PCIE_MODE_DISABLED) {
 		CntlInitV2ParamInit(0, board_id, vendor_id, &pci0_property_table, &param);
-		PCIeInit(&param);
+		status = PCIeInit(&param);
+		if (status != PCIeInitOk) {
+			LOG_ERR("PCIe0 initialization failed: %d", status);
+			record_init_failure(INIT_STAGE_PCIE);
+			return -EIO;
+		}
+		InitResetInterrupt(0);
 	}
 
 	if (pci1_property_table.pcie_mode != BH_PCIE_MODE_DISABLED) {
 		CntlInitV2ParamInit(1, board_id, vendor_id, &pci1_property_table, &param);
-		PCIeInit(&param);
+		status = PCIeInit(&param);
+		if (status != PCIeInitOk) {
+			LOG_ERR("PCIe1 initialization failed: %d", status);
+			record_init_failure(INIT_STAGE_PCIE);
+			return -EIO;
+		}
+		InitResetInterrupt(1);
 	}
-
-	InitResetInterrupt(0);
-	InitResetInterrupt(1);
 
 	WriteReg(PCIE_INIT_CPL_TIME_REG_ADDR, TimerTimestamp());
 

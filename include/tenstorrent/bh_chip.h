@@ -57,6 +57,11 @@ struct bh_chip_data {
 	 */
 	atomic_t trigger_reset;
 	volatile bool performing_reset;
+	/* Latched when a reset sequence fails. Prevents later code from treating a
+	 * partially reset ASIC as initialized until a complete retry succeeds.
+	 */
+	bool reset_failed;
+	int reset_error;
 
 	/* notify the main thread to handle therm trip */
 	volatile bool therm_trip_triggered;
@@ -67,6 +72,7 @@ struct bh_chip_data {
 	volatile bool pgood_rise_triggered;
 	bool pgood_severe_fault;
 	int64_t pgood_last_trip_ms;
+	int pgood_read_error;
 
 	/* Max allowable time between pings from SMC in ms */
 	uint32_t auto_reset_timeout;
@@ -181,21 +187,26 @@ int bh_chip_write_logs(struct bh_chip *chip, char *log_data, size_t log_size);
 
 void bh_chip_auto_reset(struct k_timer *timer);
 
-void bh_chip_assert_asic_reset(const struct bh_chip *chip);
-void bh_chip_deassert_asic_reset(const struct bh_chip *chip);
+int bh_chip_assert_asic_reset(const struct bh_chip *chip);
+int bh_chip_deassert_asic_reset(const struct bh_chip *chip);
 
-void bh_chip_set_straps(struct bh_chip *chip);
-void bh_chip_unset_straps(struct bh_chip *chip);
+int bh_chip_set_straps(struct bh_chip *chip);
+int bh_chip_unset_straps(struct bh_chip *chip);
 
-void bh_chip_assert_spi_reset(const struct bh_chip *chip);
-void bh_chip_deassert_spi_reset(const struct bh_chip *chip);
+int bh_chip_assert_spi_reset(const struct bh_chip *chip);
+int bh_chip_deassert_spi_reset(const struct bh_chip *chip);
 
 int bh_chip_reset_chip(struct bh_chip *chip, bool force_reset);
 
 int therm_trip_gpio_setup(struct bh_chip *chip);
 int pgood_gpio_setup(struct bh_chip *chip);
 
-void handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_led);
+int handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_led);
+
+#if defined(CONFIG_ZTEST)
+void bh_chip_test_record_pgood_sample(struct bh_chip *chip, int sample);
+void bh_chip_test_force_reset_result(bool enable, int result);
+#endif
 
 #ifdef __cplusplus
 }

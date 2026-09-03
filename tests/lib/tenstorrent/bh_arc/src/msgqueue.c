@@ -7,21 +7,27 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/clock_control_tt_bh.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
 #include <zephyr/ztest.h>
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/misc/bh_fwtable.h>
 
+#include <tenstorrent/bh_power.h>
 #include <tenstorrent/smc_msg.h>
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/tt_smbus_regs.h>
 #include <tenstorrent/bh_arc.h>
 #include "asic_state.h"
 #include "clock_wave.h"
+#include "bh_reset.h"
 #include "cm2dm_msg.h"
 #include "noc_init.h"
 #include "aiclk_ppm.h"
+#include "telemetry_internal.h"
+#include "throttler.h"
+#include "vf_curve.h"
 
 #include "reg_mock.h"
 #include "voltage.h"
@@ -41,6 +47,8 @@ static uint8_t i2c_write_buf_idx;
 
 static uint32_t clock_wave_value;
 static uint32_t noc_2_axi_last_write;
+static enum bh_power_domain containment_after_power_enable = BH_POWER_DOMAIN_COUNT;
+static enum bh_power_domain expire_sample_after_power_enable = BH_POWER_DOMAIN_COUNT;
 
 union request req = {0};
 struct response rsp = {0};
@@ -203,6 +211,31 @@ static void WriteReg_msgqueue_fake(uint32_t addr, uint32_t value)
 	}
 }
 
+static void request_containment_after_power_enable(enum bh_power_domain domain)
+{
+	if (domain == containment_after_power_enable) {
+		ThrottlerRequestRuntimeContainment();
+	} else if (domain == expire_sample_after_power_enable) {
+		/* Exceed the 5 ms operational freshness deadline without reaching the
+		 * 25 ms irreversible stale-sample deadline.
+		 */
+		k_msleep(10);
+	}
+}
+
+static void publish_post_enable_idle_sample(void)
+{
+	uint8_t input_power[2];
+
+	/* Production gets this from the independent 1 ms DMC IRQ and a fresh AVS
+	 * read. Native simulation injects the same post-enable ordering explicitly.
+	 */
+	k_msleep(1);
+	sys_put_le16(100U, input_power);
+	zassert_ok(Dm2CmSendPowerHandler(input_power, sizeof(input_power)));
+	TelemetryInternalTestSetVcorePower(20.0F, true);
+}
+
 static uint8_t msgqueue_handler_73(const union request *req, struct response *rsp)
 {
 	BUILD_ASSERT(MSG_TYPE_SHIFT % 8 == 0);
@@ -233,7 +266,10 @@ ZTEST(msgqueue, test_msgqueue_power_settings_cmd)
 	push_msg_success();
 
 	CalculateTargAiclk();
-	zexpect_equal(GetAiclkTarg(), GetAiclkFmax());
+	/* Strict policy stages domain transitions at the floor and lets the
+	 * board-power controller raise the clock on later fresh samples.
+	 */
+	zexpect_equal(GetAiclkTarg(), GetAiclkFmin());
 
 	zexpect_equal(rsp.data[0], 0x0);
 
@@ -279,6 +315,138 @@ ZTEST(msgqueue, test_msgqueue_power_settings_cmd)
 		      CLOCK_CONTROL_STATUS_OFF);
 }
 
+ZTEST(msgqueue, test_power_enable_race_rolls_back_only_newly_raised_domains)
+{
+	bool state;
+
+	/* Start with every host-controlled domain low. Pure power-down remains
+	 * valid even if a previous test left containment asserted.
+	 */
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	push_msg_success();
+
+	ThrottlerTestPauseRuntimeContainmentWorker(true);
+	bh_test_set_power_enable_hook(request_containment_after_power_enable);
+
+	/* Exercise the exact check -> hardware-enable -> latch boundary for every
+	 * rising field. The completed setter must not leave its domain raised.
+	 */
+	for (enum bh_power_domain domain = BH_POWER_DOMAIN_AICLK;
+	     domain < BH_POWER_DOMAIN_COUNT; domain++) {
+		uint8_t input_power[2];
+
+		ThrottlerTestResetRuntimePowerGuard();
+		ThrottlerTestPauseRuntimeContainmentWorker(true);
+		sys_put_le16(100U, input_power);
+		zassert_ok(Dm2CmSendPowerHandler(input_power, sizeof(input_power)));
+		TelemetryInternalTestSetVcorePower(20.0F, true);
+		containment_after_power_enable = domain;
+		req = (union request){0};
+		rsp = (struct response){0};
+		req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+		req.power_setting.power_flags_valid = domain + 1U;
+		switch (domain) {
+		case BH_POWER_DOMAIN_AICLK:
+			req.power_setting.power_flags_bitfield.max_ai_clk = 1U;
+			break;
+		case BH_POWER_DOMAIN_MRISC:
+			req.power_setting.power_flags_bitfield.mrisc_phy_power = 1U;
+			break;
+		case BH_POWER_DOMAIN_TENSIX:
+			req.power_setting.power_flags_bitfield.tensix_enable = 1U;
+			break;
+		case BH_POWER_DOMAIN_L2CPU:
+			req.power_setting.power_flags_bitfield.l2cpu_enable = 1U;
+			break;
+		default:
+			zassert_unreachable("invalid power domain");
+		}
+
+		push_msg_failure("domain %u survived a containment race", domain);
+		zassert_true(ThrottlerRuntimePowerFaultLatched());
+		zassert_ok(bh_power_state_get(domain, &state));
+		zassert_false(state, "domain %u was not rolled back", domain);
+	}
+
+	/* Freshness may expire after the dispatcher check while a setter runs.
+	 * Full compute readiness—not only the irreversible latch—must be checked
+	 * again and the completed enable must be undone.
+	 */
+	ThrottlerTestResetRuntimePowerGuard();
+	ThrottlerTestPauseRuntimeContainmentWorker(true);
+	{
+		uint8_t input_power[2];
+
+		sys_put_le16(100U, input_power);
+		zassert_ok(Dm2CmSendPowerHandler(input_power, sizeof(input_power)));
+		TelemetryInternalTestSetVcorePower(20.0F, true);
+	}
+	containment_after_power_enable = BH_POWER_DOMAIN_COUNT;
+	expire_sample_after_power_enable = BH_POWER_DOMAIN_L2CPU;
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	req.power_setting.power_flags_bitfield.l2cpu_enable = 1U;
+	push_msg_failure();
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_L2CPU, &state));
+	zassert_false(state, "stale-sample enable was not rolled back");
+	expire_sample_after_power_enable = BH_POWER_DOMAIN_COUNT;
+
+	/* An already-on domain is not part of rollback: preserving an existing
+	 * GDDR PHY state keeps host-visible memory available after containment.
+	 */
+	ThrottlerTestResetRuntimePowerGuard();
+	ThrottlerTestPauseRuntimeContainmentWorker(true);
+	{
+		uint8_t input_power[2];
+
+		sys_put_le16(100U, input_power);
+		zassert_ok(Dm2CmSendPowerHandler(input_power, sizeof(input_power)));
+		TelemetryInternalTestSetVcorePower(20.0F, true);
+	}
+	containment_after_power_enable = BH_POWER_DOMAIN_COUNT;
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_MRISC + 1U;
+	req.power_setting.power_flags_bitfield.mrisc_phy_power = 1U;
+	push_msg_success();
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_MRISC, &state));
+	zassert_true(state);
+
+	containment_after_power_enable = BH_POWER_DOMAIN_L2CPU;
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	req.power_setting.power_flags_bitfield.mrisc_phy_power = 1U;
+	req.power_setting.power_flags_bitfield.l2cpu_enable = 1U;
+	push_msg_failure();
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_L2CPU, &state));
+	zassert_false(state);
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_MRISC, &state));
+	zassert_true(state, "rollback incorrectly powered down an existing domain");
+
+	bh_test_set_power_enable_hook(NULL);
+	containment_after_power_enable = BH_POWER_DOMAIN_COUNT;
+	expire_sample_after_power_enable = BH_POWER_DOMAIN_COUNT;
+	/* Cleanup remains a pure power-down request and therefore stays permitted
+	 * under the latch.
+	 */
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	push_msg_success();
+	ThrottlerTestResetRuntimePowerGuard();
+	ThrottlerTestPauseRuntimeContainmentWorker(false);
+}
+
 ZTEST(msgqueue, test_msgqueue_power_settings_with_go_busy)
 {
 	/* LSB to MSB:
@@ -295,21 +463,21 @@ ZTEST(msgqueue, test_msgqueue_power_settings_with_go_busy)
 	CalculateTargAiclk();
 	zexpect_equal(GetAiclkTarg(), GetAiclkFmin());
 
-	/* Go busy should set targ to max */
+	/* Go busy requests max, but the strict-policy startup clamp still wins. */
 	req.data[0] = TT_SMC_MSG_AICLK_GO_BUSY;
 	push_msg_success();
 
 	CalculateTargAiclk();
-	zexpect_equal(GetAiclkTarg(), GetAiclkFmax());
+	zexpect_equal(GetAiclkTarg(), GetAiclkFmin());
 
 	/*
-	 * Because we got GO_BUSY, AICLK should remain at FMax after aiclk off POWER_SETTING
+	 * The strict-policy startup clamp remains at FMin after GO_BUSY.
 	 */
 	req.data[0] = off_power_cmd;
 	push_msg_success();
 
 	CalculateTargAiclk();
-	zexpect_equal(GetAiclkTarg(), GetAiclkFmax());
+	zexpect_equal(GetAiclkTarg(), GetAiclkFmin());
 
 	/*
 	 * Send POWER_SETTING with AICLK high
@@ -319,16 +487,16 @@ ZTEST(msgqueue, test_msgqueue_power_settings_with_go_busy)
 	push_msg_success();
 
 	CalculateTargAiclk();
-	zexpect_equal(GetAiclkTarg(), GetAiclkFmax());
+	zexpect_true(GetAiclkTarg() < GetAiclkFmax());
 
 	/*
-	 * Send GO_LONG_IDLE. We should remain at FMax because POWER_SETTING was set high
+	 * GO_LONG_IDLE cannot bypass the strict controller's bounded ramp.
 	 */
 	req.data[0] = TT_SMC_MSG_AICLK_GO_LONG_IDLE;
 	push_msg_success();
 
 	CalculateTargAiclk();
-	zexpect_equal(GetAiclkTarg(), GetAiclkFmax());
+	zexpect_true(GetAiclkTarg() < GetAiclkFmax());
 
 	/*
 	 * Send POWER_SETTING with AICLK low. Now we should go to Fmin
@@ -346,15 +514,9 @@ ZTEST(msgqueue, test_msg_type_set_voltage)
 	req.data[0] = TT_SMC_MSG_SET_VOLTAGE;
 	req.data[1] = 0x64; /* regulator id */
 	req.data[2] = 800;  /* voltage in mV */
-	push_msg_success();
-
-	zexpect_equal(i2c_write_buf_emul[0], 33); /*VOUT_COMMAND*/
-
-	uint32_t received_voltage;
-
-	memcpy(&received_voltage, &i2c_write_buf_emul[1], sizeof(received_voltage));
-
-	zexpect_equal(received_voltage, 800 * 2);
+	push_msg_failure("raw regulator writes must remain blocked");
+	zexpect_equal(rsp.data[0], 0xFFU);
+	zexpect_equal(i2c_write_buf_emul[0], 0U);
 }
 
 ZTEST(msgqueue, test_msg_type_get_voltage)
@@ -376,12 +538,9 @@ ZTEST(msgqueue, test_msg_type_switch_vout_control)
 	req.data[0] = TT_SMC_MSG_SWITCH_VOUT_CONTROL;
 	req.data[1] = 0x01; /* regulator id */
 	req.data[2] = 1;    /* enable */
-	push_msg_success();
-
-	zexpect_equal(i2c_write_buf_emul[0], 1); /*OPERATION command, for readback*/
-
-	zexpect_equal(i2c_write_buf_emul[2], 1);    /*OPERATION command, writ*/
-	zexpect_equal(i2c_write_buf_emul[3], 0x12); /* transition_control and command_source high*/
+	push_msg_failure("raw VOUT control must remain blocked");
+	zexpect_equal(rsp.data[0], 0xFFU);
+	zexpect_equal(i2c_write_buf_emul[0], 0U);
 }
 
 ZTEST(msgqueue, test_msg_type_switch_clk_scheme)
@@ -391,37 +550,41 @@ ZTEST(msgqueue, test_msg_type_switch_clk_scheme)
 
 	req.data[0] = TT_SMC_MSG_SWITCH_CLK_SCHEME;
 	req.data[1] = TT_CLK_SCHEME_CLOCK_WAVE;
-	push_msg_success();
-
-	zassert_equal(clock_wave_value, 2U);
+	push_msg_failure("raw clock-scheme switching must remain blocked");
+	zassert_equal(rsp.data[0], 0xFFU);
+	zassert_equal(clock_wave_value, 0U);
 
 	req.data[1] = TT_CLK_SCHEME_ZERO_SKEW;
-	push_msg_success();
-
-	zassert_equal(clock_wave_value, 1U);
+	push_msg_failure("raw clock-scheme switching must remain blocked");
+	zassert_equal(rsp.data[0], 0xFFU);
+	zassert_equal(clock_wave_value, 0U);
 }
 
 ZTEST(msgqueue, test_msg_type_debug_noc_translation)
 {
+	noc_2_axi_last_write = 0xA5A5A5A5U;
 	req.data[0] = TT_SMC_MSG_DEBUG_NOC_TRANSLATION | (BIT(0) << 8U) /* Enable translation*/
 		      | (BIT(1) << 8U)                                  /* PCIE Instance  = 1*/
 		      | (BIT(2) << 8U)                                  /*PCIE instance override*/
 		      | ((BIT(0) | BIT(3)) << 16U) /*Bad tensix columns 0 and 3*/
 		;
 	req.data[1] = 8U /* Bad GDDR 8 */ | ((BIT(1) | BIT(3)) << 8U) /*skip eth 1 and 3*/;
-	msgqueue_request_push(0, &req);
-	process_message_queues();
-	msgqueue_response_pop(0, &rsp);
-
-	zassert_equal(rsp.data[0], 234); /* uin8_t EINVAL -> GDDR out of range*/
+	push_msg_failure("debug NOC translation is blocked by strict policy");
+	zassert_equal(rsp.data[0], 0xFFU);
+	zassert_equal(noc_2_axi_last_write, 0xA5A5A5A5U);
 
 	req.data[1] = NO_BAD_GDDR | ((BIT(1) | BIT(3)) << 8U) /*skip eth 1 and 3*/;
 
-	push_msg_success();
+	push_msg_failure("debug NOC translation is blocked regardless of parameters");
+	zassert_equal(rsp.data[0], 0xFFU);
+	zassert_equal(noc_2_axi_last_write, 0xA5A5A5A5U);
 }
 
 static void test_setup(void *ctx)
 {
+	uint8_t input_power[2];
+	uint16_t reset_safe_voltage_raw;
+
 	(void)ctx;
 	ReadReg_fake.custom_fake = ReadReg_msgqueue_fake;
 	WriteReg_fake.custom_fake = WriteReg_msgqueue_fake;
@@ -429,8 +592,32 @@ static void test_setup(void *ctx)
 	i2c_read_buf_idx = 0U;
 	i2c_write_buf_idx = 0U;
 	clock_wave_value = 0U;
+	containment_after_power_enable = BH_POWER_DOMAIN_COUNT;
+	expire_sample_after_power_enable = BH_POWER_DOMAIN_COUNT;
+	bh_test_set_power_enable_hook(NULL);
 	memset(i2c_read_buf_emul, 0, sizeof(i2c_read_buf_emul));
 	memset(i2c_write_buf_emul, 0, sizeof(i2c_write_buf_emul));
+	/* Staged domain enable verifies MAX20816 READ_VOUT. The register reports
+	 * 0.5 mV/LSB, so make the emulated regulator follow the requested safe VF
+	 * point instead of returning the old all-zero placeholder.
+	 */
+	reset_safe_voltage_raw =
+		(uint16_t)(2U * (uint32_t)VFCurve((float)AICLK_RESET_SAFE_FREQ));
+	memcpy(i2c_read_buf_emul, &reset_safe_voltage_raw,
+	       sizeof(reset_safe_voltage_raw));
+
+	/* Production publishes the host queue only after this state exists. Native
+	 * tests bypass the normal InitDVFS boot path, so establish it explicitly.
+	 */
+	ThrottlerTestResetRuntimePowerGuard();
+	ThrottlerTestPrepareForInit();
+	bh_test_set_boot_cable_power_limit(true, 300U);
+	sys_put_le16(100U, input_power);
+	zassert_ok(Dm2CmSendPowerHandler(input_power, sizeof(input_power)));
+	TelemetryInternalTestSetVcorePower(20.0F, true);
+	InitThrottlers();
+	zassert_true(ThrottlerPrepareComputeRelease());
+	ThrottlerTestSetPowerTransitionSampleHook(publish_post_enable_idle_sample);
 }
 
 ZTEST(msgqueue, test_msg_type_send_pcie_msi)
@@ -465,7 +652,7 @@ ZTEST(msgqueue, test_msg_type_i2c_message_bad_line_id)
 	process_message_queues();
 	msgqueue_response_pop(0, &rsp);
 
-	zassert_equal(rsp.data[0], 1);
+	zassert_equal(rsp.data[0], 0xFFU);
 }
 
 ZTEST(msgqueue, test_msg_type_i2c_message)
@@ -487,13 +674,9 @@ ZTEST(msgqueue, test_msg_type_i2c_message)
 	req.data[1] = 4Ul;         /*Read 4 bytes*/
 	req.data[2] = 0xDDCCBBAAU; /*Write data*/
 
-	push_msg_success();
-	zexpect_equal(rsp.data[1], 0x04030201);
-
-	zexpect_equal(i2c_write_buf_emul[0], 0xaa);
-	zexpect_equal(i2c_write_buf_emul[1], 0xbb);
-	zexpect_equal(i2c_write_buf_emul[2], 0xcc);
-	zexpect_equal(i2c_write_buf_emul[3], 0xdd);
+	push_msg_failure("raw I2C passthrough must remain blocked");
+	zexpect_equal(rsp.data[0], 0xFFU);
+	zexpect_equal(i2c_write_buf_emul[0], 0U);
 }
 
 ZTEST(msgqueue, test_msg_type_blink_led)
@@ -560,12 +743,8 @@ ZTEST(msgqueue, test_msg_type_read_eeprom_no_flash)
 
 ZTEST(msgqueue, test_msg_type_force_vdd)
 {
-	/* Exercises TT_SMC_MSG_FORCE_VDD. Handler under test: ForceVddHandler
-	 * (lib/.../voltage.c). The handler's gate is:
-	 *   if ((v > vdd_max || v < vdd_min) && v != 0) return 1;   // reject
-	 *   else                                        return 0;   // accept
-	 * All test inputs are derived from the loaded fw_table so this test is
-	 * board-portable.
+	/* FORCE_VDD bypasses VF ordering and is blocked regardless of whether the
+	 * requested value happens to fall inside the regulator envelope.
 	 */
 	(void)InitVoltagePPM();
 
@@ -580,19 +759,23 @@ ZTEST(msgqueue, test_msg_type_force_vdd)
 	const uint32_t too_high = vdd_max + 1U;          /* out of range, high */
 	const uint32_t too_low = vdd_min - 1U;           /* out of range, low (vdd_min ≥ 650) */
 
-	/* Case 1: in-range — accept */
+	/* Case 1: in-range is still unsafe. */
 	req = (union request){0};
 	rsp = (struct response){0};
 	req.force_vdd.command_code = TT_SMC_MSG_FORCE_VDD;
 	req.force_vdd.forced_voltage = valid;
-	push_msg_success("in-range %u (envelope [%u, %u])", valid, vdd_min, vdd_max);
+	push_msg_failure("in-range %u (envelope [%u, %u])", valid, vdd_min, vdd_max);
+	zexpect_equal(rsp.data[0], 0xFFU);
 
-	/* Case 2: release sentinel 0 — accept */
+	/* The dispatcher blocks the raw API entirely, including its release
+	 * sentinel; safe clock/voltage release occurs through managed DVFS paths.
+	 */
 	req = (union request){0};
 	rsp = (struct response){0};
 	req.force_vdd.command_code = TT_SMC_MSG_FORCE_VDD;
 	req.force_vdd.forced_voltage = 0;
-	push_msg_success("forced_voltage=0 (release sentinel)");
+	push_msg_failure("forced_voltage=0 (raw API blocked)");
+	zexpect_equal(rsp.data[0], 0xFFU);
 
 	/* Case 3: above vdd_max — reject */
 	req = (union request){0};
@@ -600,6 +783,7 @@ ZTEST(msgqueue, test_msg_type_force_vdd)
 	req.force_vdd.command_code = TT_SMC_MSG_FORCE_VDD;
 	req.force_vdd.forced_voltage = too_high;
 	push_msg_failure("above-range %u (envelope [%u, %u])", too_high, vdd_min, vdd_max);
+	zexpect_equal(rsp.data[0], 0xFFU);
 
 	/* Case 4: below vdd_min — reject */
 	req = (union request){0};
@@ -607,6 +791,7 @@ ZTEST(msgqueue, test_msg_type_force_vdd)
 	req.force_vdd.command_code = TT_SMC_MSG_FORCE_VDD;
 	req.force_vdd.forced_voltage = too_low;
 	push_msg_failure("below-range %u (envelope [%u, %u])", too_low, vdd_min, vdd_max);
+	zexpect_equal(rsp.data[0], 0xFFU);
 }
 
 ZTEST(msgqueue, test_msg_type_pcie_dma_chip_to_host)
@@ -618,9 +803,8 @@ ZTEST(msgqueue, test_msg_type_pcie_dma_chip_to_host)
 	req.pcie_dma_transfer.host_addr = 0x200000;
 	req.pcie_dma_transfer.msi_completion_addr = 0x300000;
 
-	push_msg_success();
-
-	zassert_equal(rsp.data[0], 0, "Chip-to-host DMA transfer should succeed");
+	push_msg_failure("raw chip-to-host DMA is blocked by strict policy");
+	zassert_equal(rsp.data[0], 0xFFU);
 }
 
 ZTEST(msgqueue, test_msg_type_pcie_dma_host_to_chip)
@@ -632,9 +816,48 @@ ZTEST(msgqueue, test_msg_type_pcie_dma_host_to_chip)
 	req.pcie_dma_transfer.host_addr = 0x500000;
 	req.pcie_dma_transfer.msi_completion_addr = 0x600000;
 
-	push_msg_success();
+	push_msg_failure("raw host-to-chip DMA is blocked by strict policy");
+	zassert_equal(rsp.data[0], 0xFFU);
+}
 
-	zassert_equal(rsp.data[0], 0, "Host-to-chip DMA transfer should succeed");
+ZTEST(msgqueue, test_strict_policy_blocks_fan_and_weakening_characterisation)
+{
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.force_fan_speed.command_code = TT_SMC_MSG_FORCE_FAN_SPEED;
+	req.force_fan_speed.raw_speed = 0U;
+	push_msg_failure("strict policy must not permit a forced zero-percent fan");
+	zassert_equal(rsp.data[0], 0xFFU);
+
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.set_tdp_limit.command_code = TT_SMC_MSG_SET_TDP_LIMIT;
+	req.set_tdp_limit.tdp_limit = 500U;
+	push_msg_failure("strict policy must not weaken the fast core-rail backstop");
+	zassert_equal(rsp.data[0], 0xFFU);
+
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.characterisation_msg.command_code = TT_SMC_MSG_CHARACTERISATION;
+	req.characterisation_msg.submsg_ID = TT_SUB_MSG_SET_KERNEL_THROTTLER_ENABLED;
+	req.characterisation_msg.submsg_data.throttler_enabled.enabled = 0U;
+	push_msg_failure("strict policy must not disable kernel throttling");
+	zassert_equal(rsp.data[0], 0xFFU);
+
+	req.characterisation_msg.submsg_data.throttler_enabled.enabled = 1U;
+	push_msg_success("enabling the safety throttler remains allowed");
+
+	req = (union request){0};
+	rsp = (struct response){0};
+	req.characterisation_msg.command_code = TT_SMC_MSG_CHARACTERISATION;
+	req.characterisation_msg.submsg_ID =
+		TT_SUB_MSG_SET_KERNEL_THROTTLER_STOP_NOPS_FREQ;
+	req.characterisation_msg.submsg_data.throttler_stop_freq.frequency = 850U;
+	push_msg_failure("strict policy must not weaken the NOP release threshold");
+	zassert_equal(rsp.data[0], 0xFFU);
+
+	req.characterisation_msg.submsg_data.throttler_stop_freq.frequency = 0U;
+	push_msg_success("restoring firmware control remains allowed");
 }
 
 ZTEST(msgqueue, test_msg_type_trigger_reset_invalid)
@@ -776,23 +999,42 @@ ZTEST(msgqueue, test_msg_type_set_wdt_timeout)
 	/* Clear any pending messages from previous tests */
 	clear_pending_smbus_messages();
 
-	/* Test setting watchdog timeout with valid value */
+	/* KMD arms this card-local recovery timer during probe. It is valid only
+	 * after the complete compute power policy is ready.
+	 */
 	req.set_wdt_timeout.command_code = TT_SMC_MSG_SET_WDT_TIMEOUT;
-	req.set_wdt_timeout.timeout_ms = 5000; /* 5 seconds - should be valid */
+	req.set_wdt_timeout.timeout_ms = 5000;
 
 	push_msg_success();
+	cm2dmMessage armed_msg = read_posted_smbus_message();
 
-	/* Now act as DMC and read the posted SMBUS message */
-	cm2dmMessage posted_msg = read_posted_smbus_message();
+	zassert_equal(armed_msg.msg_id, kCm2DmMsgIdAutoResetTimeoutUpdate);
+	zassert_equal(armed_msg.data, 5000U);
+	ack_smbus_message(&armed_msg);
 
-	/* Verify the posted message contains the correct timeout data */
-	zassert_equal(posted_msg.msg_id, kCm2DmMsgIdAutoResetTimeoutUpdate,
-		      "Posted message should be AutoResetTimeoutUpdate");
-	zassert_equal(posted_msg.data, 5000,
-		      "Posted message data should contain timeout value 5000ms");
+	/* The handler, not the policy gate, still rejects a timeout shorter than
+	 * the firmware feed interval.
+	 */
+	memset(&req, 0, sizeof(req));
+	memset(&rsp, 0, sizeof(rsp));
+	req.set_wdt_timeout.command_code = TT_SMC_MSG_SET_WDT_TIMEOUT;
+	req.set_wdt_timeout.timeout_ms = 1U;
+	push_msg_failure();
+	zassert_not_equal(rsp.data[0], 0xFFU);
+	zassert_equal(read_posted_smbus_message().msg_id, 0U);
 
-	/* Send ACK for the message */
-	ack_smbus_message(&posted_msg);
+	/* Once runtime containment is latched, a new autonomous reset deadline is
+	 * forbidden, but disabling the watchdog remains a recovery operation.
+	 */
+	ThrottlerTestPauseRuntimeContainmentWorker(true);
+	ThrottlerRequestRuntimeContainment();
+	memset(&req, 0, sizeof(req));
+	memset(&rsp, 0, sizeof(rsp));
+	req.set_wdt_timeout.command_code = TT_SMC_MSG_SET_WDT_TIMEOUT;
+	req.set_wdt_timeout.timeout_ms = 5000U;
+	push_msg_failure();
+	zassert_equal(rsp.data[0], 0xFFU);
+	zassert_equal(read_posted_smbus_message().msg_id, 0U);
 
 	/* Test disabling watchdog (timeout = 0) */
 	memset(&req, 0, sizeof(req));
@@ -813,24 +1055,9 @@ ZTEST(msgqueue, test_msg_type_set_wdt_timeout)
 
 	/* Send ACK for the disable message */
 	ack_smbus_message(&disable_msg);
+	ThrottlerTestResetRuntimePowerGuard();
+	ThrottlerTestPauseRuntimeContainmentWorker(false);
 
-	/* Test setting timeout too small (should fail with ENOTSUP) */
-	memset(&req, 0, sizeof(req));
-	memset(&rsp, 0, sizeof(rsp));
-	req.set_wdt_timeout.command_code = TT_SMC_MSG_SET_WDT_TIMEOUT;
-	req.set_wdt_timeout.timeout_ms = 1; /* Very small timeout - should be rejected */
-
-	msgqueue_request_push(0, &req);
-	process_message_queues();
-	msgqueue_response_pop(0, &rsp);
-
-	/* Should fail with ENOTSUP (too small) */
-	zassert_equal(rsp.data[0], ENOTSUP, "Small watchdog timeout should fail with ENOTSUP");
-
-	/* Verify no message was posted for invalid timeout */
-	cm2dmMessage invalid_msg = read_posted_smbus_message();
-
-	zassert_equal(invalid_msg.msg_id, 0, "No message should be posted for invalid timeout");
 }
 
 ZTEST(msgqueue, test_msg_type_ping_dm)

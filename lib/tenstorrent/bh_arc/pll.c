@@ -5,9 +5,11 @@
  */
 
 #include "pll.h"
+#include "init.h"
 #include "reg.h"
 #include "timer.h"
 
+#include <errno.h>
 #include <stdbool.h>
 
 #include <tenstorrent/post_code.h>
@@ -260,8 +262,7 @@ static void ConfigExtPostDivs(PLLNum pll_num, const PLLSettings *pll_settings)
 	WriteReg(GET_PLL_CNTL_ADDR(pll_num, USE_POSTDIV), pll_settings->use_postdiv.val);
 }
 
-/* assume PLL Lock never times out */
-static void WaitPLLLock(PLLNum pll_num)
+static int WaitPLLLock(PLLNum pll_num)
 {
 	uint64_t end_time = TimerTimestamp() + 400 * WAIT_1US;
 	PLL_CNTL_WRAPPER_PLL_LOCK_reg_u pll_lock_reg;
@@ -269,9 +270,11 @@ static void WaitPLLLock(PLLNum pll_num)
 	do {
 		pll_lock_reg.val = ReadReg(PLL_CNTL_WRAPPER_PLL_LOCK_REG_ADDR);
 		if (pll_lock_reg.val & (1 << pll_num)) {
-			return;
+			return 0;
 		}
 	} while (TimerTimestamp() < end_time);
+
+	return -ETIMEDOUT;
 }
 
 void PLLAllBypass(void)
@@ -294,7 +297,7 @@ void PLLAllBypass(void)
 }
 
 /* Redo PLLInit, but for a single PLL with new settings */
-void PLLUpdate(PLLNum pll, const PLLSettings *pll_settings)
+static int PLLUpdate(PLLNum pll, const PLLSettings *pll_settings)
 {
 	PLL_CNTL_PLL_CNTL_0_reg_u pll_cntl_0;
 
@@ -320,7 +323,12 @@ void PLLUpdate(PLLNum pll, const PLLSettings *pll_settings)
 	WriteReg(GET_PLL_CNTL_ADDR(pll, PLL_CNTL_0), pll_cntl_0.val);
 
 	/* wait for PLL to lock */
-	WaitPLLLock(pll);
+	int ret = WaitPLLLock(pll);
+
+	if (ret != 0) {
+		/* Leave the glitch-free mux on refclk. Never select an unlocked PLL. */
+		return ret;
+	}
 
 	/* setup external postdivs */
 	ConfigExtPostDivs(pll, pll_settings);
@@ -332,6 +340,8 @@ void PLLUpdate(PLLNum pll, const PLLSettings *pll_settings)
 	WriteReg(GET_PLL_CNTL_ADDR(pll, PLL_CNTL_0), pll_cntl_0.val);
 
 	WaitNs(300);
+
+	return 0;
 }
 
 static void enable_clk_counters(void)
@@ -386,7 +396,15 @@ int PLLInit(void)
 
 	/* wait for PLLs to lock */
 	for (PLLNum i = 0; i < PLL_COUNT; i++) {
-		WaitPLLLock(i);
+		int ret = WaitPLLLock(i);
+
+		if (ret != 0) {
+			/* Every output is still on refclk here. Keep it there and fail
+			 * initialization rather than selecting an unlocked source.
+			 */
+			record_init_failure(INIT_STAGE_REGULATOR);
+			return ret;
+		}
 	}
 
 	/* setup external postdivs */
@@ -565,8 +583,7 @@ int SetGddrMemClk(uint32_t gddr_mem_clk_mhz)
 		return -1;
 	}
 
-	PLLUpdate(PLL3, &pll_settings);
-	return 0;
+	return PLLUpdate(PLL3, &pll_settings);
 }
 
 /* Assume: refdiv = 2, internal post div = 0, external post div = 1 */

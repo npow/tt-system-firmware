@@ -21,6 +21,7 @@
 #include <math.h>  /* for floor */
 #include <stdint.h>
 
+#include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
 
 #ifdef CONFIG_BH_FWTABLE
@@ -175,6 +176,7 @@ static struct telemetry_table telemetry_table = {
 		[72] = {TAG_NOP_ON_DURATION, TELEM_OFFSET(TAG_NOP_ON_DURATION)},
 		[73] = {TAG_FW_CAPABILITIES_0, TELEM_OFFSET(TAG_FW_CAPABILITIES_0)},
 		[74] = {TAG_FW_ACTIVE_CONFIG_0, TELEM_OFFSET(TAG_FW_ACTIVE_CONFIG_0)},
+		[75] = {TAG_RUNTIME_POWER_FAULT, TELEM_OFFSET(TAG_RUNTIME_POWER_FAULT)},
 	},
 };
 /* clang-format on */
@@ -258,6 +260,34 @@ void UpdateTelemetryKernelThrottler(bool enabled, uint32_t stop_nops_freq)
 	active_config.bits.kernel_nops_at_aiclk_fmin = enabled ? 1U : 0U;
 	telemetry[TAG_FW_ACTIVE_CONFIG_0] = active_config.u32_all;
 	telemetry[TAG_KERNEL_THROTTLER] = (enabled ? 1U : 0U) | ((stop_nops_freq & 0xFFFFU) << 16U);
+}
+
+void UpdateTelemetryRuntimePowerFault(bool latched, uint16_t input_power)
+{
+	/* Bits 1..15 carry live policy status. Updating the latched fault and its
+	 * trip power must not erase strict/fresh/ready state maintained elsewhere.
+	 */
+	unsigned int key = irq_lock();
+	uint32_t status = telemetry[TAG_RUNTIME_POWER_FAULT] & 0x0000FFFEU;
+
+	telemetry[TAG_RUNTIME_POWER_FAULT] = status | (latched ? 1U : 0U) |
+					     ((uint32_t)input_power << 16U);
+	irq_unlock(key);
+}
+
+void UpdateTelemetryRuntimePowerStatus(bool strict, bool sample_fresh, bool policy_ready)
+{
+	/* Keep the irreversible fault bit and trip power intact. Bits 1..3 are
+	 * dynamic status: strict policy, fresh input sample, and policy ready.
+	 */
+	unsigned int key = irq_lock();
+	uint32_t status = telemetry[TAG_RUNTIME_POWER_FAULT] & ~0x0000000EU;
+
+	status |= strict ? 0x2U : 0U;
+	status |= sample_fresh ? 0x4U : 0U;
+	status |= policy_ready ? 0x8U : 0U;
+	telemetry[TAG_RUNTIME_POWER_FAULT] = status;
+	irq_unlock(key);
 }
 
 telemetry_feature_flags_bits_0_t GetActiveFeatures(void)
@@ -567,6 +597,9 @@ static void update_telemetry(void)
 	}
 	telemetry[TAG_MAX_GDDR_TEMP] = telemetry_internal_data.gddr_temps.max_temp;
 	telemetry[TAG_INPUT_POWER] = GetInputPower(); /* Input power - reported in W */
+	UpdateTelemetryRuntimePowerStatus(ThrottlerBoardPowerPolicyStrict(),
+					 ThrottlerBoardPowerSampleFresh(),
+					 ThrottlerBoardPowerPolicyInstalled());
 	telemetry[TAG_SMBUS_ERRORS] = smbus_target_get_error_count(smbus_target_dev);
 	/* reported in W, truncated to uint32_t */
 	telemetry[TAG_GDDR_WEST_IO_POWER] = telemetry_internal_data.gddr_io_power_west;

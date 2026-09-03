@@ -13,6 +13,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/sensor/ina2xx.h>
 #include <zephyr/drivers/smbus.h>
 #include <zephyr/drivers/jtag.h>
 #include <zephyr/drivers/mfd/max6639.h>
@@ -62,6 +63,19 @@ static dmStaticInfo static_info = {.version = 1, .bl_version = 0, .app_version =
 
 static uint16_t max_power;
 
+struct ina228_register_snapshot {
+	enum sensor_attribute attribute;
+	struct sensor_value expected;
+};
+
+static struct ina228_register_snapshot ina228_registers[] = {
+	{.attribute = SENSOR_ATTR_CONFIGURATION},
+	{.attribute = (enum sensor_attribute)SENSOR_ATTR_ADC_CONFIGURATION},
+	{.attribute = SENSOR_ATTR_CALIBRATION},
+};
+static bool ina228_snapshot_valid;
+static bool ina228_configuration_fault_logged;
+
 /* FIXME: notify_smcs should be automatic, we should notify if the SMCs are ready, otherwise
  * record a notification to be sent once they are. Also it's properly per-SMC state.
  */
@@ -96,14 +110,58 @@ void update_fan_speed(bool notify_smcs)
 	}
 }
 
+static void latch_reset_failure(struct bh_chip *chip, const char *source, int error)
+{
+	int asic_hold_ret = bh_chip_assert_asic_reset(chip);
+	int spi_hold_ret = bh_chip_assert_spi_reset(chip);
+
+	LOG_ERR("%s reset failed: %d; keeping ASIC communication contained", source, error);
+	if (asic_hold_ret != 0 || spi_hold_ret != 0) {
+		LOG_ERR("Failed to confirm reset hold (ASIC %d, SPI %d)", asic_hold_ret,
+			spi_hold_ret);
+	}
+	chip->data.arc_needs_init_msg = false;
+	chip->data.reset_failed = true;
+	chip->data.reset_error = error;
+	chip->data.performing_reset = false;
+	chip->data.auto_reset_timeout = 0U;
+	k_timer_stop(&chip->auto_reset_timer);
+	chip->data.fan_speed = 100U;
+	chip->data.fan_speed_forced = true;
+	bh_chip_cancel_bus_transfer_set(chip);
+
+	if (board_fault_led.port != NULL) {
+		(void)gpio_pin_set_dt(&board_fault_led, 1);
+	}
+	update_fan_speed(false);
+}
+
+static void complete_reset(struct bh_chip *chip)
+{
+	chip->data.reset_failed = false;
+	chip->data.reset_error = 0;
+	chip->data.performing_reset = false;
+}
+
 static bool process_reset_req(struct bh_chip *chip, uint8_t msg_id, uint32_t msg_data)
 {
 	switch (msg_data) {
-	case kCm2DmResetLevelAsic:
+	case kCm2DmResetLevelAsic: {
+		int ret;
+
 		LOG_INF("Received ARC reset request");
+		chip->data.performing_reset = true;
+		chip->data.arc_needs_init_msg = false;
 		bh_chip_cancel_bus_transfer_clear(chip);
-		bh_chip_reset_chip(chip, true);
+		ret = bh_chip_reset_chip(chip, true);
+
+		if (ret != 0) {
+			latch_reset_failure(chip, "ARC-requested ASIC", ret);
+		} else {
+			complete_reset(chip);
+		}
 		break;
+	}
 
 	case kCm2DmResetLevelDmc:
 		/* Trigger reboot; will reset asic and reload dmfw */
@@ -289,15 +347,103 @@ void process_cm2dm_message(struct bh_chip *chip)
 	}
 }
 
+static int ina228_capture_configuration(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(ina228_registers); i++) {
+		int ret = sensor_attr_get(ina228, SENSOR_CHAN_ALL, ina228_registers[i].attribute,
+					  &ina228_registers[i].expected);
+
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	/* A reset INA228 has a zero calibration register and reports zero current
+	 * and power. Never accept that state as the baseline configuration.
+	 */
+	if (ina228_registers[2].expected.val1 == 0) {
+		return -EIO;
+	}
+
+	ina228_snapshot_valid = true;
+	return 0;
+}
+
+static bool ina228_configuration_valid(void)
+{
+	if (!ina228_snapshot_valid) {
+		return ina228_capture_configuration() == 0;
+	}
+
+	for (size_t i = 0; i < ARRAY_SIZE(ina228_registers); i++) {
+		struct sensor_value current;
+		int ret = sensor_attr_get(ina228, SENSOR_CHAN_ALL, ina228_registers[i].attribute,
+					  &current);
+
+		if (ret != 0) {
+			return false;
+		}
+		if (current.val1 == ina228_registers[i].expected.val1 &&
+		    current.val2 == ina228_registers[i].expected.val2) {
+			continue;
+		}
+
+		/* A sensor brownout/reset clears configuration and calibration. Restore
+		 * the complete boot-qualified snapshot, but discard this sample. The SMC
+		 * will see stale input power and stay clamped until a later sample proves
+		 * that the restored configuration is active.
+		 */
+		for (size_t j = 0; j < ARRAY_SIZE(ina228_registers); j++) {
+			ret = sensor_attr_set(ina228, SENSOR_CHAN_ALL,
+					      ina228_registers[j].attribute,
+					      &ina228_registers[j].expected);
+			if (ret != 0) {
+				break;
+			}
+		}
+		if (!ina228_configuration_fault_logged) {
+			LOG_ERR("INA228 configuration changed; power samples held invalid");
+			ina228_configuration_fault_logged = true;
+		}
+		return false;
+	}
+
+	if (ina228_configuration_fault_logged) {
+		LOG_INF("INA228 configuration restored");
+		ina228_configuration_fault_logged = false;
+	}
+	return true;
+}
+
 void ina228_power_update(void)
 {
-	struct sensor_value sensor_val;
+	struct sensor_value sensor_val = {0};
+	int ret;
 
-	sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER);
-	sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val);
+	if (!ina228_configuration_valid()) {
+		return;
+	}
 
-	/* Only use integer part of sensor value */
-	int16_t power = sensor_val.val1 & 0xFFFF;
+	ret = sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER);
+	if (ret != 0) {
+		return;
+	}
+
+	ret = sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val);
+	if (ret != 0 || sensor_val.val1 < 0 || sensor_val.val1 >= UINT16_MAX ||
+	    sensor_val.val2 < 0 || sensor_val.val2 >= 1000000) {
+		return;
+	}
+	/* Close the reset race between the pre-sample configuration check and the
+	 * conversion read. A brownout in that interval can otherwise publish one
+	 * fresh-looking zero-power sample before calibration loss is noticed.
+	 */
+	if (!ina228_configuration_valid()) {
+		return;
+	}
+
+	/* Round up so integer transport never understates measured input power. */
+	uint16_t power = (uint16_t)sensor_val.val1 + (sensor_val.val2 > 0 ? 1U : 0U);
 
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		bh_chip_set_input_power(chip, power);
@@ -311,11 +457,18 @@ uint16_t detect_max_power(void)
 	static const struct gpio_dt_spec psu_sense1 =
 		GPIO_DT_SPEC_GET_OR(DT_PATH(psu_sense1), gpios, {0});
 
-	gpio_pin_configure_dt(&psu_sense0, GPIO_INPUT);
-	gpio_pin_configure_dt(&psu_sense1, GPIO_INPUT);
+	if (!gpio_is_ready_dt(&psu_sense0) || !gpio_is_ready_dt(&psu_sense1) ||
+	    gpio_pin_configure_dt(&psu_sense0, GPIO_INPUT) != 0 ||
+	    gpio_pin_configure_dt(&psu_sense1, GPIO_INPUT) != 0) {
+		return 0;
+	}
 
 	int sense0_val = gpio_pin_get_dt(&psu_sense0);
 	int sense1_val = gpio_pin_get_dt(&psu_sense1);
+
+	if (sense0_val < 0 || sense1_val < 0) {
+		return 0;
+	}
 
 	uint16_t psu_power;
 
@@ -328,14 +481,21 @@ uint16_t detect_max_power(void)
 	} else {
 		/* Pins could either be open or shorted together */
 		/* Pull down one and check the other */
-		gpio_pin_configure_dt(&psu_sense0, GPIO_OUTPUT_LOW);
-		if (!gpio_pin_get_dt(&psu_sense1)) {
+		if (gpio_pin_configure_dt(&psu_sense0, GPIO_OUTPUT_LOW) != 0) {
+			return 0;
+		}
+		sense1_val = gpio_pin_get_dt(&psu_sense1);
+		if (sense1_val < 0) {
+			psu_power = 0;
+		} else if (!sense1_val) {
 			/* If shorted together then max power is 150W */
 			psu_power = 150;
 		} else {
 			psu_power = 0;
 		}
-		gpio_pin_configure_dt(&psu_sense0, GPIO_INPUT);
+		if (gpio_pin_configure_dt(&psu_sense0, GPIO_INPUT) != 0) {
+			return 0;
+		}
 	}
 
 	return psu_power;
@@ -413,6 +573,8 @@ static void handle_therm_trip(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		if (chip->data.therm_trip_triggered) {
+			int ret;
+
 			chip->data.therm_trip_triggered = false;
 
 			if (board_fault_led.port != NULL) {
@@ -433,13 +595,19 @@ static void handle_therm_trip(void)
 				 * think I'm happy to eat the non-enum in that case
 				 */
 				chip->data.performing_reset = true;
+				chip->data.arc_needs_init_msg = false;
 				/* Set the bus cancel following the logic of
 				 * (reset_triggered && !performing_reset)
 				 */
 				bh_chip_cancel_bus_transfer_clear(chip);
 
 				chip->data.therm_trip_count++;
-				bh_chip_reset_chip(chip, true);
+				ret = bh_chip_reset_chip(chip, true);
+
+				if (ret != 0) {
+					latch_reset_failure(chip, "thermal-trip ASIC", ret);
+					continue;
+				}
 
 				/* Set the bus cancel following the logic of
 				 * (reset_triggered && !performing_reset)
@@ -447,7 +615,7 @@ static void handle_therm_trip(void)
 				if (atomic_get(&chip->data.trigger_reset)) {
 					bh_chip_cancel_bus_transfer_set(chip);
 				}
-				chip->data.performing_reset = false;
+				complete_reset(chip);
 			}
 		}
 	}
@@ -457,14 +625,27 @@ static void handle_watchdog_reset(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		if (chip->data.arc_wdog_triggered) {
+			int ret;
+			bool jtag_active;
+
 			chip->data.arc_wdog_triggered = false;
 			bh_chip_cancel_bus_transfer_clear(chip);
 			/* Read PC from ARC and record it */
-			jtag_setup(chip->config.jtag);
-			jtag_reset(chip->config.jtag);
-			jtag_axi_read32(chip->config.jtag, RESET_UNIT_ARC_PC_CORE_0,
-					&chip->data.arc_hang_pc);
-			jtag_teardown(chip->config.jtag);
+			ret = jtag_setup(chip->config.jtag);
+			jtag_active = ret == 0;
+			if (ret == 0) {
+				ret = jtag_reset(chip->config.jtag);
+			}
+			if (ret == 0) {
+				ret = jtag_axi_read32(chip->config.jtag, RESET_UNIT_ARC_PC_CORE_0,
+						      &chip->data.arc_hang_pc);
+			}
+			if (jtag_active && jtag_teardown(chip->config.jtag) != 0 && ret == 0) {
+				ret = -EIO;
+			}
+			if (ret != 0) {
+				LOG_WRN("Failed to capture ARC watchdog PC: %d", ret);
+			}
 			/* Clear watchdog state */
 			chip->data.auto_reset_timeout = 0;
 
@@ -477,11 +658,16 @@ static void handle_watchdog_reset(void)
 			}
 
 			chip->data.performing_reset = true;
-			bh_chip_reset_chip(chip, true);
+			chip->data.arc_needs_init_msg = false;
+			ret = bh_chip_reset_chip(chip, true);
+			if (ret != 0) {
+				latch_reset_failure(chip, "watchdog ASIC", ret);
+				continue;
+			}
 			/* Clear bus transfer cancel flag */
 			bh_chip_cancel_bus_transfer_clear(chip);
 
-			chip->data.performing_reset = false;
+			complete_reset(chip);
 		}
 	}
 }
@@ -490,20 +676,44 @@ static void handle_perst(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		if (atomic_set(&chip->data.trigger_reset, false)) {
+			int reset_ret;
+			int bus_ret;
+			bool jtag_active = false;
+
 			chip->data.performing_reset = true;
 			chip->data.last_cm2dm_seq_num_valid = false;
+			chip->data.arc_needs_init_msg = false;
 			/*
 			 * Set the bus cancel following the logic of (reset_triggered &&
 			 * !performing_reset)
 			 */
 			bh_chip_cancel_bus_transfer_clear(chip);
 
-			bharc_disable_i2cbus(&chip->config.arc);
-			jtag_bootrom_reset_asic(chip);
-			jtag_bootrom_set_cable_power_limit(chip, chip->data.cable_power_limit);
-			jtag_bootrom_soft_reset_arc(chip);
-			jtag_bootrom_teardown(chip);
-			bharc_enable_i2cbus(&chip->config.arc);
+			reset_ret = bharc_disable_i2cbus(&chip->config.arc);
+			if (reset_ret == 0) {
+				reset_ret = jtag_bootrom_reset_asic(chip);
+				jtag_active = reset_ret == 0;
+			}
+			if (reset_ret == 0) {
+				reset_ret = jtag_bootrom_set_cable_power_limit(
+					chip, chip->data.cable_power_limit);
+			}
+			if (reset_ret == 0) {
+				reset_ret = jtag_bootrom_soft_reset_arc(chip);
+			}
+			if (jtag_active) {
+				int teardown_ret = jtag_bootrom_teardown(chip);
+
+				if (reset_ret == 0) {
+					reset_ret = teardown_ret;
+				}
+			}
+			bus_ret = bharc_enable_i2cbus(&chip->config.arc);
+			if (reset_ret != 0 || bus_ret != 0) {
+				latch_reset_failure(chip, "PERST ASIC",
+						    reset_ret != 0 ? reset_ret : bus_ret);
+				continue;
+			}
 
 			/*
 			 * Set the bus cancel following the logic of (reset_triggered &&
@@ -514,7 +724,7 @@ static void handle_perst(void)
 			}
 			chip->data.therm_trip_count = 0;
 			chip->data.arc_hang_pc = 0;
-			chip->data.performing_reset = false;
+			complete_reset(chip);
 		}
 	}
 }
@@ -522,14 +732,19 @@ static void handle_perst(void)
 static void handle_pgood_change(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
-		handle_pgood_event(chip, board_fault_led);
+		int ret = handle_pgood_event(chip, board_fault_led);
+
+		if (ret != 0) {
+			latch_reset_failure(chip, "PGOOD recovery", ret);
+		}
 	}
 }
 
 static void send_init_data(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
-		if (chip->data.arc_needs_init_msg) {
+		if (chip->data.arc_needs_init_msg && !chip->data.performing_reset &&
+		    !chip->data.reset_failed) {
 			if (bh_chip_set_static_info(chip, &static_info) == 0 &&
 			    bh_chip_set_input_power_lim(chip, max_power) == 0 &&
 			    bh_chip_set_therm_trip_count(chip, chip->data.therm_trip_count) == 0 &&
@@ -624,6 +839,18 @@ int main(void)
 	}
 
 	update_fan_speed(false);
+	if (IS_ENABLED(CONFIG_INA228) &&
+	    (!device_is_ready(ina228) || ina228_capture_configuration() != 0)) {
+		/* Do not publish unqualified power data. SMC strict policy holds AICLK
+		 * at its safe floor while input-power samples are missing or stale.
+		 */
+		LOG_ERR("INA228 configuration could not be qualified at boot");
+		ARRAY_FOR_EACH_BH_CHIP(chip) {
+			chip->data.fan_speed = 100U;
+			chip->data.fan_speed_forced = true;
+		}
+		update_fan_speed(false);
+	}
 
 	if (bist_rc == 0 && !boot_is_img_confirmed()) {
 		ret = boot_write_img_confirmed();
@@ -637,13 +864,21 @@ int main(void)
 	/* Force all spi_muxes back to arc control */
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		if (chip->config.spi_mux.port != NULL) {
-			gpio_pin_configure_dt(&chip->config.spi_mux, GPIO_OUTPUT_ACTIVE);
+			ret = gpio_pin_configure_dt(&chip->config.spi_mux, GPIO_OUTPUT_ACTIVE);
+			if (ret != 0) {
+				latch_reset_failure(chip, "SPI mux initialization", ret);
+				return ret;
+			}
 		}
 	}
 
 	/* Set up GPIOs */
 	if (board_fault_led.port != NULL) {
-		gpio_pin_configure_dt(&board_fault_led, GPIO_OUTPUT_INACTIVE);
+		ret = gpio_pin_configure_dt(&board_fault_led, GPIO_OUTPUT_INACTIVE);
+		if (ret != 0) {
+			LOG_ERR("Board fault LED initialization failed: %d", ret);
+			return ret;
+		}
 	}
 
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
@@ -669,18 +904,25 @@ int main(void)
 			ret = jtag_bootrom_init(chip);
 			if (ret != 0) {
 				LOG_ERR("%s() failed: %d", "jtag_bootrom_init", ret);
+				latch_reset_failure(chip, "JTAG initialization", ret);
 				return ret;
 			}
 
-			bharc_disable_i2cbus(&chip->config.arc);
-
 			/* Store power limit for use in runtime resets */
 			chip->data.cable_power_limit = max_power;
-			ret = jtag_bootrom_reset_sequence(chip, false, max_power);
+			ret = bharc_disable_i2cbus(&chip->config.arc);
+			if (ret == 0) {
+				ret = jtag_bootrom_reset_sequence(chip, false, max_power);
+			}
 			/* Always enable I2C bus */
-			bharc_enable_i2cbus(&chip->config.arc);
+			int bus_ret = bharc_enable_i2cbus(&chip->config.arc);
+
+			if (ret == 0) {
+				ret = bus_ret;
+			}
 			if (ret != 0) {
 				LOG_ERR("%s() failed: %d", "jtag_bootrom_reset", ret);
+				latch_reset_failure(chip, "boot ASIC", ret);
 				return ret;
 			}
 		}
@@ -691,7 +933,11 @@ int main(void)
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		const struct device *smbus = chip->config.arc.smbus.bus;
 
-		smbus_configure(smbus, SMBUS_MODE_CONTROLLER | SMBUS_MODE_PEC);
+		ret = smbus_configure(smbus, SMBUS_MODE_CONTROLLER | SMBUS_MODE_PEC);
+		if (ret != 0) {
+			latch_reset_failure(chip, "SMBus initialization", ret);
+			return ret;
+		}
 		bh_chip_cancel_bus_transfer_clear(chip);
 	}
 

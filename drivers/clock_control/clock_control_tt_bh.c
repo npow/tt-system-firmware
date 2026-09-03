@@ -18,7 +18,10 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(clock_control_tt_bh);
 
-#define PLL_LOCK_TIMEOUT_MS 400
+#define PLL_LOCK_TIMEOUT_MS       400
+#define PLL_LOCK_TIMEOUT_POLLS    (PLL_LOCK_TIMEOUT_MS * 1000U)
+#define PLL_LOCK_POLL_INTERVAL_US 1U
+#define PLL_DYNAMIC_LOCK_POLLS    1000U
 
 #define PLL_CNTL_0_OFFSET             0x00
 #define PLL_CNTL_1_OFFSET             0x04
@@ -209,19 +212,23 @@ static void clock_control_tt_bh_config_ext_postdivs(const struct clock_control_t
 	clock_control_tt_bh_write_reg(config, PLL_USE_POSTDIV_OFFSET, settings->use_postdiv.val);
 }
 
-static int clock_control_tt_bh_wait_lock(uint8_t inst)
+static int clock_control_tt_bh_wait_lock(uint8_t inst, uint32_t max_polls)
 {
 	union tt_bh_pll_cntl_wrapper_lock_reg pll_lock_reg;
-	uint64_t start = k_uptime_get();
 
-	do {
+	/* Callers hold a spinlock, which masks the timer interrupt that advances
+	 * uptime on this single-core target. Use a finite poll budget instead of
+	 * k_uptime_get() so a failed PLL cannot wedge firmware indefinitely.
+	 */
+	for (uint32_t polls = 0; polls < max_polls; polls++) {
 		pll_lock_reg.val = sys_read32(PLL_CNTL_WRAPPER_PLL_LOCK_REG_ADDR);
 		if (pll_lock_reg.val & BIT(inst)) {
 			return 0;
 		}
-	} while (k_uptime_get() - start < PLL_LOCK_TIMEOUT_MS);
+		k_busy_wait(PLL_LOCK_POLL_INTERVAL_US);
+	}
 
-	LOG_ERR("PLL %d failed to lock within %d ms", inst, PLL_LOCK_TIMEOUT_MS);
+	LOG_ERR("PLL %d failed to lock after %u polls", inst, max_polls);
 	return -ETIMEDOUT;
 }
 
@@ -313,9 +320,9 @@ static uint32_t clock_control_tt_bh_get_freq(const struct clock_control_tt_bh_co
 	return (config->refclk_rate * pll_cntl_1.f.fbdiv) / (pll_cntl_1.f.refdiv * eff_postdiv);
 }
 
-static void clock_control_tt_bh_update(const struct clock_control_tt_bh_config *config,
-				       struct clock_control_tt_bh_data *data,
-				       const struct tt_bh_pll_settings *settings)
+static int clock_control_tt_bh_update(const struct clock_control_tt_bh_config *config,
+				      struct clock_control_tt_bh_data *data,
+				      const struct tt_bh_pll_settings *settings)
 {
 	union tt_bh_pll_cntl_0_reg pll_cntl_0;
 
@@ -342,7 +349,12 @@ static void clock_control_tt_bh_update(const struct clock_control_tt_bh_config *
 	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
 
 	/* Wait for PLLs to lock */
-	clock_control_tt_bh_wait_lock(config->inst);
+	int ret = clock_control_tt_bh_wait_lock(config->inst, PLL_LOCK_TIMEOUT_POLLS);
+
+	if (ret != 0) {
+		/* Keep the glitch-free mux on its bypass source. */
+		return ret;
+	}
 
 	/* Setup external postdivs */
 	clock_control_tt_bh_config_ext_postdivs(config, settings);
@@ -356,6 +368,7 @@ static void clock_control_tt_bh_update(const struct clock_control_tt_bh_config *
 	k_busy_wait_ns(300);
 
 	data->settings = *settings;
+	return 0;
 }
 
 static int clock_control_tt_bh_enable(const struct device *dev, clock_control_subsys_t sys,
@@ -365,6 +378,11 @@ static int clock_control_tt_bh_enable(const struct device *dev, clock_control_su
 	struct clock_control_tt_bh_config *config =
 		(struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
+	k_spinlock_key_t key;
+
+	if (k_spin_trylock(&data->lock, &key) < 0) {
+		return -EBUSY;
+	}
 	struct tt_bh_pll_settings settings = data->settings;
 
 	switch (clock) {
@@ -382,11 +400,14 @@ static int clock_control_tt_bh_enable(const struct device *dev, clock_control_su
 		break;
 
 	default:
+		k_spin_unlock(&data->lock, key);
 		return -ENOSYS;
 	}
 
-	clock_control_tt_bh_update(config, data, &settings);
-	return 0;
+	int ret = clock_control_tt_bh_update(config, data, &settings);
+
+	k_spin_unlock(&data->lock, key);
+	return ret;
 }
 static int clock_control_tt_bh_on(const struct device *dev, clock_control_subsys_t sys)
 {
@@ -468,6 +489,7 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 		(const struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
 	k_spinlock_key_t key;
+	int ret = 0;
 
 	if (k_spin_trylock(&data->lock, &key) < 0) {
 		return -EBUSY;
@@ -493,7 +515,7 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 			return -ERANGE;
 		}
 
-		clock_control_tt_bh_update(config, data, &settings);
+		ret = clock_control_tt_bh_update(config, data, &settings);
 	} else if (clock == CLOCK_CONTROL_TT_BH_CLOCK_AICLK) {
 		uint32_t target_fbdiv;
 		union tt_bh_pll_cntl_1_reg pll_cntl_1;
@@ -506,6 +528,10 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 		target_fbdiv =
 			clock_control_tt_bh_calculate_fbdiv(config->refclk_rate, (uint32_t)rate,
 							    pll_cntl_1, pll_cntl_5, use_postdiv, 0);
+		if (target_fbdiv == 0U || target_fbdiv > UINT16_MAX) {
+			ret = -EINVAL;
+			goto out;
+		}
 
 		while (pll_cntl_1.f.fbdiv != target_fbdiv) {
 			if (target_fbdiv > pll_cntl_1.f.fbdiv) {
@@ -517,18 +543,24 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 			clock_control_tt_bh_write_reg(config, PLL_CNTL_1_OFFSET, pll_cntl_1.val);
 			k_busy_wait_ns(100);
 		}
+		ret = clock_control_tt_bh_wait_lock(config->inst, PLL_DYNAMIC_LOCK_POLLS);
+		if (ret == 0) {
+			data->settings.pll_cntl_1 = pll_cntl_1;
+		}
 	} else if (clock == CLOCK_CONTROL_TT_BH_INIT_STATE) {
 		struct tt_bh_pll_settings settings = config->init_settings;
 
-		clock_control_tt_bh_update(config, data, &settings);
-		clock_control_enable_clk_counters(config);
+		ret = clock_control_tt_bh_update(config, data, &settings);
+		if (ret == 0) {
+			clock_control_enable_clk_counters(config);
+		}
 	} else {
-		k_spin_unlock(&data->lock, key);
-		return -ENOTSUP;
+		ret = -ENOTSUP;
 	}
 
+out:
 	k_spin_unlock(&data->lock, key);
-	return 0;
+	return ret;
 }
 
 static int clock_control_tt_bh_configure(const struct device *dev, clock_control_subsys_t sys,
@@ -605,8 +637,9 @@ static int clock_control_tt_bh_init(const struct device *dev)
 	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
 
 	/* Wait for PLLs to lock */
-	ret = clock_control_tt_bh_wait_lock(config->inst);
+	ret = clock_control_tt_bh_wait_lock(config->inst, PLL_LOCK_TIMEOUT_POLLS);
 	if (ret < 0) {
+		k_spin_unlock(&data->lock, key);
 		return ret;
 	}
 

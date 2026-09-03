@@ -7,11 +7,13 @@
 #include <zephyr/ztest.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/fff.h>
+#include <zephyr/sys/byteorder.h>
 #include <tenstorrent/tt_smbus_regs.h>
 #include <zephyr/drivers/i2c.h>
 #include <tenstorrent/smbus_target.h>
 #include "reg_mock.h"
 #include "asic_state.h"
+#include "chip_info.h"
 #include "telemetry.h"
 #include "status_reg.h"
 #include "cm2dm_msg.h"
@@ -21,9 +23,51 @@ static const struct device *const smbus_target_dev =
 	DEVICE_DT_GET_OR_NULL(DT_NODELABEL(smbus_target0));
 static const uint8_t tt_i2c_addr = 0xA;
 
+static void publish_new_input_power_sample(void)
+{
+	uint8_t data[2];
+
+	sys_put_le16(124U, data);
+	zassert_ok(Dm2CmSendPowerHandler(data, sizeof(data)));
+}
+
 static uint32_t get_smbus_error_count(void)
 {
 	return smbus_target_get_error_count(smbus_target_dev);
+}
+
+ZTEST(smbus_target, test_input_power_sample_freshness)
+{
+	uint8_t data[2];
+
+	sys_put_le16(123U, data);
+	zassert_ok(Dm2CmSendPowerHandler(data, sizeof(data)));
+	zassert_true(InputPowerSampleIsFresh(5U));
+
+	k_msleep(10);
+	zassert_false(InputPowerSampleIsFresh(5U));
+}
+
+ZTEST(smbus_target, test_input_power_snapshot_cannot_mix_old_power_with_new_timestamp)
+{
+	InputPowerSample snapshot;
+	uint8_t data[2];
+
+	sys_put_le16(123U, data);
+	zassert_ok(Dm2CmSendPowerHandler(data, sizeof(data)));
+	k_msleep(10);
+
+	/* Publish a fresh, different sample immediately after the atomic copy. The
+	 * returned old power must retain its old timestamp and remain stale.
+	 */
+	InputPowerTestSetPostSnapshotHook(publish_new_input_power_sample);
+	zassert_false(GetInputPowerSample(5U, &snapshot));
+	zassert_equal(snapshot.power,
+		      123U + bh_chip_info_additional_board_power());
+
+	zassert_true(GetInputPowerSample(5U, &snapshot));
+	zassert_equal(snapshot.power,
+		      124U + bh_chip_info_additional_board_power());
 }
 static void tear_down_tc(void *fixture)
 {

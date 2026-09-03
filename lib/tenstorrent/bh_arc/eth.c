@@ -15,6 +15,7 @@
 #include "reg.h"
 #include "serdes_eth.h"
 #include "aiclk_ppm.h"
+#include "throttler.h"
 
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/post_code.h>
@@ -57,6 +58,7 @@ LOG_MODULE_REGISTER(eth, CONFIG_TT_APP_LOG_LEVEL);
 #define ETH_SD_FW_TAG      "ethsdfw"
 #define ETH_ALT_SD_REG_TAG "altsdreg"
 #define ETH_ALT_SD_FW_TAG  "altsdfw"
+#define ETH_WIPE_DMA_TIMEOUT_MS 50
 
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 static const struct device *flash = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(spi_flash));
@@ -428,7 +430,42 @@ static bool LoadAltSerdes(uint8_t serdes_inst)
 	return false;
 }
 
-static void SerdesEthInit(void)
+static void HoldEthMaskInReset(uint32_t mask)
+{
+	RESET_UNIT_ETH_RESET_reg_u eth_reset = {
+		.val = ReadReg(RESET_UNIT_ETH_RESET_REG_ADDR),
+	};
+
+	eth_reset.f.eth_reset_n &= ~mask;
+	eth_reset.f.eth_risc_reset_n &= ~mask;
+	WriteReg(RESET_UNIT_ETH_RESET_REG_ADDR, eth_reset.val);
+}
+
+#if defined(CONFIG_ZTEST)
+void EthTestHoldMaskInReset(uint32_t mask)
+{
+	HoldEthMaskInReset(mask);
+}
+#endif
+
+static void ReleaseEthHardwareReset(uint32_t mask)
+{
+	RESET_UNIT_ETH_RESET_reg_u eth_reset = {
+		.val = ReadReg(RESET_UNIT_ETH_RESET_REG_ADDR),
+	};
+
+	eth_reset.f.eth_risc_reset_n |= mask;
+	WriteReg(RESET_UNIT_ETH_RESET_REG_ADDR, eth_reset.val);
+}
+
+static int FailEthInit(int error)
+{
+	HoldEthMaskInReset(tile_enable.eth_enabled);
+	record_init_failure(INIT_STAGE_ETH);
+	return error != 0 ? error : -EIO;
+}
+
+static int SerdesEthInit(void)
 {
 	uint32_t ring = 0;
 	int rc;
@@ -459,33 +496,75 @@ static void SerdesEthInit(void)
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_SD_FW_TAG, &serdes_fw_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_SD_FW_TAG, rc);
-		return;
+		return rc;
 	}
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_ALT_SD_FW_TAG, &alt_serdes_fw_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_ALT_SD_FW_TAG, rc);
-		return;
+		return rc;
 	}
 
 	/* Load fw */
 	for (uint8_t serdes_inst = 0; serdes_inst < 6; serdes_inst++) {
 		if (IS_BIT_SET(load_serdes, serdes_inst)) {
 			if (LoadAltSerdes(serdes_inst)) {
-				LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
-						alt_serdes_fw_fd.spi_addr,
-						alt_serdes_fw_fd.flags.f.image_size);
+				rc = LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
+						     alt_serdes_fw_fd.spi_addr,
+						     alt_serdes_fw_fd.flags.f.image_size);
 			} else {
-				LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
-						serdes_fw_fd.spi_addr,
-						serdes_fw_fd.flags.f.image_size);
+				rc = LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
+						     serdes_fw_fd.spi_addr,
+						     serdes_fw_fd.flags.f.image_size);
+			}
+			if (rc != 0) {
+				LOG_ERR("%s(%u) failed: %d", "LoadSerdesEthFw", serdes_inst, rc);
+				return rc;
 			}
 		}
 	}
+
+	return 0;
 }
 
-/* This function assumes that tensix L1s have already been cleared */
-static void wipe_l1(void)
+static int WaitForEthWipeDma(void)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(ETH_WIPE_DMA_TIMEOUT_MS));
+	struct dma_status status;
+	int ret;
+
+	do {
+		ret = dma_get_status(dma_noc, 1, &status);
+		if (ret != 0) {
+			return ret;
+		}
+		if (!status.busy) {
+			return 0;
+		}
+		k_busy_wait(10);
+	} while (!sys_timepoint_expired(timeout));
+
+	return -ETIMEDOUT;
+}
+
+static int RunEthWipeDma(struct dma_config *config, struct tt_bh_dma_noc_coords *coords)
+{
+	int ret = tt_dma_config(dma_noc, 1, config, coords);
+
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = dma_start(dma_noc, 1);
+	if (ret != 0) {
+		return ret;
+	}
+
+	return WaitForEthWipeDma();
+}
+
+/* This function assumes that Tensix L1s have already been cleared. */
+static int wipe_l1(void)
 {
 	uint8_t noc_id = 0;
 	uint64_t addr = 0;
@@ -515,13 +594,18 @@ static void wipe_l1(void)
 		if (IS_BIT_SET(tile_enable.eth_enabled, eth_inst)) {
 			GetEthNocCoords(eth_inst, noc_id, &coords.dest_x, &coords.dest_y);
 
-			tt_dma_config(dma_noc, 1, &config, &coords);
-			dma_start(dma_noc, 1);
+			int rc = RunEthWipeDma(&config, &coords);
+
+			if (rc != 0) {
+				return rc;
+			}
 		}
 	}
+
+	return 0;
 }
 
-static void EthInit(void)
+static int EthInit(void)
 {
 	uint32_t ring = 0;
 	int rc;
@@ -532,41 +616,47 @@ static void EthInit(void)
 
 	/* Early exit if no ETH tiles enabled */
 	if (tile_enable.eth_enabled == 0) {
-		return;
+		return 0;
 	}
 
-	wipe_l1();
+	rc = wipe_l1();
+	if (rc != 0) {
+		LOG_ERR("%s() failed: %d", "wipe_l1", rc);
+		return rc;
+	}
 
 	uint8_t buf[SCRATCHPAD_SIZE] __aligned(4);
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_FW_TAG, &eth_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_FW_TAG, rc);
-		return;
+		return rc;
 	}
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_FW_CFG_TAG, &eth_cfg_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_FW_CFG_TAG, rc);
-		return;
+		return rc;
 	}
 
 	/* Loading ETH FW configuration data requires the whole data to be loaded into buffer */
-	__ASSERT(SCRATCHPAD_SIZE >= eth_cfg_fd.flags.f.image_size,
-		 "spi buffer size %zu must be larger than image size %zu", SCRATCHPAD_SIZE,
-		 eth_cfg_fd.flags.f.image_size);
+	if (eth_cfg_fd.flags.f.image_size > SCRATCHPAD_SIZE) {
+		LOG_ERR("ETH configuration image too large: %zu > %u",
+			(size_t)eth_cfg_fd.flags.f.image_size, SCRATCHPAD_SIZE);
+		return -E2BIG;
+	}
 
 	/* Load the SerDes cfg from SPI into each enabled ETH tile's L1 at ETH_SERDES_CFG_ADDR */
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_SD_REG_TAG, &serdes_reg_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_SD_REG_TAG, rc);
-		return;
+		return rc;
 	}
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_ALT_SD_REG_TAG, &alt_serdes_reg_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_ALT_SD_REG_TAG, rc);
-		return;
+		return rc;
 	}
 
 	/* Load fw, params, and serdes cfg */
@@ -575,8 +665,12 @@ static void EthInit(void)
 			continue;
 		}
 
-		LoadEthFw(eth_inst, ring, buf, SCRATCHPAD_SIZE, eth_fd.spi_addr,
-			  eth_fd.flags.f.image_size);
+		rc = LoadEthFw(eth_inst, ring, buf, SCRATCHPAD_SIZE, eth_fd.spi_addr,
+			       eth_fd.flags.f.image_size);
+		if (rc != 0) {
+			LOG_ERR("%s(%u) failed: %d", "LoadEthFw", eth_inst, rc);
+			return rc;
+		}
 
 		if (load_alt_eth_serdes_cfg(eth_inst)) {
 			rc = load_eth_serdes_cfg(eth_inst, ring, buf, SCRATCHPAD_SIZE,
@@ -589,12 +683,30 @@ static void EthInit(void)
 		}
 		if (rc < 0) {
 			LOG_ERR("%s(%u) failed: %d", "load_eth_serdes_cfg", eth_inst, rc);
-			return;
+			return rc;
 		}
 
-		LoadEthFwCfg(eth_inst, ring, buf, tile_enable.eth_enabled, eth_cfg_fd.spi_addr,
-			     eth_cfg_fd.flags.f.image_size);
+		rc = LoadEthFwCfg(eth_inst, ring, buf, tile_enable.eth_enabled,
+				  eth_cfg_fd.spi_addr, eth_cfg_fd.flags.f.image_size);
+		if (rc != 0) {
+			LOG_ERR("%s(%u) failed: %d", "LoadEthFwCfg", eth_inst, rc);
+			return rc;
+		}
 	}
+
+	/* Hardware reset remains asserted throughout every load. Release only after
+	 * all enabled tiles contain a complete, known image and configuration. A
+	 * PCIe fault IRQ can latch containment while SPI/DMA is in progress, so the
+	 * final check and every executable-RISC release are one serialized action.
+	 */
+	unsigned int key = irq_lock();
+
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		HoldEthMaskInReset(tile_enable.eth_enabled);
+		irq_unlock(key);
+		return -ECANCELED;
+	}
+	ReleaseEthHardwareReset(tile_enable.eth_enabled);
 
 	/* Deassert tile reset */
 	for (uint8_t eth_inst = 0; eth_inst < MAX_ETH_INSTANCES; eth_inst++) {
@@ -607,6 +719,9 @@ static void EthInit(void)
 
 		ReleaseEthReset(eth_inst, ring);
 	}
+	irq_unlock(key);
+
+	return 0;
 }
 
 static void assert_eth_risc_soft_reset(uint32_t eth_inst, uint32_t ring)
@@ -675,7 +790,10 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 		}
 	}
 
-	SetAiclkResetSafe(true);
+	if (bh_reset_safe_aiclk_acquire() != 0) {
+		rsp->data[1] = ETH_RESET_ERR_AICLK;
+		return 1;
+	}
 
 	RESET_UNIT_ETH_RESET_reg_u eth_reset = {.val = ReadReg(RESET_UNIT_ETH_RESET_REG_ADDR)};
 
@@ -695,12 +813,6 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 		}
 	}
 
-	/* Deassert risc reset */
-	eth_reset.f.eth_risc_reset_n |= mask;
-	WriteReg(RESET_UNIT_ETH_RESET_REG_ADDR, eth_reset.val);
-
-	SetAiclkResetSafe(false);
-
 	if (!skip_fw) {
 		uint8_t buf[SCRATCHPAD_SIZE] __aligned(4);
 
@@ -713,17 +825,32 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 				       fw_fd.flags.f.image_size);
 			if (rc < 0) {
 				rsp->data[1] = ETH_RESET_ERR_FW_LOAD;
-				return 1;
+				goto fail;
 			}
 
 			rc = LoadEthFwCfg(eth_inst, ring, buf, tile_enable.eth_enabled,
 					  cfg_fd.spi_addr, cfg_fd.flags.f.image_size);
 			if (rc < 0) {
 				rsp->data[1] = ETH_RESET_ERR_CFG_LOAD;
-				return 1;
+				goto fail;
 			}
 		}
+	}
 
+	/* Do not execute partially loaded/stale firmware or race an IRQ-side power
+	 * latch. Release hardware and soft reset as one interrupt-serialized
+	 * transition only after every requested reload has completed.
+	 */
+	unsigned int key = irq_lock();
+
+	if (!ThrottlerComputePowerPolicyReady()) {
+		HoldEthMaskInReset(mask);
+		irq_unlock(key);
+		rsp->data[1] = ETH_RESET_ERR_AICLK;
+		return 1;
+	}
+	ReleaseEthHardwareReset(mask);
+	if (!skip_fw) {
 		/* Start ERISC FW */
 		for (uint8_t eth_inst = 0; eth_inst < MAX_ETH_INSTANCES; eth_inst++) {
 			/* Ensure that saved heartbeat is cleared before releasing reset */
@@ -736,9 +863,19 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 			ReleaseEthReset(eth_inst, ring);
 		}
 	}
+	irq_unlock(key);
+
+	if (bh_reset_safe_aiclk_release() != 0) {
+		rsp->data[1] = ETH_RESET_ERR_AICLK;
+		goto fail;
+	}
 
 	rsp->data[1] = mask;
 	return 0;
+
+fail:
+	HoldEthMaskInReset(mask);
+	return 1;
 }
 
 REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_ETH_RESET, toggle_eth_reset_handler);
@@ -757,9 +894,25 @@ static int eth_init(void)
 	if (is_cable_fault_mode()) {
 		return 0;
 	}
+	if (error_status0 != 0U || ThrottlerRuntimePowerFaultLatched()) {
+		HoldEthMaskInReset(tile_enable.eth_enabled);
+		return -ECANCELED;
+	}
 
-	SerdesEthInit();
-	EthInit();
+	if (flash == NULL || !device_is_ready(flash) || !device_is_ready(dma_noc)) {
+		return FailEthInit(-ENODEV);
+	}
+
+	int rc = SerdesEthInit();
+
+	if (rc != 0) {
+		return FailEthInit(rc);
+	}
+
+	rc = EthInit();
+	if (rc != 0) {
+		return FailEthInit(rc);
+	}
 
 	return 0;
 }

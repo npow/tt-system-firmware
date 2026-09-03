@@ -10,11 +10,12 @@
 #include <stdbool.h>
 
 /* Bounds checks for FMAX and FMIN (in MHz) */
-#define AICLK_FMAX_MAX        1400.0F
-#define AICLK_FMAX_MIN        800.0F
-#define AICLK_FMIN_MAX        1400.0F
-#define AICLK_FMIN_MIN        200.0F
-#define AICLK_RESET_SAFE_FREQ 250.0F
+#define AICLK_FMAX_MAX                 1400.0F
+#define AICLK_FMAX_MIN                 800.0F
+#define AICLK_FMIN_MAX                 1400.0F
+#define AICLK_FMIN_MIN                 200.0F
+#define AICLK_RESET_SAFE_FREQ          250.0F
+#define AICLK_POWER_SLEW_UP_MHZ_PER_MS 1U
 
 /**
  * @brief AICLK maximum frequency arbiters
@@ -80,18 +81,28 @@ union aiclk_targ_freq_info {
 };
 
 void aiclk_update_busy(void);
+void SetAiclkPowerSlew(bool enable);
 void SetAiclkArbMax(enum aiclk_arb_max arb_max, float freq);
 void SetAiclkArbMin(enum aiclk_arb_min arb_min, float freq);
 void EnableArbMax(enum aiclk_arb_max arb_max, bool enable);
 void EnableArbMin(enum aiclk_arb_min arb_min, bool enable);
 void CalculateTargAiclk(void);
-void DecreaseAiclk(void);
-void IncreaseAiclk(void);
+int DecreaseAiclk(void);
+int IncreaseAiclk(void);
 void InitArbMaxVoltage(void);
 float GetThrottlerArbMax(enum aiclk_arb_max arb_max);
 uint8_t ForceAiclk(uint32_t freq);
-void SetAiclkResetSafe(bool enable);
+int SetAiclkResetSafe(bool enable);
+/**
+ * @brief Permanently select the reset-safe AICLK policy for a runtime power fault.
+ *
+ * This only updates arbitration state; the active DVFS transaction applies the
+ * clock and voltage changes after its throttler calculation returns.
+ */
+void LatchAiclkPowerFault(void);
 uint32_t GetAiclkTarg(void);
+/** Read the physical PLL rate. UINT32_MAX indicates a read failure. */
+uint32_t GetAiclkCurrent(void);
 uint32_t GetMaxAiclkForVoltage(uint32_t voltage);
 uint32_t GetAiclkFmin(void);
 uint32_t GetAiclkFmax(void);
@@ -99,6 +110,15 @@ uint32_t get_aiclk_effective_arb_min(enum aiclk_arb_min *effective_min_arb);
 uint32_t get_aiclk_effective_arb_max(enum aiclk_arb_max *effective_max_arb);
 uint32_t get_enabled_arb_min_bitmask(void);
 uint32_t get_enabled_arb_max_bitmask(void);
+
+#if defined(CONFIG_ZTEST)
+uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms);
+bool AiclkTestResetSafeEnabled(void);
+void AiclkTestSetResetSafePreClearHook(void (*hook)(void));
+void AiclkTestSetRaisePreCommitHook(void (*hook)(void));
+void AiclkTestSetTarget(uint32_t target_freq);
+void AiclkTestReinitializeRuntimeOverrides(void);
+#endif
 union aiclk_targ_freq_info get_targ_aiclk_info(void);
 
 struct response;

@@ -8,6 +8,7 @@
 
 #include "status_reg.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define RESET_UNIT_GLOBAL_RESET_REG_ADDR 0x80030000
@@ -114,10 +115,16 @@ enum init_stage_id {
 	INIT_STAGE_TENSIX = 2,
 	INIT_STAGE_MRISC_LOAD = 3,
 	INIT_STAGE_GDDR_TRAIN = 4,
+	INIT_STAGE_PCIE = 5,
+	INIT_STAGE_ETH = 6,
+	INIT_STAGE_THERMAL = 7,
 	INIT_STAGE_COUNT,
 };
 
 extern uint32_t error_status0;
+
+/** Return true once application hardware initialization has begun. */
+bool BhArcInitializationStarted(void);
 
 /**
  * @brief Record a failure from an init function
