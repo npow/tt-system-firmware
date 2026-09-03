@@ -33,6 +33,7 @@ static atomic_t runtime_power_fault_trip_power;
 static atomic_t runtime_power_sample_seen;
 static atomic_t runtime_power_sample_timestamp_ms;
 static atomic_t runtime_power_sample_watchdog_started_ms;
+static atomic_t runtime_power_monitor_initialized;
 static struct k_spinlock runtime_power_sample_lock;
 
 static bool doppler;
@@ -387,6 +388,7 @@ void InitThrottlers(void)
 {
 	uint16_t boot_cable_power_limit;
 
+	atomic_clear(&runtime_power_monitor_initialized);
 	doppler = tt_bh_fwtable_get_fw_table(fwtable_dev)->feature_enable.doppler_en;
 	doppler_slow = doppler;
 	doppler_t2 = doppler;
@@ -459,6 +461,12 @@ void InitThrottlers(void)
 	if (bh_get_boot_cable_power_limit(&boot_cable_power_limit)) {
 		(void)InstallDmcBoardPowerLimit(boot_cable_power_limit);
 	}
+
+	/* PCIe fault containment must not arm while reset/retrain initialization
+	 * is still producing expected controller events. A power sample received
+	 * before this point is cleared above and cannot satisfy readiness.
+	 */
+	atomic_set(&runtime_power_monitor_initialized, 1);
 }
 
 static void UpdateThrottler(ThrottlerId id, float value)
@@ -664,6 +672,11 @@ void ThrottlerTestRecordInputPowerSample(uint32_t now_ms)
 	ThrottlerRecordInputPowerSample(now_ms);
 }
 
+void ThrottlerTestSetRuntimePowerMonitorInitialized(bool initialized)
+{
+	atomic_set(&runtime_power_monitor_initialized, initialized);
+}
+
 bool ThrottlerTestRuntimePowerSampleExpired(uint32_t now_ms)
 {
 	return RuntimePowerSampleExpired(now_ms);
@@ -844,6 +857,12 @@ bool ThrottlerRuntimePowerFaultLatched(void)
 bool ThrottlerStrictRuntimePowerLimitActive(void)
 {
 	return strict_runtime_power_limit;
+}
+
+bool ThrottlerRuntimePowerMonitorReady(void)
+{
+	return atomic_get(&runtime_power_monitor_initialized) != 0 &&
+	       atomic_get(&runtime_power_sample_seen) != 0;
 }
 
 void ThrottlerRequestRuntimeContainment(void)

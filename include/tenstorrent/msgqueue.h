@@ -893,12 +893,8 @@ struct set_wdt_timeout_rqst {
 
 	/** @brief The watchdog timeout value in milliseconds
 	 *
-	 * Valid values:
-	 * - 0: Disable the watchdog timer completely
-	 * - >CONFIG_TT_BH_ARC_WDT_FEED_INTERVAL: Enable watchdog with specified timeout
-	 *
-	 * Values between 1 and CONFIG_TT_BH_ARC_WDT_FEED_INTERVAL (inclusive) are
-	 * rejected with ENOTSUP, as they are below the minimum feed interval.
+	 * Zero disables the watchdog. Nonzero values are rejected with ENOTSUP so
+	 * a host request cannot asynchronously reset the ASIC and its PCIe link.
 	 */
 	uint32_t timeout_ms;
 };

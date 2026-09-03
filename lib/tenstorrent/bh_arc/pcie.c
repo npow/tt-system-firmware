@@ -20,11 +20,15 @@
 
 #include <tenstorrent/post_code.h>
 #include <tenstorrent/sys_init_defines.h>
+#if defined(CONFIG_ARC)
+#include <zephyr/arch/arc/v2/arcv2_irq_unit.h>
+#endif
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_arc_hs.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
 #define PCIE_SERDES0_ALPHACORE_TLB 0
@@ -55,6 +59,16 @@
 LOG_MODULE_DECLARE(bh_arc);
 
 static const struct device *const arc_dma_dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(dma0));
+
+#if defined(CONFIG_ARC) || defined(CONFIG_ZTEST)
+static atomic_t pcie_error_interrupts_armed;
+#if defined(CONFIG_ARC)
+static atomic_t pcie_error_interrupt_mask;
+#endif
+#if defined(CONFIG_ZTEST)
+static uint8_t pcie_error_interrupt_arm_count;
+#endif
+#endif
 
 typedef struct {
 	uint32_t tlp_type: 5;
@@ -274,17 +288,80 @@ static void PcieErrorInterrupt(void *arg)
 static void InitResetInterrupt(uint8_t pcie_inst)
 {
 #if CONFIG_ARC
+	uint32_t irq_num;
+
+	if (pcie_inst == 0) {
+		irq_num = IRQNUM_PCIE0_ERR_INTR;
+	} else if (pcie_inst == 1) {
+		irq_num = IRQNUM_PCIE1_ERR_INTR;
+	} else {
+		return;
+	}
+
+	irq_disable(irq_num);
 	if (pcie_inst == 0) {
 		IRQ_CONNECT(IRQNUM_PCIE0_ERR_INTR, 0, PcieErrorInterrupt, IRQNUM_PCIE0_ERR_INTR, 0);
-		irq_enable(IRQNUM_PCIE0_ERR_INTR);
-	} else if (pcie_inst == 1) {
+	} else {
 		IRQ_CONNECT(IRQNUM_PCIE1_ERR_INTR, 0, PcieErrorInterrupt, IRQNUM_PCIE1_ERR_INTR, 0);
-		irq_enable(IRQNUM_PCIE1_ERR_INTR);
 	}
+	atomic_or(&pcie_error_interrupt_mask, BIT(pcie_inst));
+
+	/* Recovery has no DMC input-power producer to arm this later. */
+#if defined(CONFIG_TT_SMC_RECOVERY)
+	z_arc_v2_irq_unit_int_eoi(irq_num);
+	irq_enable(irq_num);
+#endif
 #else
 	ARG_UNUSED(pcie_inst);
 #endif
 }
+
+void PcieArmErrorInterrupts(void)
+{
+#if defined(CONFIG_ARC) || defined(CONFIG_ZTEST)
+#if defined(CONFIG_ARC) && !defined(CONFIG_TT_SMC_RECOVERY)
+	atomic_val_t mask = atomic_get(&pcie_error_interrupt_mask);
+
+	if (mask == 0) {
+		return;
+	}
+#endif
+	if (!atomic_cas(&pcie_error_interrupts_armed, 0, 1)) {
+		return;
+	}
+#if defined(CONFIG_ZTEST)
+	pcie_error_interrupt_arm_count++;
+#endif
+#if defined(CONFIG_ARC) && !defined(CONFIG_TT_SMC_RECOVERY)
+	if (mask & BIT(0)) {
+		z_arc_v2_irq_unit_int_eoi(IRQNUM_PCIE0_ERR_INTR);
+		irq_enable(IRQNUM_PCIE0_ERR_INTR);
+	}
+	if (mask & BIT(1)) {
+		z_arc_v2_irq_unit_int_eoi(IRQNUM_PCIE1_ERR_INTR);
+		irq_enable(IRQNUM_PCIE1_ERR_INTR);
+	}
+#endif
+#endif
+}
+
+#if defined(CONFIG_ZTEST)
+bool PcieTestErrorInterruptsArmed(void)
+{
+	return atomic_get(&pcie_error_interrupts_armed) != 0;
+}
+
+uint8_t PcieTestErrorInterruptArmCount(void)
+{
+	return pcie_error_interrupt_arm_count;
+}
+
+void PcieTestResetErrorInterrupts(void)
+{
+	atomic_clear(&pcie_error_interrupts_armed);
+	pcie_error_interrupt_arm_count = 0;
+}
+#endif
 
 static void SetupOutboundTlbs(void)
 {
@@ -485,15 +562,14 @@ static int pcie_init(void)
 	if (pci0_property_table.pcie_mode != BH_PCIE_MODE_DISABLED) {
 		CntlInitV2ParamInit(0, board_id, vendor_id, &pci0_property_table, &param);
 		PCIeInit(&param);
+		InitResetInterrupt(0);
 	}
 
 	if (pci1_property_table.pcie_mode != BH_PCIE_MODE_DISABLED) {
 		CntlInitV2ParamInit(1, board_id, vendor_id, &pci1_property_table, &param);
 		PCIeInit(&param);
+		InitResetInterrupt(1);
 	}
-
-	InitResetInterrupt(0);
-	InitResetInterrupt(1);
 
 	WriteReg(PCIE_INIT_CPL_TIME_REG_ADDR, TimerTimestamp());
 

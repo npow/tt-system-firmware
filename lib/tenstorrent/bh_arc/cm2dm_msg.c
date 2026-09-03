@@ -27,6 +27,7 @@
 #include "fan_ctrl.h"
 #include "telemetry.h"
 #include "dvfs.h"
+#include "pcie.h"
 #include "throttler.h"
 
 typedef struct {
@@ -255,36 +256,31 @@ REGISTER_MESSAGE(TT_SMC_MSG_PING_DM, ping_dm_handler);
  * @param[out] response The response to the host (unused for this handler).
  * @retval 0 Success
  * @retval ENODEV Watchdog device is not ready
- * @retval ENOTSUP Timeout is below the minimum feed interval
+ * @retval ENOTSUP A nonzero reset watchdog was requested
  * @return Other error codes for watchdog setup failures
  * @see set_wdt_timeout_rqst
  */
 static uint8_t set_watchdog_timeout(const union request *request, struct response *response)
 {
 	const struct device *wdt_dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(wdt0));
-	struct wdt_timeout_cfg cfg = {0};
 	int ret;
+
+	/*
+	 * The DMC watchdog resets the complete ASIC, including the host PCIe link.
+	 * A userspace client can already request a coordinated reset through the
+	 * kernel driver; never let an unprivileged raw SMC message arm an
+	 * asynchronous link-destroying reset. Keep timeout zero working so the
+	 * driver can explicitly disable a watchdog left by older firmware.
+	 */
+	if (request->set_wdt_timeout.timeout_ms != 0) {
+		return ENOTSUP;
+	}
 
 	if (!device_is_ready(wdt_dev)) {
 		return ENODEV;
 	}
 
-	if (request->set_wdt_timeout.timeout_ms != 0) {
-		/* Deny a timeout lower than our feed interval */
-		if (request->set_wdt_timeout.timeout_ms <= CONFIG_TT_BH_ARC_WDT_FEED_INTERVAL) {
-			return ENOTSUP;
-		}
-		cfg.window.max = request->set_wdt_timeout.timeout_ms;
-		/* Program watchdog timeout */
-		ret = wdt_install_timeout(wdt_dev, &cfg);
-		if (ret < 0) {
-			return 0 - ret;
-		}
-		ret = wdt_setup(wdt_dev, WDT_FLAG_RESET_CPU_CORE);
-	} else {
-		/* Turn off watchdog */
-		ret = wdt_disable(wdt_dev);
-	}
+	ret = wdt_disable(wdt_dev);
 	return 0 - ret;
 }
 
@@ -350,6 +346,9 @@ int32_t Dm2CmSendPowerHandler(const uint8_t *data, uint8_t size)
 	 * Invalid payloads leave the watchdog running and lead to containment.
 	 */
 	ThrottlerRecordInputPowerSample(k_uptime_get_32());
+	if (ThrottlerRuntimePowerMonitorReady()) {
+		PcieArmErrorInterrupts();
+	}
 	AdjustDVFSTimer();
 
 	return 0;

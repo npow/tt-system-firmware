@@ -6,6 +6,7 @@
 #ifndef PCIE_H
 #define PCIE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "noc2axi.h"
 
@@ -27,6 +28,18 @@ typedef enum {
 	PCIeSerdesFWLoadTimeout = 1,
 	PCIeLinkTrainTimeout = 2,
 } PCIeInitStatus;
+
+/* The mission image arms PCIe error containment only after DMC has delivered
+ * its first complete input-power sample. The recovery image keeps its legacy
+ * boot-time arming behavior.
+ */
+void PcieArmErrorInterrupts(void);
+
+#if defined(CONFIG_ZTEST)
+bool PcieTestErrorInterruptsArmed(void);
+uint8_t PcieTestErrorInterruptArmCount(void);
+void PcieTestResetErrorInterrupts(void);
+#endif
 
 #define PCIE_INST0_LOGICAL_X 2
 #define PCIE_INST1_LOGICAL_X 11

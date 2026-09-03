@@ -9,6 +9,7 @@
 
 #include "aiclk_ppm.h"
 #include "cm2dm_msg.h"
+#include "pcie.h"
 #include "telemetry.h"
 #include "throttler.h"
 #include <tenstorrent/bh_power.h>
@@ -42,6 +43,7 @@ static void set_dmc_board_power_limit(uint16_t watts)
 static void *throttler_setup(void)
 {
 	InitThrottlers();
+	PcieTestResetErrorInterrupts();
 	return NULL;
 }
 
@@ -214,7 +216,15 @@ ZTEST(throttler, test_runtime_power_freshness_accepts_valid_samples_and_wraps)
 	now_ms = k_uptime_get_32();
 	ThrottlerTestStartRuntimePowerSampleWatchdog(now_ms);
 	sys_put_le16(300, power_data);
+	PcieTestResetErrorInterrupts();
+	zassert_false(PcieTestErrorInterruptsArmed());
+	zassert_equal(Dm2CmSendPowerHandler(power_data, 1), -1);
+	zassert_false(PcieTestErrorInterruptsArmed());
 	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	zassert_true(PcieTestErrorInterruptsArmed());
+	zassert_equal(PcieTestErrorInterruptArmCount(), 1);
+	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	zassert_equal(PcieTestErrorInterruptArmCount(), 1);
 	zassert_false(ThrottlerTestRuntimePowerSampleExpired(k_uptime_get_32()));
 
 	ThrottlerTestStartRuntimePowerSampleWatchdog(100);
@@ -227,6 +237,21 @@ ZTEST(throttler, test_runtime_power_freshness_accepts_valid_samples_and_wraps)
 	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(94));
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_pcie_error_interrupts_wait_for_initialized_power_monitor)
+{
+	uint8_t power_data[2];
+
+	sys_put_le16(100, power_data);
+	PcieTestResetErrorInterrupts();
+	ThrottlerTestSetRuntimePowerMonitorInitialized(false);
+	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	zassert_false(PcieTestErrorInterruptsArmed());
+
+	ThrottlerTestSetRuntimePowerMonitorInitialized(true);
+	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	zassert_true(PcieTestErrorInterruptsArmed());
 }
 
 ZTEST(throttler, test_runtime_power_guard_stays_latched)

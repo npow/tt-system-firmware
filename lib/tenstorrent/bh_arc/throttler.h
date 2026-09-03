@@ -22,6 +22,8 @@ uint32_t GetNOPOnAccumulatedTime(void);
 uint32_t GetNOPOnDuration(uint32_t window_ms);
 bool ThrottlerRuntimePowerFaultLatched(void);
 bool ThrottlerStrictRuntimePowerLimitActive(void);
+/* True only after throttler initialization and a later complete DMC sample. */
+bool ThrottlerRuntimePowerMonitorReady(void);
 /* IRQ-safe request used by PCIe error handling; containment runs on the next
  * DVFS pass so ARC/PCIe management is never reset from the interrupt path.
  */
@@ -37,6 +39,7 @@ bool ThrottlerTestUpdateRuntimePowerGuard(bool eligible, uint16_t current_power,
 void ThrottlerTestResetRuntimePowerGuard(void);
 void ThrottlerTestStartRuntimePowerSampleWatchdog(uint32_t now_ms);
 void ThrottlerTestRecordInputPowerSample(uint32_t now_ms);
+void ThrottlerTestSetRuntimePowerMonitorInitialized(bool initialized);
 bool ThrottlerTestRuntimePowerSampleExpired(uint32_t now_ms);
 bool ThrottlerTestUpdateRuntimePowerFreshnessGuard(uint32_t now_ms);
 uint16_t ThrottlerTestUpdateBoardPowerHistory(uint16_t current_power);
