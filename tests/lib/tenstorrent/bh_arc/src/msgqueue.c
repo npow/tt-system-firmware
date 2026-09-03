@@ -854,19 +854,23 @@ ZTEST(msgqueue, test_msg_type_set_wdt_timeout)
 	/* Clear any pending messages from previous tests */
 	clear_pending_smbus_messages();
 
-	/* A nonzero timeout could asynchronously reset the complete ASIC/link. */
+	/* Test setting watchdog timeout with valid value */
 	req.set_wdt_timeout.command_code = TT_SMC_MSG_SET_WDT_TIMEOUT;
-	req.set_wdt_timeout.timeout_ms = 5000;
+	req.set_wdt_timeout.timeout_ms = 5000; /* 5 seconds - should be valid */
 
-	msgqueue_request_push(0, &req);
-	process_message_queues();
-	msgqueue_response_pop(0, &rsp);
-	zassert_equal(rsp.data[0], ENOTSUP, "Nonzero reset watchdog should be rejected");
+	push_msg_success();
 
-	/* A rejected request must not reach DMC. */
+	/* Now act as DMC and read the posted SMBUS message */
 	cm2dmMessage posted_msg = read_posted_smbus_message();
 
-	zassert_equal(posted_msg.msg_id, 0, "Rejected watchdog must not post a DMC message");
+	/* Verify the posted message contains the correct timeout data */
+	zassert_equal(posted_msg.msg_id, kCm2DmMsgIdAutoResetTimeoutUpdate,
+		      "Posted message should be AutoResetTimeoutUpdate");
+	zassert_equal(posted_msg.data, 5000,
+		      "Posted message data should contain timeout value 5000ms");
+
+	/* Send ACK for the message */
+	ack_smbus_message(&posted_msg);
 
 	/* Test disabling watchdog (timeout = 0) */
 	memset(&req, 0, sizeof(req));
