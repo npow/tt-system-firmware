@@ -114,23 +114,17 @@ static void EnableOverlayCg(uint8_t tlb_index, uint8_t px, uint8_t py)
 /* This function requires that NOC translation is disabled (or identity) on both NOCs for the ARC
  * node.
  */
-static void ProgramBroadcastExclusion(uint16_t disabled_tensix_columns)
+static void GetBroadcastExclusionMasks(uint16_t disabled_tensix_columns,
+				       uint32_t router_cfg_1[NUM_NOCS],
+				       uint32_t router_cfg_3[NUM_NOCS])
 {
-	/* ROUTER_CFG_1,2 are a 64-bit mask for column broadcast disable */
-	/* ROUTER_CFG_3,4 are a 64-bit mask for row broadcast disable */
-	/* A node will not receive broadcasts if it is in a disabled row or column. */
-
 	/* Disable broadcast to west GDDR, L2CPU/security/ARC, east GDDR columns. */
-	uint32_t router_cfg_1[NUM_NOCS] = {
-		BIT(0) | BIT(8) | BIT(9),
-		BIT(NOC0_X_TO_NOC1(0)) | BIT(NOC0_X_TO_NOC1(8)) | BIT(NOC0_X_TO_NOC1(9)),
-	};
+	router_cfg_1[0] = BIT(0) | BIT(8) | BIT(9);
+	router_cfg_1[1] = BIT(NOC0_X_TO_NOC1(0)) | BIT(NOC0_X_TO_NOC1(8)) | BIT(NOC0_X_TO_NOC1(9));
 
 	/* Disable broadcast to ethernet row, PCIE/SERDES row. */
-	static const uint32_t router_cfg_3[NUM_NOCS] = {
-		BIT(0) | BIT(1),
-		BIT(NOC0_Y_TO_NOC1(0)) | BIT(NOC0_Y_TO_NOC1(1)),
-	};
+	router_cfg_3[0] = BIT(0) | BIT(1);
+	router_cfg_3[1] = BIT(NOC0_Y_TO_NOC1(0)) | BIT(NOC0_Y_TO_NOC1(1));
 
 	/* Update for any disabled Tensix columns. */
 	for (uint8_t i = 0; i < 14; i++) {
@@ -141,18 +135,35 @@ static void ProgramBroadcastExclusion(uint16_t disabled_tensix_columns)
 			router_cfg_1[1] |= BIT(NOC0_X_TO_NOC1(noc0_x));
 		}
 	}
+}
+
+static void ProgramBroadcastExclusionSingleTile(uint8_t px, uint8_t py,
+						const uint32_t router_cfg_1[NUM_NOCS],
+						const uint32_t router_cfg_3[NUM_NOCS])
+{
+	for (uint32_t noc_id = 0; noc_id < NUM_NOCS; noc_id++) {
+		volatile uint32_t *noc_regs = SetupNiuTlbPhys(kTlbIndex, px, py, noc_id);
+
+		WriteNocCfgReg(noc_regs, ROUTER_CFG(1), router_cfg_1[noc_id]);
+		WriteNocCfgReg(noc_regs, ROUTER_CFG(2), 0);
+		WriteNocCfgReg(noc_regs, ROUTER_CFG(3), router_cfg_3[noc_id]);
+		WriteNocCfgReg(noc_regs, ROUTER_CFG(4), 0);
+	}
+}
+
+static void ProgramBroadcastExclusion(uint16_t disabled_tensix_columns)
+{
+	/* ROUTER_CFG_1,2 are a 64-bit mask for column broadcast disable. */
+	/* ROUTER_CFG_3,4 are a 64-bit mask for row broadcast disable. */
+	/* A node will not receive broadcasts if it is in a disabled row or column. */
+	uint32_t router_cfg_1[NUM_NOCS];
+	uint32_t router_cfg_3[NUM_NOCS];
+
+	GetBroadcastExclusionMasks(disabled_tensix_columns, router_cfg_1, router_cfg_3);
 
 	for (uint32_t py = 0; py < NOC_Y_SIZE; py++) {
 		for (uint32_t px = 0; px < NOC_X_SIZE; px++) {
-			for (uint32_t noc_id = 0; noc_id < NUM_NOCS; noc_id++) {
-				volatile uint32_t *noc_regs =
-					SetupNiuTlbPhys(kTlbIndex, px, py, noc_id);
-
-				WriteNocCfgReg(noc_regs, ROUTER_CFG(1), router_cfg_1[noc_id]);
-				WriteNocCfgReg(noc_regs, ROUTER_CFG(2), 0);
-				WriteNocCfgReg(noc_regs, ROUTER_CFG(3), router_cfg_3[noc_id]);
-				WriteNocCfgReg(noc_regs, ROUTER_CFG(4), 0);
-			}
+			ProgramBroadcastExclusionSingleTile(px, py, router_cfg_1, router_cfg_3);
 		}
 	}
 }
@@ -686,6 +697,40 @@ void ProgramNocTranslationSingleTile(uint8_t noc0_x, uint8_t noc0_y)
 			WriteNocCfgReg(noc_regs, NIU_CFG_0, niu_cfg_0);
 		}
 	}
+}
+
+void ReinitTensixNoc(void)
+{
+	uint32_t router_cfg_1[NUM_NOCS];
+	uint32_t router_cfg_3[NUM_NOCS];
+	uint16_t disabled_tensix_columns = BIT_MASK(NUM_TENSIX_X) & ~tile_enable.tensix_col_enabled;
+	bool restore_translation = noc_translation_enabled;
+
+	/* A Tensix tile reset clears only the Tensix-local NIU and router state.
+	 * Reprogramming translation on every live GDDR, PCIe, ARC, and L2CPU node
+	 * is unnecessary and can disrupt traffic left in the fabric by the workload
+	 * being stopped. Address the reset tiles by physical coordinates while the
+	 * ARC's own translation is disabled, and leave every non-Tensix node alone.
+	 */
+	DisableArcNocTranslation();
+	GetBroadcastExclusionMasks(disabled_tensix_columns, router_cfg_1, router_cfg_3);
+
+	for (uint8_t tensix_y = 0; tensix_y < NUM_TENSIX_Y; tensix_y++) {
+		for (uint8_t tensix_x = 0; tensix_x < NUM_TENSIX_X; tensix_x++) {
+			uint8_t noc0_x = TensixPhysXToNoc(tensix_x, 0);
+			uint8_t noc0_y = TensixPhysYToNoc(tensix_y, 0);
+			uint8_t px = NocToPhysX(noc0_x, 0);
+			uint8_t py = NocToPhysY(noc0_y, 0);
+
+			NocInitSingleTile(noc0_x, noc0_y);
+			ProgramBroadcastExclusionSingleTile(px, py, router_cfg_1, router_cfg_3);
+			if (restore_translation) {
+				ProgramNocTranslationSingleTile(noc0_x, noc0_y);
+			}
+		}
+	}
+
+	RestoreArcNocTranslation();
 }
 
 void DisableArcNocTranslation(void)

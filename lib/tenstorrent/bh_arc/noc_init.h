@@ -14,6 +14,7 @@ int32_t set_tensix_enable(bool enable);
 
 int NocInit(void);
 void NocInitSingleTile(uint8_t noc0_x, uint8_t noc0_y);
+void ReinitTensixNoc(void);
 void InitNocTranslation(unsigned int pcie_instance, uint16_t bad_tensix_cols, uint8_t bad_gddr,
 			uint16_t skip_eth);
 int InitNocTranslationFromHarvesting(void);

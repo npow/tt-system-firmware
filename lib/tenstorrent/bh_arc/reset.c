@@ -78,6 +78,12 @@ static const uint32_t kAllRiscSoftReset = 0x47800;
  */
 static const uint32_t kAllComputeSoftReset = 0x7FFFF;
 
+/* Match the established idle-before-clock-gate interval. At reset-safe AICLK,
+ * 100 us also gives the NOC endpoints ample time to observe reset assertion and
+ * to become addressable again after deassertion.
+ */
+#define TENSIX_RESET_SETTLE_US 100U
+
 static bool RejectTensixRecoveryAfterPowerFault(struct response *rsp)
 {
 	if (!ThrottlerRuntimePowerFaultLatched()) {
@@ -248,6 +254,11 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 	if (RejectTensixRecoveryAfterPowerFault(rsp)) {
 		return 2;
 	}
+	ARG_UNUSED(req);
+
+	SetAiclkResetSafe(true);
+	bh_assert_all_tensix_risc_resets();
+	k_busy_wait(TENSIX_RESET_SETTLE_US);
 
 	/* Assert reset (active low) */
 	RESET_UNIT_TENSIX_RESET_reg_u tensix_reset = {.val = 0};
@@ -255,12 +266,18 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 	for (uint32_t i = 0; i < 8; i++) {
 		WriteReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + i * 4, tensix_reset.val);
 	}
+	/* Flush the APB writes before beginning the reset hold interval. */
+	(void)ReadReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 7 * sizeof(uint32_t));
+	k_busy_wait(TENSIX_RESET_SETTLE_US);
 
 	/* Deassert reset */
 	tensix_reset.val = 0xffffffff;
 	for (uint32_t i = 0; i < 8; i++) {
 		WriteReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + i * 4, tensix_reset.val);
 	}
+	/* Do not issue NOC transactions until every tile endpoint has settled. */
+	(void)ReadReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 7 * sizeof(uint32_t));
+	k_busy_wait(TENSIX_RESET_SETTLE_US);
 
 	return 0;
 }
@@ -374,15 +391,9 @@ static __maybe_unused uint8_t ReinitTensix(const union request *req, struct resp
 		return 2;
 	}
 
-	ClearNocTranslation();
-	/* We technically don't have to re-program the entire NOC (only the Tensix NOC portions),
-	 * but it's simpler to reuse the same functions to re-program all of it.
-	 */
-	NocInit();
+	ReinitTensixNoc();
 	TensixInit();
-	if (bh_chip_info_feature_noc_translation_en()) {
-		InitNocTranslationFromHarvesting();
-	}
+	SetAiclkResetSafe(false);
 
 	return 0;
 }
