@@ -82,27 +82,30 @@ int32_t bh_force_tensix_off(void)
 
 int32_t bh_force_safe_power_state(void)
 {
-	int32_t first_error = bh_force_tensix_off();
-	int32_t ret;
+	/*
+	 * Do not clock- or power-gate a PCIe-addressable tile here.  The host can
+	 * have NOC transactions in flight when the asynchronous power monitor
+	 * trips; removing the destination clock turns those transactions into PCIe
+	 * Completion Timeouts and can make the root port contain the entire link.
+	 *
+	 * Holding every Tensix RISC in soft reset stops the untrusted workload while
+	 * leaving its register/L1 target and the NOC routers able to complete host
+	 * accesses.  The strict Doppler critical arbiter and kernel-NOP request own
+	 * the immediate power reduction; an explicit host reset performs any later
+	 * destructive domain transition after mappings have been revoked.
+	 */
+	if (power_state[BH_POWER_DOMAIN_TENSIX]) {
+		bh_soft_reset_all_tensix();
+		k_usleep(100);
+	}
 
-	/* Stop asking PPM for the busy AICLK floor before removing the memory
-	 * domain. The strict power arbiter remains at Fmin independently.
+	/* Stop asking PPM for the busy AICLK floor.  The strict power arbiter
+	 * remains at Fmin independently.
 	 */
 	power_state[BH_POWER_DOMAIN_AICLK] = false;
 	aiclk_update_busy();
 
-	/* Let MRISC place each GDDR PHY into its supported low-power state. Keep
-	 * the NoC fabric active: ARC telemetry, fan control, and PCIe recovery all
-	 * depend on that fabric remaining responsive after the fault is latched.
-	 */
-	ret = set_mrisc_power_setting(false);
-	if (ret == 0) {
-		power_state[BH_POWER_DOMAIN_MRISC] = false;
-	} else if (first_error == 0) {
-		first_error = ret;
-	}
-
-	return first_error;
+	return 0;
 }
 
 static int32_t apply_power_settings(const struct power_setting_rqst *power_setting)

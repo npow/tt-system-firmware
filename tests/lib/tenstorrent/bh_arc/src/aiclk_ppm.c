@@ -121,7 +121,7 @@ ZTEST(aiclk_ppm, test_latched_containment_clears_prior_busy_floor)
 	}
 
 	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
-	/* bh_force_safe_power_state() calls this after it gates compute. */
+	/* bh_force_safe_power_state() calls this after it resets compute. */
 	aiclk_update_busy();
 	{
 		enum aiclk_arb_min effective_arb;

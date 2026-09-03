@@ -92,8 +92,8 @@ ZTEST(throttler, test_set_board_power_limit)
 
 	zassert_equal(set_board_power_limit(225, false), 0);
 	zassert_equal(GetTelemetryTag(TAG_BOARD_POWER_LIMIT), 225);
-	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 225);
-	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 236);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 202);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 225);
 	zassert_equal(ThrottlerGetDopplerSlowAiclkLimit(), GetAiclkFmin());
 }
 
@@ -120,20 +120,20 @@ ZTEST(throttler, test_restore_board_power_limit)
 
 	zassert_equal(set_board_power_limit(0, true), 0);
 	zassert_equal(GetTelemetryTag(TAG_BOARD_POWER_LIMIT), 300);
-	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 300);
-	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 315);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 270);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 300);
 }
 
 ZTEST(throttler, test_runtime_board_power_limit_tightens_transient_thresholds)
 {
 	set_dmc_board_power_limit(300);
 
-	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 300);
-	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 315);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 270);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 300);
 
 	zassert_equal(set_board_power_limit(150, false), 0);
-	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 150);
-	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 157);
+	zassert_equal(ThrottlerGetDopplerT2PowerLimit(), 135);
+	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 150);
 }
 
 ZTEST(throttler, test_runtime_power_guard_trips_on_first_emergency_sample)

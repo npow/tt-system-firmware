@@ -55,8 +55,12 @@ static uint32_t kernel_throttler_stop_nops_freq_default;
 #define DEFAULT_BOARD_POWER_LIMIT              150
 #define DOPPLER_SHORT_WINDOW_SAMPLES           16U
 #define RUNTIME_POWER_CONTROL_HEADROOM_PERCENT 5U
-#define RUNTIME_POWER_T2_PERCENT               100U
-#define RUNTIME_POWER_T3_PERCENT               105U
+/* The external INA228/SMBus loop cannot act as an instantaneous hardware
+ * limiter.  Force the fast AICLK/NOP clamp with 10% measured headroom so one
+ * conversion/transport interval cannot normally reach the hard board cap.
+ */
+#define RUNTIME_POWER_T2_PERCENT               90U
+#define RUNTIME_POWER_T3_PERCENT               100U
 /* DMC normally posts INA228 input power every 1 ms. Ten periods leaves room
  * for SMBus/DVFS scheduling jitter while containing a stopped stream quickly.
  */

@@ -289,9 +289,27 @@ ZTEST(msgqueue, test_runtime_safe_power_state_preserves_l2cpu_clocks)
 		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_3,
 	};
 	const struct device *pll4 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(pll4));
+	bool tensix_enabled_before;
+	bool tensix_enabled_after;
+
+	/* The preceding power-settings test intentionally leaves Tensix disabled.
+	 * Re-enable every domain so this test would catch containment calling
+	 * set_tensix_enable(false), rather than merely preserving an already-off
+	 * state.
+	 */
+	req = (union request){0};
+	req.power_setting.command_code = TT_SMC_MSG_POWER_SETTING;
+	req.power_setting.power_flags_valid = BH_POWER_DOMAIN_COUNT;
+	req.power_setting.power_flags_bitfield.max_ai_clk = 1;
+	req.power_setting.power_flags_bitfield.mrisc_phy_power = 1;
+	req.power_setting.power_flags_bitfield.tensix_enable = 1;
+	req.power_setting.power_flags_bitfield.l2cpu_enable = 1;
+	push_msg_success();
+	zassert_equal(rsp.data[0], 0);
 
 	zassert_true(device_is_ready(pll4));
-	zassert_ok(bh_set_l2cpu_enable(true));
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &tensix_enabled_before));
+	zassert_true(tensix_enabled_before);
 	ARRAY_FOR_EACH(l2cpu_clocks, i) {
 		zassert_equal(
 			clock_control_get_status(pll4, (clock_control_subsys_t)l2cpu_clocks[i]),
@@ -302,6 +320,11 @@ ZTEST(msgqueue, test_runtime_safe_power_state_preserves_l2cpu_clocks)
 	 * containment must stop compute without making the endpoint disappear.
 	 */
 	zassert_ok(bh_force_safe_power_state());
+	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &tensix_enabled_after));
+	/* Soft-reset the workload, but leave the tile/NOC clock state unchanged so
+	 * an in-flight host transaction cannot become a Completion Timeout.
+	 */
+	zassert_true(tensix_enabled_after);
 	ARRAY_FOR_EACH(l2cpu_clocks, i) {
 		zassert_equal(
 			clock_control_get_status(pll4, (clock_control_subsys_t)l2cpu_clocks[i]),
