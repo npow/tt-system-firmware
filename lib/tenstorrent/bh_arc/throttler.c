@@ -60,6 +60,11 @@ static uint32_t kernel_throttler_stop_nops_freq_default;
  * for SMBus/DVFS scheduling jitter while containing a stopped stream quickly.
  */
 #define RUNTIME_POWER_SAMPLE_FRESHNESS_MS      10U
+/* A fresh SMC must wait for DMC's post-reset SMBus initialization before it
+ * can receive the first input-power sample. Allow one 64 ms DMC I2C timeout
+ * plus reset/queue jitter; every subsequent sample keeps the 10 ms bound.
+ */
+#define RUNTIME_POWER_FIRST_SAMPLE_TIMEOUT_MS  100U
 
 LOG_MODULE_REGISTER(throttler);
 
@@ -219,6 +224,7 @@ void ThrottlerRecordInputPowerSample(uint32_t now_ms)
 static bool RuntimePowerSampleExpired(uint32_t now_ms)
 {
 	uint32_t reference_ms;
+	uint32_t timeout_ms;
 	k_spinlock_key_t key;
 
 	if (!strict_runtime_power_limit) {
@@ -226,21 +232,25 @@ static bool RuntimePowerSampleExpired(uint32_t now_ms)
 	}
 
 	/* CM2DM message processing and DVFS normally share one workqueue, but use
-	 * a lock so a valid sample cannot race the 10 ms decision on another
-	 * context. The snapshot covers the seen flag and its paired timestamp.
+	 * a lock so a valid sample cannot race the first-sample or steady-state
+	 * decision on another context. The snapshot covers the seen flag and its
+	 * paired timestamp.
 	 */
 	key = k_spin_lock(&runtime_power_sample_lock);
 	if (atomic_get(&runtime_power_sample_seen)) {
 		reference_ms = (uint32_t)atomic_get(&runtime_power_sample_timestamp_ms);
+		timeout_ms = RUNTIME_POWER_SAMPLE_FRESHNESS_MS;
 	} else {
 		reference_ms = (uint32_t)atomic_get(&runtime_power_sample_watchdog_started_ms);
+		timeout_ms = RUNTIME_POWER_FIRST_SAMPLE_TIMEOUT_MS;
 	}
 	k_spin_unlock(&runtime_power_sample_lock, key);
 
 	/* Unsigned subtraction deliberately remains valid over the 32-bit uptime
-	 * wrap. A sample exactly 10 ms old is no longer fresh.
+	 * wrap. A missing first sample expires at its startup timeout; after a
+	 * sample arrives, one exactly 10 ms old is no longer fresh.
 	 */
-	return now_ms - reference_ms >= RUNTIME_POWER_SAMPLE_FRESHNESS_MS;
+	return now_ms - reference_ms >= timeout_ms;
 }
 
 static void UpdateRuntimePowerFaultTelemetry(uint32_t now_ms, uint16_t input_power)

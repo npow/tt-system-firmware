@@ -173,8 +173,12 @@ ZTEST(throttler, test_runtime_power_freshness_latches_when_first_sample_is_missi
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) & 0xffU,
 		      RUNTIME_POWER_FAULT_STRICT_BIT);
 
-	zassert_false(ThrottlerTestRuntimePowerSampleExpired(109));
-	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(110));
+	/* DMC's 1 ms producer starts after its post-reset SMBus initialization,
+	 * which may consume an I2C timeout. The startup deadline must not use the
+	 * tighter cadence watchdog before any valid sample is accepted.
+	 */
+	zassert_false(ThrottlerTestRuntimePowerSampleExpired(199));
+	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(200));
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) & 0xffU,
 		      RUNTIME_POWER_FAULT_LATCHED_BIT | RUNTIME_POWER_FAULT_STRICT_BIT);
@@ -186,13 +190,16 @@ ZTEST(throttler, test_runtime_power_freshness_latches_when_sample_is_stale)
 	ThrottlerTestResetRuntimePowerGuard();
 	set_dmc_board_power_limit(300);
 	ThrottlerTestStartRuntimePowerSampleWatchdog(100);
-	ThrottlerTestRecordInputPowerSample(109);
+	/* A valid sample arriving near the end of the post-reset allowance arms
+	 * the normal 10 ms stale-sample watchdog immediately.
+	 */
+	ThrottlerTestRecordInputPowerSample(199);
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) & 0xffU,
 		      RUNTIME_POWER_FAULT_STRICT_BIT | RUNTIME_POWER_FAULT_SAMPLE_FRESH_BIT |
 			      RUNTIME_POWER_FAULT_POLICY_READY_BIT);
 
-	zassert_false(ThrottlerTestRuntimePowerSampleExpired(118));
-	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(119));
+	zassert_false(ThrottlerTestRuntimePowerSampleExpired(208));
+	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(209));
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	ThrottlerTestResetRuntimePowerGuard();
 }
@@ -212,11 +219,12 @@ ZTEST(throttler, test_runtime_power_freshness_accepts_valid_samples_and_wraps)
 
 	ThrottlerTestStartRuntimePowerSampleWatchdog(100);
 	zassert_equal(Dm2CmSendPowerHandler(power_data, 1), -1);
-	zassert_true(ThrottlerTestRuntimePowerSampleExpired(110));
+	zassert_false(ThrottlerTestRuntimePowerSampleExpired(199));
+	zassert_true(ThrottlerTestRuntimePowerSampleExpired(200));
 
 	ThrottlerTestStartRuntimePowerSampleWatchdog(UINT32_MAX - 5U);
-	zassert_false(ThrottlerTestRuntimePowerSampleExpired(3));
-	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(4));
+	zassert_false(ThrottlerTestRuntimePowerSampleExpired(93));
+	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(94));
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	ThrottlerTestResetRuntimePowerGuard();
 }
