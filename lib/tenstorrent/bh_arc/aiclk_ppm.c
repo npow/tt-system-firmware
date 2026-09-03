@@ -143,6 +143,11 @@ bool AiclkTestResetSafeEnabled(void)
 {
 	return aiclk_ppm.reset_safe;
 }
+
+void AiclkTestSetResetSafeState(bool enable)
+{
+	aiclk_ppm.reset_safe = enable;
+}
 #endif
 
 void CalculateTargAiclk(void)

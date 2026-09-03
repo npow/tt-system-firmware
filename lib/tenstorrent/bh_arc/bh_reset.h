@@ -46,4 +46,10 @@ bool is_cable_fault_mode(void);
  */
 bool bh_get_boot_cable_power_limit(uint16_t *power_limit);
 
+#if defined(CONFIG_ZTEST)
+bool ResetTestRequestHostTensixQuiesce(void);
+bool ResetTestUnsafeTensixResetLatched(void);
+void ResetTestResetHostQuiesceState(void);
+#endif
+
 #endif /*BH_RESET*/

@@ -84,6 +84,65 @@ static const uint32_t kAllComputeSoftReset = 0x7FFFF;
  */
 #define TENSIX_RESET_SETTLE_US 100U
 
+/* A busy Tensix fabric can backpressure ARC's own NOC injection path.  The
+ * whole-Tensix reset therefore uses a host-assisted two-phase protocol: KMD
+ * quiesces streams through the independent PCIe ingress and acknowledges the
+ * exact request token before CMFW is allowed to destroy the tile endpoints.
+ */
+#define TENSIX_RESET_HOST_TIMEOUT_MS 450U
+
+static bool unsafe_tensix_reset_latched;
+#if defined(CONFIG_ZTEST)
+static uint32_t tensix_reset_host_timeout_ms;
+#else
+static const uint32_t tensix_reset_host_timeout_ms = TENSIX_RESET_HOST_TIMEOUT_MS;
+#endif
+
+static bool RequestHostTensixQuiesce(void)
+{
+	uint32_t request;
+	uint32_t start_ms;
+
+	/* The request register is retained across a warm ARC restart. Advancing
+	 * the complete 32-bit value, while keeping acknowledgments in a separate
+	 * register, prevents a delayed host worker from satisfying or overwriting
+	 * a newer transaction.
+	 */
+	request = ReadReg(TENSIX_RESET_REQUEST_REG_ADDR);
+	if (request == UINT32_MAX || ReadReg(TENSIX_RESET_ACK_REG_ADDR) == UINT32_MAX) {
+		WriteReg(TENSIX_RESET_ACK_REG_ADDR, 0U);
+		(void)ReadReg(TENSIX_RESET_ACK_REG_ADDR);
+	}
+	request++;
+	if (request == 0U || request == UINT32_MAX) {
+		request = 1U;
+	}
+	WriteReg(TENSIX_RESET_REQUEST_REG_ADDR, request);
+	(void)ReadReg(TENSIX_RESET_REQUEST_REG_ADDR);
+
+	start_ms = k_uptime_get_32();
+	for (;;) {
+		if (ReadReg(TENSIX_RESET_ACK_REG_ADDR) == request) {
+			return true;
+		}
+		if ((uint32_t)(k_uptime_get_32() - start_ms) >= tensix_reset_host_timeout_ms) {
+			return false;
+		}
+		k_msleep(1);
+	}
+}
+
+static bool RejectRecoveryAfterUnsafeTensixReset(struct response *rsp)
+{
+	if (!unsafe_tensix_reset_latched) {
+		return false;
+	}
+
+	rsp->data[0] = 3;
+	LOG_ERR("Refusing Tensix recovery after unsafe reset timeout");
+	return true;
+}
+
 static bool RejectTensixRecoveryAfterPowerFault(struct response *rsp)
 {
 	if (!ThrottlerRuntimePowerFaultLatched()) {
@@ -259,6 +318,16 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 	SetAiclkResetSafe(true);
 	bh_assert_all_tensix_risc_resets();
 	k_busy_wait(TENSIX_RESET_SETTLE_US);
+	if (!RequestHostTensixQuiesce()) {
+		/* Keep the RISCs held and AICLK reset-safe.  Returning an error in
+		 * this contained state is recoverable; resetting live NOC endpoints
+		 * is not.
+		 */
+		unsafe_tensix_reset_latched = true;
+		rsp->data[0] = 3;
+		LOG_ERR("Refusing unsafe Tensix reset: host quiesce timed out");
+		return 3;
+	}
 
 	/* Assert reset (active low) */
 	RESET_UNIT_TENSIX_RESET_reg_u tensix_reset = {.val = 0};
@@ -278,6 +347,7 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 	/* Do not issue NOC transactions until every tile endpoint has settled. */
 	(void)ReadReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 7 * sizeof(uint32_t));
 	k_busy_wait(TENSIX_RESET_SETTLE_US);
+	unsafe_tensix_reset_latched = false;
 
 	return 0;
 }
@@ -291,6 +361,9 @@ static __maybe_unused uint8_t ToggleSingleTensixReset(const union request *req,
 {
 	if (RejectTensixRecoveryAfterPowerFault(rsp)) {
 		return 2;
+	}
+	if (RejectRecoveryAfterUnsafeTensixReset(rsp)) {
+		return 3;
 	}
 
 	uint8_t noc_x = req->toggle_single_tensix_reset.noc_x;
@@ -390,6 +463,9 @@ static __maybe_unused uint8_t ReinitTensix(const union request *req, struct resp
 	if (RejectTensixRecoveryAfterPowerFault(rsp)) {
 		return 2;
 	}
+	if (RejectRecoveryAfterUnsafeTensixReset(rsp)) {
+		return 3;
+	}
 
 	ReinitTensixNoc();
 	TensixInit();
@@ -403,11 +479,28 @@ REGISTER_MESSAGE(TT_SMC_MSG_REINIT_TENSIX, ReinitTensix);
 
 static int DeassertTileResets(void)
 {
+	uint32_t reset_request;
+
 	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEP3);
 
 	if (!IS_ENABLED(CONFIG_ARC)) {
 		return 0;
 	}
+
+	/* Preserve the monotonically advancing request ID across a warm ARC
+	 * restart, but mark any interrupted transaction complete before this
+	 * firmware instance advertises the protocol capability.
+	 */
+	reset_request = ReadReg(TENSIX_RESET_REQUEST_REG_ADDR);
+	if (reset_request == UINT32_MAX) {
+		reset_request = 0U;
+		WriteReg(TENSIX_RESET_REQUEST_REG_ADDR, reset_request);
+		(void)ReadReg(TENSIX_RESET_REQUEST_REG_ADDR);
+	}
+
+	WriteReg(TENSIX_RESET_ACK_REG_ADDR, reset_request);
+	(void)ReadReg(TENSIX_RESET_ACK_REG_ADDR);
+	unsafe_tensix_reset_latched = false;
 
 	/* Read cable power limit with magic marker check for backward compatibility.
 	 * - If magic marker present: new DMC, check power limit (0 = cable fault)
@@ -483,3 +576,21 @@ static int DeassertTileResets(void)
 	return 0;
 }
 SYS_INIT_APP(DeassertTileResets);
+
+#if defined(CONFIG_ZTEST)
+bool ResetTestRequestHostTensixQuiesce(void)
+{
+	return RequestHostTensixQuiesce();
+}
+
+bool ResetTestUnsafeTensixResetLatched(void)
+{
+	return unsafe_tensix_reset_latched;
+}
+
+void ResetTestResetHostQuiesceState(void)
+{
+	unsafe_tensix_reset_latched = false;
+	tensix_reset_host_timeout_ms = 0U;
+}
+#endif

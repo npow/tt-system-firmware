@@ -118,6 +118,7 @@ union aiclk_targ_freq_info get_targ_aiclk_info(void);
 #if defined(CONFIG_ZTEST)
 uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms);
 bool AiclkTestResetSafeEnabled(void);
+void AiclkTestSetResetSafeState(bool enable);
 #endif
 
 struct response;

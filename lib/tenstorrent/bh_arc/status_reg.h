@@ -81,6 +81,15 @@
  * Fixed at compile time for a given CMFW build.
  */
 #define RUNTIME_TELEMETRY_SIZE_REG_ADDR      RESET_UNIT_SCRATCH_RAM_REG_ADDR(23)
+/**
+ * @brief Host-assisted Tensix reset handshake.
+ *
+ * CMFW advances the request ID before a destructive whole-Tensix reset. A
+ * compatible KMD quiesces the Tensix engines through the independent PCIe NOC
+ * ingress, then copies that ID to the separate acknowledgment register.
+ */
+#define TENSIX_RESET_REQUEST_REG_ADDR         RESET_UNIT_SCRATCH_RAM_REG_ADDR(24)
+#define TENSIX_RESET_ACK_REG_ADDR             RESET_UNIT_SCRATCH_RAM_REG_ADDR(25)
 
 #define STATUS_FW_VUART_REG_ADDR(n) RESET_UNIT_SCRATCH_RAM_REG_ADDR(40 + (n))
 /* SCRATCH_RAM_40 - SCRATCH_RAM_41 reserved for virtual uarts */
@@ -90,7 +99,8 @@ typedef struct {
 	uint32_t msg_queue_ready: 1;
 	uint32_t hw_init_status: 2;
 	uint32_t fw_id: 4;
-	uint32_t spare: 25;
+	uint32_t tensix_reset_host_quiesce: 1;
+	uint32_t spare: 24;
 } STATUS_BOOT_STATUS0_reg_t;
 
 typedef union {

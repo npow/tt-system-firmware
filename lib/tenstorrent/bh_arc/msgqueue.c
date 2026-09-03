@@ -519,6 +519,9 @@ void init_msgqueue(void)
 
 	volatile STATUS_BOOT_STATUS0_reg_u *boot_status0 =
 		(volatile STATUS_BOOT_STATUS0_reg_u *)STATUS_BOOT_STATUS0_REG_ADDR;
+#ifndef CONFIG_TT_SMC_RECOVERY
+	boot_status0->f.tensix_reset_host_quiesce = 1;
+#endif
 	boot_status0->f.msg_queue_ready = 1;
 #endif
 }
