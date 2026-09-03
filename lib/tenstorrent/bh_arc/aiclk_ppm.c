@@ -413,7 +413,11 @@ void aiclk_update_busy(void)
 
 	bh_power_state_get(BH_POWER_DOMAIN_AICLK, &aiclk_state);
 
-	if (last_msg_busy || aiclk_state) {
+	/* Containment owns the clock floor. A GO_BUSY request accepted before a
+	 * stale-sample or PCIe fault must not keep AICLK at Fmax after the compute
+	 * domains have been gated.
+	 */
+	if (!ThrottlerRuntimePowerFaultLatched() && (last_msg_busy || aiclk_state)) {
 		SetAiclkArbMin(aiclk_arb_min_busy, aiclk_ppm.fmax);
 	} else {
 		SetAiclkArbMin(aiclk_arb_min_busy, aiclk_ppm.fmin);

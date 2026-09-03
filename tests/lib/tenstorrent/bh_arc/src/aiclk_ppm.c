@@ -109,6 +109,31 @@ ZTEST(aiclk_ppm, test_latched_containment_blocks_aiclk_raise_paths)
 	SetAiclkResetSafe(false);
 }
 
+ZTEST(aiclk_ppm, test_latched_containment_clears_prior_busy_floor)
+{
+	ThrottlerTestResetRuntimePowerGuard();
+	EnableArbMin(aiclk_arb_min_busy, true);
+	set_busy(true);
+	{
+		enum aiclk_arb_min effective_arb;
+
+		zassert_equal(get_aiclk_effective_arb_min(&effective_arb), fmax);
+	}
+
+	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
+	/* bh_force_safe_power_state() calls this after it gates compute. */
+	aiclk_update_busy();
+	{
+		enum aiclk_arb_min effective_arb;
+
+		zassert_equal(get_aiclk_effective_arb_min(&effective_arb), fmin,
+			      "a pre-fault GO_BUSY request must not retain the Fmax floor");
+	}
+
+	ThrottlerTestResetRuntimePowerGuard();
+	set_busy(false);
+}
+
 static void reinit_arb(void *fixture)
 {
 	(void)fixture;
