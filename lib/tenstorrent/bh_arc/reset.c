@@ -71,6 +71,7 @@ static uint16_t boot_cable_power_limit;
 static const uint8_t kNocRing;
 static const uint8_t kNocTlb;
 static const uint32_t kSoftReset0Addr = 0xFFB121B0; /* NOC address in each tile */
+static const uint32_t kNocOverlayStartAddr = 0xFFB40000;
 static const uint32_t kAllRiscSoftReset = 0x47800;
 /* SOFT_RESET_0 bits 0-18 cover unpackers, packers, mover/search, glue/TDMA,
  * thread control, FPU/SFPU, source/destination state, and all five RISCs.
@@ -78,11 +79,18 @@ static const uint32_t kAllRiscSoftReset = 0x47800;
  */
 static const uint32_t kAllComputeSoftReset = 0x7FFFF;
 
-/* Match the established idle-before-clock-gate interval. At reset-safe AICLK,
- * 100 us also gives the NOC endpoints ample time to observe reset assertion and
- * to become addressable again after deassertion.
+#define TENSIX_STREAM_COUNT                   64U
+#define TENSIX_STREAM_REG_SPACE_SIZE          0x1000U
+#define TENSIX_STREAM_ONETIME_MISC_CFG_OFFSET (2U * sizeof(uint32_t))
+#define TENSIX_STREAM_RESET_OFFSET            (271U * sizeof(uint32_t))
+
+/* Stop instruction issue before sending the one NOC transaction needed to
+ * quiesce autonomous compute engines. Keep the endpoints alive long enough for
+ * already-issued traffic to retire before resetting the tile/NOC state.
  */
-#define TENSIX_RESET_SETTLE_US 100U
+#define TENSIX_RISC_RESET_SETTLE_US 100U
+#define TENSIX_NOC_DRAIN_US         10000U
+#define TENSIX_TILE_RESET_SETTLE_US 100U
 
 static bool RejectTensixRecoveryAfterPowerFault(struct response *rsp)
 {
@@ -145,6 +153,25 @@ void bh_soft_reset_all_tensix_compute(void)
 	 * clock: those remain available to retire host transactions.
 	 */
 	bh_soft_reset_all_tensix_mask(kAllComputeSoftReset);
+}
+
+static void bh_stop_all_tensix_streams(void)
+{
+	/* SOFT_RESET_0 does not cover the overlay stream engines. Stop their
+	 * auto-configuration and reset every stream before resetting the tile/NOC
+	 * endpoint; otherwise a stream can keep traffic in flight indefinitely.
+	 * All overlay registers fit in one 16 MiB NOC2AXI TLB window.
+	 */
+	NOC2AXITensixBroadcastTlbSetup(kNocRing, kNocTlb, kNocOverlayStartAddr,
+				       kNoc2AxiOrderingStrict);
+	for (uint32_t stream_id = 0; stream_id < TENSIX_STREAM_COUNT; stream_id++) {
+		uint32_t stream_base =
+			kNocOverlayStartAddr + stream_id * TENSIX_STREAM_REG_SPACE_SIZE;
+
+		NOC2AXIWrite32(kNocRing, kNocTlb,
+			       stream_base + TENSIX_STREAM_ONETIME_MISC_CFG_OFFSET, 0);
+		NOC2AXIWrite32(kNocRing, kNocTlb, stream_base + TENSIX_STREAM_RESET_OFFSET, 1);
+	}
 }
 
 /* Assert soft reset for all RISC-V cores */
@@ -258,7 +285,17 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 
 	SetAiclkResetSafe(true);
 	bh_assert_all_tensix_risc_resets();
-	k_busy_wait(TENSIX_RESET_SETTLE_US);
+	k_busy_wait(TENSIX_RISC_RESET_SETTLE_US);
+
+	/* A hardware RISC reset alone does not stop stream, mover, or math engines
+	 * that were programmed before the reset. Reset those engines while their
+	 * NOC endpoints are still intact, then drain residual traffic before the
+	 * destructive tile reset below. Otherwise a saturated workload can leave
+	 * the fabric backpressured long enough for reinitialization to stall ARC.
+	 */
+	bh_stop_all_tensix_streams();
+	bh_soft_reset_all_tensix_compute();
+	k_busy_wait(TENSIX_NOC_DRAIN_US);
 
 	/* Assert reset (active low) */
 	RESET_UNIT_TENSIX_RESET_reg_u tensix_reset = {.val = 0};
@@ -268,7 +305,7 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 	}
 	/* Flush the APB writes before beginning the reset hold interval. */
 	(void)ReadReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 7 * sizeof(uint32_t));
-	k_busy_wait(TENSIX_RESET_SETTLE_US);
+	k_busy_wait(TENSIX_TILE_RESET_SETTLE_US);
 
 	/* Deassert reset */
 	tensix_reset.val = 0xffffffff;
@@ -277,7 +314,7 @@ static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct
 	}
 	/* Do not issue NOC transactions until every tile endpoint has settled. */
 	(void)ReadReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 7 * sizeof(uint32_t));
-	k_busy_wait(TENSIX_RESET_SETTLE_US);
+	k_busy_wait(TENSIX_TILE_RESET_SETTLE_US);
 
 	return 0;
 }
