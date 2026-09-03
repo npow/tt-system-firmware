@@ -85,17 +85,6 @@ int32_t bh_force_safe_power_state(void)
 	int32_t first_error = bh_force_tensix_off();
 	int32_t ret;
 
-	/* L2CPU is not part of the ARC/NoC/PCIe management path. Gate it as well
-	 * so an independent L2CPU workload cannot keep drawing power after the
-	 * whole-board limit has latched containment.
-	 */
-	ret = bh_set_l2cpu_enable(false);
-	if (ret == 0) {
-		power_state[BH_POWER_DOMAIN_L2CPU] = false;
-	} else if (first_error == 0) {
-		first_error = ret;
-	}
-
 	/* Stop asking PPM for the busy AICLK floor before removing the memory
 	 * domain. The strict power arbiter remains at Fmin independently.
 	 */

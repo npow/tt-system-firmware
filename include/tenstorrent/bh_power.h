@@ -33,9 +33,10 @@ int32_t bh_force_tensix_off(void);
 /**
  * @brief Enter a reset-latched low-power safety state.
  *
- * Stops Tensix, gates the independent L2CPU clocks, and asks each GDDR PHY to
- * enter its supported power-down state. ARC, PCIe, telemetry, and fan control
- * remain active so the host can inspect and reset the card.
+ * Stops Tensix and asks each GDDR PHY to enter its supported power-down state.
+ * L2CPU clocks remain enabled because the P150A PCIe/NoC management path
+ * depends on that clock tree. ARC, PCIe, telemetry, and fan control remain
+ * active so the host can inspect and reset the card.
  *
  * @retval 0 On success
  * @retval negative errno if a power-down step failed

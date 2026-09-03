@@ -280,7 +280,7 @@ ZTEST(msgqueue, test_msgqueue_power_settings_cmd)
 		      CLOCK_CONTROL_STATUS_OFF);
 }
 
-ZTEST(msgqueue, test_runtime_safe_power_state_gates_all_l2cpu_clocks)
+ZTEST(msgqueue, test_runtime_safe_power_state_preserves_l2cpu_clocks)
 {
 	static const enum clock_control_tt_bh_clock l2cpu_clocks[] = {
 		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0,
@@ -289,7 +289,6 @@ ZTEST(msgqueue, test_runtime_safe_power_state_gates_all_l2cpu_clocks)
 		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_3,
 	};
 	const struct device *pll4 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(pll4));
-	bool l2cpu_enabled;
 
 	zassert_true(device_is_ready(pll4));
 	zassert_ok(bh_set_l2cpu_enable(true));
@@ -299,17 +298,15 @@ ZTEST(msgqueue, test_runtime_safe_power_state_gates_all_l2cpu_clocks)
 			CLOCK_CONTROL_STATUS_ON);
 	}
 
-	/* The containment routine must gate L2CPU even though it is independent
-	 * from the Tensix/MRISC path, while leaving management hardware intact.
+	/* P150A's PCIe/NoC management path requires the L2CPU clock tree. Runtime
+	 * containment must stop compute without making the endpoint disappear.
 	 */
 	zassert_ok(bh_force_safe_power_state());
 	ARRAY_FOR_EACH(l2cpu_clocks, i) {
 		zassert_equal(
 			clock_control_get_status(pll4, (clock_control_subsys_t)l2cpu_clocks[i]),
-			CLOCK_CONTROL_STATUS_OFF);
+			CLOCK_CONTROL_STATUS_ON);
 	}
-	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_L2CPU, &l2cpu_enabled));
-	zassert_false(l2cpu_enabled);
 }
 
 ZTEST(msgqueue, test_msgqueue_power_settings_with_go_busy)
