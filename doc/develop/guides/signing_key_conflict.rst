@@ -20,6 +20,35 @@ The Failure Chain:
 * **Subsequent Flash:** Developer attempts to flash a local, development-signed fwbundle (``west build``).
 * **Result:** The new DMFW won't be installed and the board will fall back to the previous production-signed firmware because the installed MCUBoot rejects the development key.
 
+Offline Update Preflight
+------------------------
+
+Before deploying a DMC update while retaining its bootloader, verify the exact
+candidate against the bootloader being retained:
+
+.. code-block:: shell
+
+   python scripts/verify_dmc_boot_chain.py \
+     --bootloader-bundle installed-bootloader-source.fwbundle \
+     --candidate-bundle candidate.fwbundle --board P150A-1
+
+Use independently established deployment provenance or readback to identify the
+installed bootloader. Do not substitute the candidate bundle for the bootloader
+source merely because it contains a compatible development bootloader: including
+that bootloader in a bundle does not prove it has been installed in STM32 flash.
+
+The verifier extracts ``blupdate`` from the bootloader source and ``dmfwimg`` from
+the candidate. It checks the MCUboot key ID, image digest and RSA-PSS signature
+against the single embedded RSA-2048 public key. Unsupported or ambiguous key
+layouts are rejected. It only reads bundle files and uses temporary extraction
+files; it does not access the card, reset it, or flash anything.
+
+A nonzero exit blocks the runtime-only deployment. A successful check establishes
+signature compatibility with the supplied bootloader key, not the identity of
+the running bootloader, successful PCIe enumeration, or stability under load.
+Do not apply this DMC-specific signature policy to the SMC bootloader, whose
+validation hooks differ.
+
 Recovery Methods (To Accept Development Firmware)
 -------------------------------------------------
 
