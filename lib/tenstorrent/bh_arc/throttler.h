@@ -22,8 +22,9 @@ uint32_t GetNOPOnAccumulatedTime(void);
 /* ms NOP was on during the last telemetry update window, clamped to window_ms */
 uint32_t GetNOPOnDuration(uint32_t window_ms);
 bool ThrottlerRuntimePowerFaultLatched(void);
-/* True while retained DMC power requires an immediate Fmin commit, including
- * the hysteretic 10%-headroom fast clamp before the hard reset-latched boundary.
+/* True while retained DMC power or a stale external sample requires an
+ * immediate Fmin commit, including the hysteretic 10%-headroom fast clamp
+ * before the sustained, non-destructive latched boundary.
  */
 bool ThrottlerRuntimePowerClampActive(void);
 bool ThrottlerStrictRuntimePowerLimitActive(void);

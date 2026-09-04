@@ -280,7 +280,7 @@ ZTEST(msgqueue, test_msgqueue_power_settings_cmd)
 		      CLOCK_CONTROL_STATUS_OFF);
 }
 
-ZTEST(msgqueue, test_runtime_safe_power_state_preserves_l2cpu_clocks)
+ZTEST(msgqueue, test_runtime_safe_power_state_preserves_pcie_targets)
 {
 	static const enum clock_control_tt_bh_clock l2cpu_clocks[] = {
 		CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0,
@@ -316,17 +316,14 @@ ZTEST(msgqueue, test_runtime_safe_power_state_preserves_l2cpu_clocks)
 			CLOCK_CONTROL_STATUS_ON);
 	}
 
-	/* P150A's PCIe/NoC management path requires the L2CPU clock tree. Runtime
-	 * containment must stop compute without making the endpoint disappear.
+	/* P150A's PCIe/NoC management path requires the L2CPU and Tensix target
+	 * clocks. Runtime containment must not issue a reset or NOC transaction:
+	 * either can strand work which was in flight when the power sample arrived.
 	 */
 	noc_2_axi_last_write = 0U;
 	zassert_ok(bh_force_safe_power_state());
-	zassert_equal(noc_2_axi_last_write, 0x7FFFFU,
-		      "containment must reset every Tensix compute engine, not only RISCs");
+	zassert_equal(noc_2_axi_last_write, 0U);
 	zassert_ok(bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &tensix_enabled_after));
-	/* Soft-reset the workload, but leave the tile/NOC clock state unchanged so
-	 * an in-flight host transaction cannot become a Completion Timeout.
-	 */
 	zassert_true(tensix_enabled_after);
 	ARRAY_FOR_EACH(l2cpu_clocks, i) {
 		zassert_equal(

@@ -83,22 +83,17 @@ int32_t bh_force_tensix_off(void)
 int32_t bh_force_safe_power_state(void)
 {
 	/*
-	 * Do not clock- or power-gate a PCIe-addressable tile here.  The host can
+	 * Do not reset, clock-gate, or power-gate a PCIe-addressable tile here. The host can
 	 * have NOC transactions in flight when the asynchronous power monitor
 	 * trips; removing the destination clock turns those transactions into PCIe
-	 * Completion Timeouts and can make the root port contain the entire link.
+	 * Completion Timeouts, while resetting an executing RISC can prevent its
+	 * software protocol from retiring and can make the root port contain the link.
 	 *
-	 * Holding every Tensix compute engine and RISC in soft reset stops the
-	 * untrusted workload while leaving its register/L1 target and the NOC routers
-	 * able to complete host accesses. The strict Doppler critical arbiter and
-	 * kernel-NOP request own the immediate power reduction; an explicit host reset
-	 * performs any later destructive domain transition after mappings are revoked.
+	 * The strict Doppler critical arbiter and posted kernel-NOP request own the
+	 * immediate power reduction. An explicit host-owned card reset may perform
+	 * destructive transitions later, after mappings and outstanding requests have
+	 * been revoked.
 	 */
-	if (power_state[BH_POWER_DOMAIN_TENSIX]) {
-		bh_soft_reset_all_tensix_compute();
-		k_usleep(100);
-	}
-
 	/* Stop asking PPM for the busy AICLK floor.  The strict power arbiter
 	 * remains at Fmin independently.
 	 */
@@ -112,8 +107,8 @@ static int32_t apply_power_settings(const struct power_setting_rqst *power_setti
 {
 	int32_t ret = 0;
 
-	/* The hardware safety state is reset-latched. Reject every power-setting
-	 * request so no partial or legacy request can raise a gated domain.
+	/* The low-clock safety state is reset-latched. Reject every power-setting
+	 * request so no partial or legacy request can raise AICLK while it is active.
 	 */
 	if (ThrottlerRuntimePowerFaultLatched()) {
 		LOG_ERR("Refusing to leave low-power safety state before reset");
@@ -178,8 +173,8 @@ static int32_t apply_power_settings(const struct power_setting_rqst *power_setti
 	}
 
 	/* A PCIe error interrupt can latch asynchronously while safe domain-enable
-	 * work is in progress. Re-apply the non-destructive containment state before
-	 * returning so that transition cannot leave compute running above the cap.
+	 * work is in progress. Re-apply the non-destructive clock containment state
+	 * before returning so that transition cannot leave AICLK above the cap.
 	 */
 	if (ThrottlerRuntimePowerFaultLatched()) {
 		(void)bh_force_safe_power_state();

@@ -31,6 +31,7 @@ static bool strict_runtime_power_limit;
 static atomic_t runtime_power_fault_latched;
 static atomic_t runtime_containment_pending;
 static atomic_t runtime_power_fast_clamp_active;
+static atomic_t runtime_power_sample_stale;
 static atomic_t runtime_power_fault_trip_power;
 static atomic_t runtime_power_sample_seen;
 static atomic_t runtime_power_sample_timestamp_ms;
@@ -40,6 +41,9 @@ static struct k_spinlock runtime_power_sample_lock;
 static uint16_t runtime_input_power;
 static uint16_t runtime_peak_power;
 static uint16_t runtime_power_guard_limit;
+static bool runtime_power_over_limit_active;
+static uint32_t runtime_power_over_limit_started_ms;
+static uint16_t runtime_power_over_limit_peak;
 
 static bool doppler;
 static bool doppler_slow;
@@ -67,6 +71,12 @@ static uint32_t kernel_throttler_stop_nops_freq_default;
 #define RUNTIME_POWER_T2_PERCENT               90U
 #define RUNTIME_POWER_T3_PERCENT               100U
 #define RUNTIME_POWER_FAST_RELEASE_PERCENT     85U
+/* The board-power limit is a sustained input rating, not a zero-duration
+ * waveform ceiling. Clamp immediately at the limit, but latch containment only
+ * for a continuous violation. Sub-sample electrical protection belongs to
+ * board OCP; a sampled firmware loop cannot provide that bound.
+ */
+#define RUNTIME_POWER_OVERCAP_DWELL_MS         100U
 /* DMC normally posts INA228 input power every 1 ms. Ten periods leaves room
  * for SMBus/DVFS scheduling jitter while containing a stopped stream quickly.
  */
@@ -219,7 +229,11 @@ static void StartRuntimePowerSampleWatchdog(uint32_t now_ms)
 	key = k_spin_lock(&runtime_power_sample_lock);
 	atomic_set(&runtime_power_sample_watchdog_started_ms, now_ms);
 	atomic_clear(&runtime_power_sample_seen);
+	atomic_clear(&runtime_power_sample_stale);
 	runtime_peak_power = runtime_input_power;
+	runtime_power_over_limit_active = false;
+	runtime_power_over_limit_started_ms = 0U;
+	runtime_power_over_limit_peak = 0U;
 	k_spin_unlock(&runtime_power_sample_lock, key);
 	UpdateRuntimePowerFaultTelemetry(now_ms, GetInputPower());
 }
@@ -238,9 +252,43 @@ static void UpdateRuntimePowerFastClampLocked(uint16_t guard_limit)
 	}
 }
 
+/* Caller holds runtime_power_sample_lock. Return the peak power for an interval
+ * which requires latched containment, or zero while the fast clamp is sufficient.
+ */
+static uint16_t UpdateRuntimePowerViolationLocked(uint32_t now_ms, uint16_t input_power,
+						  uint16_t guard_limit)
+{
+	bool previous_sample_fresh =
+		atomic_get(&runtime_power_sample_seen) &&
+		now_ms - (uint32_t)atomic_get(&runtime_power_sample_timestamp_ms) <
+			RUNTIME_POWER_SAMPLE_FRESHNESS_MS;
+
+	if (guard_limit == 0U || input_power < guard_limit) {
+		runtime_power_over_limit_active = false;
+		runtime_power_over_limit_started_ms = 0U;
+		runtime_power_over_limit_peak = 0U;
+		return 0U;
+	}
+
+	if (!runtime_power_over_limit_active || !previous_sample_fresh) {
+		runtime_power_over_limit_active = true;
+		runtime_power_over_limit_started_ms = now_ms;
+		runtime_power_over_limit_peak = input_power;
+		return 0U;
+	}
+
+	runtime_power_over_limit_peak = MAX(runtime_power_over_limit_peak, input_power);
+	if (now_ms - runtime_power_over_limit_started_ms >= RUNTIME_POWER_OVERCAP_DWELL_MS) {
+		return runtime_power_over_limit_peak;
+	}
+
+	return 0U;
+}
+
 void ThrottlerRecordInputPowerSample(uint32_t now_ms, uint16_t input_power)
 {
 	uint16_t guard_limit;
+	uint16_t hard_trip_power;
 	k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
 
 	runtime_input_power = input_power;
@@ -252,17 +300,19 @@ void ThrottlerRecordInputPowerSample(uint32_t now_ms, uint16_t input_power)
 	 * commit points observe it.
 	 */
 	UpdateRuntimePowerFastClampLocked(guard_limit);
+	hard_trip_power = UpdateRuntimePowerViolationLocked(now_ms, input_power, guard_limit);
 	atomic_set(&runtime_power_sample_timestamp_ms, now_ms);
 	atomic_set(&runtime_power_sample_seen, 1);
+	atomic_clear(&runtime_power_sample_stale);
 	k_spin_unlock(&runtime_power_sample_lock, key);
 
 	/* The sample callback can run before the cooperative DVFS work item. Latch
-	 * the exact accepted value here so a later low sample cannot overwrite an
-	 * electrical-limit violation during that scheduling window. Hardware work
-	 * remains deferred to ApplyRuntimePowerFault().
+	 * a continuously over-cap interval here so a later low sample cannot
+	 * overwrite it. A brief crossing remains a fast clock/NOP clamp. Hardware
+	 * work remains deferred to ApplyRuntimePowerFault().
 	 */
-	if (guard_limit != 0U && input_power >= guard_limit) {
-		(void)LatchRuntimePowerFault(input_power);
+	if (hard_trip_power != 0U) {
+		(void)LatchRuntimePowerFault(hard_trip_power);
 	} else {
 		UpdateRuntimePowerFaultTelemetry(now_ms, input_power);
 	}
@@ -321,6 +371,23 @@ static bool RuntimePowerSampleExpired(uint32_t now_ms)
 	return now_ms - reference_ms >= timeout_ms;
 }
 
+static bool UpdateRuntimePowerFreshnessGuard(uint32_t now_ms)
+{
+	bool expired = RuntimePowerSampleExpired(now_ms);
+
+	if (expired) {
+		/* Loss of the external measurement must immediately prevent upward
+		 * DVFS, but it is not proof that the board crossed its electrical
+		 * limit. Keep this state reversible so an ordinary DMC/SMBus gap does
+		 * not permanently strand the card in containment.
+		 */
+		return atomic_cas(&runtime_power_sample_stale, 0, 1);
+	}
+
+	atomic_clear(&runtime_power_sample_stale);
+	return false;
+}
+
 static void UpdateRuntimePowerFaultTelemetry(uint32_t now_ms, uint16_t input_power)
 {
 	uint8_t status = 0U;
@@ -361,7 +428,6 @@ static void apply_board_power_limit(uint32_t new_power_limit)
 {
 	uint32_t controller_limit = new_power_limit;
 	uint16_t new_guard_limit = strict_runtime_power_limit ? (uint16_t)new_power_limit : 0U;
-	uint16_t violating_power = 0U;
 	k_spinlock_key_t key;
 
 	if (strict_runtime_power_limit) {
@@ -378,14 +444,9 @@ static void apply_board_power_limit(uint32_t new_power_limit)
 	if (new_guard_limit != 0U &&
 	    (runtime_power_guard_limit == 0U || new_guard_limit < runtime_power_guard_limit)) {
 		runtime_power_guard_limit = new_guard_limit;
-		violating_power = MAX(runtime_input_power, runtime_peak_power);
 		UpdateRuntimePowerFastClampLocked(new_guard_limit);
 	}
 	k_spin_unlock(&runtime_power_sample_lock, key);
-	if (violating_power >= new_guard_limit && new_guard_limit != 0U) {
-		(void)LatchRuntimePowerFault(violating_power);
-	}
-
 	power_limit = new_power_limit;
 	SetThrottlerLimit(kThrottlerBoardPower, power_limit);
 	SetThrottlerLimit(kThrottlerDopplerSlow, controller_limit);
@@ -404,6 +465,9 @@ static void apply_board_power_limit(uint32_t new_power_limit)
 
 	key = k_spin_lock(&runtime_power_sample_lock);
 	runtime_power_guard_limit = new_guard_limit;
+	runtime_power_over_limit_active = false;
+	runtime_power_over_limit_started_ms = 0U;
+	runtime_power_over_limit_peak = 0U;
 	UpdateRuntimePowerFastClampLocked(new_guard_limit);
 	k_spin_unlock(&runtime_power_sample_lock, key);
 	UpdateTelemetryBoardPowerLimit(power_limit);
@@ -425,8 +489,13 @@ static void BroadcastKernelThrottleState(void)
 	if (tensixes_enabled) {
 		sys_trace_named_event("kernel_throttle", throttle_counter & 1, 0);
 		NOC2AXITensixBroadcastTlbSetup(kNocRing, kNocTlb, kKernelThrottleAddress,
-					       kNoc2AxiOrderingStrict);
+					       kNoc2AxiOrderingPostedStrict);
 		NOC2AXIWrite32(kNocRing, kNocTlb, kKernelThrottleAddress, throttle_counter);
+		/* Do not fence this write with any local or remote read. The dedicated
+		 * TLB is not reused here, and power containment must never wait for a
+		 * Tensix or NOC completion: an already-stalled tile is precisely when
+		 * keeping ARC and PCIe alive matters most.
+		 */
 	}
 }
 
@@ -491,6 +560,7 @@ void InitThrottlers(void)
 		atomic_clear(&runtime_power_fault_trip_power);
 	}
 	atomic_clear(&runtime_power_fast_clamp_active);
+	atomic_clear(&runtime_power_sample_stale);
 	{
 		k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
 
@@ -500,6 +570,9 @@ void InitThrottlers(void)
 		runtime_input_power = 0;
 		runtime_peak_power = 0;
 		runtime_power_guard_limit = 0;
+		runtime_power_over_limit_active = false;
+		runtime_power_over_limit_started_ms = 0U;
+		runtime_power_over_limit_peak = 0U;
 		k_spin_unlock(&runtime_power_sample_lock, key);
 	}
 	UpdateRuntimePowerFaultTelemetry(k_uptime_get_32(), 0);
@@ -662,13 +735,8 @@ static uint32_t GetDopplerT3PowerLimit(void)
 					  : power_limit * 5U / 2U;
 }
 
-static uint32_t GetRuntimePowerFailSafeLimit(void)
+static __maybe_unused uint32_t GetRuntimePowerFailSafeLimit(void)
 {
-	/* The closed-loop controller already targets 5% below the configured
-	 * electrical cap. A sampled input power at the cap is therefore a failed
-	 * containment response, not transient headroom. Latch immediately so a
-	 * 300 W P150A policy also contains the observed 306 W escape.
-	 */
 	return power_limit;
 }
 
@@ -679,12 +747,11 @@ static bool LatchRuntimePowerFault(uint16_t current_power)
 	}
 
 	atomic_set(&runtime_power_fault_trip_power, current_power);
-	/* Stop instruction issue immediately. This helper only touches ARC-local
-	 * reset-unit registers and is therefore safe when the first fault sample is
-	 * accepted from the SMBus ISR. Do not reset or gate the Tensix tiles: their
-	 * NOC endpoints must remain able to complete outstanding host requests.
+	/* The sample callback can run in the SMBus receive path. Restrict it to
+	 * publishing atomic state: resetting a RISC or issuing a strict NOC request
+	 * here can strand a host transaction and escalate a board fault into a root
+	 * port or host reset. The cooperative worker applies the Fmin/NOP clamp.
 	 */
-	bh_assert_all_tensix_risc_resets();
 	atomic_set(&runtime_containment_pending, 1);
 	UpdateRuntimePowerFaultTelemetry(k_uptime_get_32(), current_power);
 	return true;
@@ -713,13 +780,6 @@ static bool ApplyRuntimePowerFault(void)
 	}
 
 	return true;
-}
-
-static void UpdateRuntimePowerFailSafe(uint16_t current_power)
-{
-	if (strict_runtime_power_limit && current_power >= GetRuntimePowerFailSafeLimit()) {
-		(void)LatchRuntimePowerFault(current_power);
-	}
 }
 
 #if defined(CONFIG_ZTEST)
@@ -761,6 +821,7 @@ void ThrottlerTestResetRuntimePowerGuard(void)
 	atomic_clear(&runtime_containment_pending);
 	atomic_clear(&runtime_power_fault_trip_power);
 	atomic_clear(&runtime_power_fast_clamp_active);
+	atomic_clear(&runtime_power_sample_stale);
 	EnableArbMax(aiclk_arb_max_doppler_critical, false);
 	kernel_nops_enabled = false;
 	{
@@ -771,6 +832,9 @@ void ThrottlerTestResetRuntimePowerGuard(void)
 		atomic_clear(&runtime_power_sample_watchdog_started_ms);
 		runtime_input_power = 0;
 		runtime_peak_power = 0;
+		runtime_power_over_limit_active = false;
+		runtime_power_over_limit_started_ms = 0U;
+		runtime_power_over_limit_peak = 0U;
 		k_spin_unlock(&runtime_power_sample_lock, key);
 	}
 	UpdateRuntimePowerFaultTelemetry(0, 0);
@@ -808,11 +872,7 @@ bool ThrottlerTestRuntimePowerSampleExpired(uint32_t now_ms)
 
 bool ThrottlerTestUpdateRuntimePowerFreshnessGuard(uint32_t now_ms)
 {
-	if (!RuntimePowerSampleExpired(now_ms)) {
-		return false;
-	}
-
-	return LatchRuntimePowerFault(GetInputPower());
+	return UpdateRuntimePowerFreshnessGuard(now_ms);
 }
 
 uint16_t ThrottlerTestUpdateBoardPowerHistory(uint16_t current_power)
@@ -880,7 +940,8 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 				 ? current_power <= runtime_release_power
 				 : GetAiclkTarg() == GetAiclkFmax() && current_power < power_limit;
 
-	bool critical_throttling = atomic_get(&runtime_power_fault_latched) || fast_clamp_active ||
+	bool critical_throttling = atomic_get(&runtime_power_fault_latched) ||
+				   atomic_get(&runtime_power_sample_stale) || fast_clamp_active ||
 				   t2_triggered || t3_triggered;
 
 	bool new_kernel_nops_enabled =
@@ -892,7 +953,6 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 	}
 
 	EnableArbMax(aiclk_arb_max_doppler_critical, critical_throttling);
-	UpdateRuntimePowerFailSafe(current_power);
 }
 
 /* Update kernel throttler NOPs state when running at the AICLK floor.
@@ -941,8 +1001,8 @@ void CalculateThrottlers(void)
 	 * normal DVFS context, never from the interrupt path.
 	 */
 	UpdateRuntimePowerFaultTelemetry(now_ms, GetInputPower());
-	if (RuntimePowerSampleExpired(now_ms) && LatchRuntimePowerFault(GetInputPower())) {
-		LOG_ERR("Runtime board-power sample stale or missing; entering containment");
+	if (UpdateRuntimePowerFreshnessGuard(now_ms)) {
+		LOG_WRN("Runtime board-power sample stale or missing; clamping until it resumes");
 	}
 	if (ApplyRuntimePowerFault()) {
 		return;
@@ -982,7 +1042,8 @@ bool ThrottlerRuntimePowerFaultLatched(void)
 bool ThrottlerRuntimePowerClampActive(void)
 {
 	return ThrottlerRuntimePowerFaultLatched() ||
-	       atomic_get(&runtime_power_fast_clamp_active) != 0;
+	       atomic_get(&runtime_power_fast_clamp_active) != 0 ||
+	       atomic_get(&runtime_power_sample_stale) != 0;
 }
 
 bool ThrottlerStrictRuntimePowerLimitActive(void)

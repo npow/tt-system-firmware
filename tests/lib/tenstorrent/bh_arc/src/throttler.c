@@ -138,7 +138,7 @@ ZTEST(throttler, test_runtime_board_power_limit_tightens_transient_thresholds)
 	zassert_equal(ThrottlerGetDopplerT3PowerLimit(), 150);
 }
 
-ZTEST(throttler, test_runtime_power_guard_trips_on_first_emergency_sample)
+ZTEST(throttler, test_runtime_power_fail_safe_uses_sustained_limit)
 {
 	ThrottlerTestResetRuntimePowerGuard();
 	set_dmc_board_power_limit(300);
@@ -147,32 +147,26 @@ ZTEST(throttler, test_runtime_power_guard_trips_on_first_emergency_sample)
 	zassert_false(ThrottlerTestRuntimePowerFailSafeEligible(99, GetAiclkFmin()));
 	zassert_true(ThrottlerTestRuntimePowerFailSafeEligible(100, GetAiclkFmin()));
 
-	/* The measured 306 W P150A escape must trip a 300 W policy; the normal
-	 * controller targets 95% below this hard containment boundary.
+	/* Instantaneous crossings are handled by the fast clamp. The sample
+	 * callback separately requires a continuous 100 ms violation before it
+	 * latches non-destructive containment.
 	 */
 	set_dmc_board_power_limit(300);
 	zassert_true(ThrottlerTestRuntimePowerFailSafeEligible(306, GetAiclkFmin()));
-
-	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 160, 1000));
-	zassert_true(ThrottlerRuntimePowerFaultLatched());
-	zassert_equal(set_board_power_limit(100, false), 2);
-	zassert_equal(request_full_power_state(), 1);
+	ThrottlerTestRecordInputPowerSampleAtPower(1000, 306);
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerRuntimePowerClampActive());
 
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
-ZTEST(throttler, test_runtime_power_latch_immediately_asserts_asic_risc_resets)
+ZTEST(throttler, test_runtime_power_latch_does_not_assert_asic_risc_resets)
 {
 	ThrottlerTestResetRuntimePowerGuard();
 	RESET_FAKE(WriteReg);
 
 	zassert_true(ThrottlerTestUpdateRuntimePowerGuard(true, 300, 1000));
-	zassert_equal(WriteReg_fake.call_count, 8U);
-	for (uint32_t i = 0; i < 8U; i++) {
-		zassert_equal(WriteReg_fake.arg0_history[i],
-			      RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + i * sizeof(uint32_t));
-		zassert_equal(WriteReg_fake.arg1_history[i], 0U);
-	}
+	zassert_equal(WriteReg_fake.call_count, 0U);
 
 	ThrottlerTestResetRuntimePowerGuard();
 }
@@ -186,6 +180,14 @@ ZTEST(throttler, test_input_power_addition_saturates_instead_of_wrapping)
 	sys_put_le16(UINT16_MAX, power_data);
 	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
 	zassert_equal(GetInputPower(), UINT16_MAX);
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerRuntimePowerClampActive());
+	/* A repeated saturated producer remains fail-closed through the same
+	 * sustained-violation path rather than killing work on one bad word.
+	 */
+	for (uint32_t now_ms = 5; now_ms <= 105; now_ms += 5) {
+		ThrottlerTestRecordInputPowerSampleAtPower(now_ms, UINT16_MAX);
+	}
 	zassert_true(ThrottlerRuntimePowerFaultLatched());
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) >> 16U, UINT16_MAX);
 
@@ -208,15 +210,16 @@ ZTEST(throttler, test_lowering_cap_checks_already_published_peak)
 	zassert_false(ThrottlerRuntimePowerFaultLatched());
 
 	/* Tightening the cap must inspect the coherent current/peak snapshot; it
-	 * cannot wait for another DMC sample that may already be below the peak.
+	 * cannot discard the fast-clamp evidence even though one retained sample
+	 * is not a sustained violation.
 	 */
 	zassert_equal(set_board_power_limit(225, false), 0);
-	zassert_true(ThrottlerRuntimePowerFaultLatched());
-	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) >> 16U, 250U);
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerRuntimePowerClampActive());
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
-ZTEST(throttler, test_runtime_power_freshness_latches_when_first_sample_is_missing)
+ZTEST(throttler, test_runtime_power_freshness_clamps_when_first_sample_is_missing)
 {
 	ThrottlerTestResetRuntimePowerGuard();
 	set_dmc_board_power_limit(300);
@@ -230,13 +233,14 @@ ZTEST(throttler, test_runtime_power_freshness_latches_when_first_sample_is_missi
 	 */
 	zassert_false(ThrottlerTestRuntimePowerSampleExpired(199));
 	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(200));
-	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerRuntimePowerClampActive());
 	zassert_equal(GetTelemetryTag(TAG_RUNTIME_POWER_FAULT) & 0xffU,
-		      RUNTIME_POWER_FAULT_LATCHED_BIT | RUNTIME_POWER_FAULT_STRICT_BIT);
+		      RUNTIME_POWER_FAULT_STRICT_BIT);
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
-ZTEST(throttler, test_runtime_power_freshness_latches_when_sample_is_stale)
+ZTEST(throttler, test_runtime_power_freshness_clamps_until_samples_resume)
 {
 	ThrottlerTestResetRuntimePowerGuard();
 	set_dmc_board_power_limit(300);
@@ -251,7 +255,10 @@ ZTEST(throttler, test_runtime_power_freshness_latches_when_sample_is_stale)
 
 	zassert_false(ThrottlerTestRuntimePowerSampleExpired(208));
 	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(209));
-	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerRuntimePowerClampActive());
+	ThrottlerTestRecordInputPowerSampleAtPower(210, 100);
+	zassert_false(ThrottlerRuntimePowerClampActive());
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
@@ -284,7 +291,8 @@ ZTEST(throttler, test_runtime_power_freshness_accepts_valid_samples_and_wraps)
 	ThrottlerTestStartRuntimePowerSampleWatchdog(UINT32_MAX - 5U);
 	zassert_false(ThrottlerTestRuntimePowerSampleExpired(93));
 	zassert_true(ThrottlerTestUpdateRuntimePowerFreshnessGuard(94));
-	zassert_true(ThrottlerRuntimePowerFaultLatched());
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_true(ThrottlerRuntimePowerClampActive());
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
@@ -318,9 +326,29 @@ ZTEST(throttler, test_runtime_power_guard_stays_latched)
 	ThrottlerTestResetRuntimePowerGuard();
 }
 
-ZTEST(throttler, test_over_limit_sample_latches_before_dvfs_and_cannot_be_hidden)
+ZTEST(throttler, test_brief_over_limit_sample_clamps_without_latching)
 {
-	uint8_t power_data[2];
+	ThrottlerTestResetRuntimePowerGuard();
+	set_dmc_board_power_limit(300);
+
+	/* This reproduces the measured 346 W single-sample OpenPI startup
+	 * excursion. It must force the fast clamp without permanently resetting
+	 * in-flight Tensix work.
+	 */
+	ThrottlerTestRecordInputPowerSampleAtPower(1000, 346);
+	zassert_true(ThrottlerRuntimePowerClampActive());
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	ThrottlerTestRecordInputPowerSampleAtPower(1001, 200);
+	zassert_false(ThrottlerRuntimePowerFaultLatched());
+	zassert_equal(ThrottlerTestConsumeRuntimePowerPeak(), 346);
+	ThrottlerTestRecordInputPowerSampleAtPower(1002, 200);
+	zassert_false(ThrottlerRuntimePowerClampActive());
+
+	ThrottlerTestResetRuntimePowerGuard();
+}
+
+ZTEST(throttler, test_sustained_over_limit_latches_before_dvfs_and_cannot_be_hidden)
+{
 	uint16_t trip_power;
 	uint16_t later_power;
 	union request req = {0};
@@ -340,14 +368,14 @@ ZTEST(throttler, test_over_limit_sample_latches_before_dvfs_and_cannot_be_hidden
 	zassert_ok(msgqueue_request_push(0, &req));
 
 	/* The DMC callback can publish multiple samples before the cooperative
-	 * DVFS work item runs. The first over-limit sample must latch immediately,
-	 * and a later low value must not replace its fault provenance.
+	 * DVFS work item runs. A continuous 100 ms interval above the sustained
+	 * limit must latch, and a later low value must not replace its provenance.
 	 */
-	sys_put_le16(301, power_data);
-	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	for (uint32_t now_ms = 1000; now_ms <= 1100; now_ms += 5) {
+		ThrottlerTestRecordInputPowerSampleAtPower(now_ms, 301);
+	}
 	trip_power = GetInputPower();
-	sys_put_le16(100, power_data);
-	zassert_ok(Dm2CmSendPowerHandler(power_data, sizeof(power_data)));
+	ThrottlerTestRecordInputPowerSampleAtPower(1101, 100);
 	later_power = GetInputPower();
 
 	zassert_true(ThrottlerRuntimePowerFaultLatched());

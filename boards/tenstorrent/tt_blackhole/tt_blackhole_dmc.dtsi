@@ -247,6 +247,11 @@
 		vbus-conversion-time-us = <50>;
 		vshunt-conversion-time-us = <50>;
 		temp-conversion-time-us = <50>;
+		/* Four-sample averaging still refreshes a bus+shunt result within
+		 * 0.4 ms, below DMC's 1 ms publication cadence, while avoiding policy
+		 * decisions from the noisiest single-conversion setting.
+		 */
+		avg-count = <4>;
 		adc-mode = "Bus and shunt voltage continuous";
 	};
 
