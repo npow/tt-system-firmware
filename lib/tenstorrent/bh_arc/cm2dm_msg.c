@@ -16,6 +16,7 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
+#include <zephyr/sys/util.h>
 #include <tenstorrent/smc_msg.h>
 #include <tenstorrent/msgqueue.h>
 
@@ -27,6 +28,7 @@
 #include "fan_ctrl.h"
 #include "telemetry.h"
 #include "dvfs.h"
+#include "throttler.h"
 
 typedef struct {
 	atomic_t pending_messages;
@@ -41,7 +43,6 @@ typedef struct {
 
 static Cm2DmMsgState cm2dm_msg_state;
 K_SEM_DEFINE(dmfw_ping_sem, 0, 1);
-static uint16_t power;
 static uint16_t telemetry_reg;
 static struct {
 	uint8_t chip_reset_asic_called: 1;
@@ -340,13 +341,20 @@ int32_t Dm2CmPingV2(uint8_t *data, uint8_t *size)
 
 int32_t Dm2CmSendPowerHandler(const uint8_t *data, uint8_t size)
 {
+	uint32_t measured_power;
+	uint16_t input_power;
+
 	if (size != 2) {
 		return -1;
 	}
 
+	measured_power = (uint32_t)sys_get_le16(data) + bh_chip_info_additional_board_power();
+	/* Saturate malformed input instead of allowing uint16_t wrap to publish an
+	 * apparently safe sample and release the power clamp.
+	 */
+	input_power = (uint16_t)MIN(measured_power, UINT16_MAX);
+	ThrottlerRecordInputPowerSample(k_uptime_get_32(), input_power);
 	AdjustDVFSTimer();
-
-	power = sys_get_le16(data) + bh_chip_info_additional_board_power();
 
 	return 0;
 }
@@ -355,7 +363,7 @@ int32_t Dm2CmSendPowerHandler(const uint8_t *data, uint8_t size)
 
 uint16_t GetInputPower(void)
 {
-	return power;
+	return ThrottlerGetInputPower();
 }
 
 int32_t Dm2CmSendFanRPMHandler(const uint8_t *data, uint8_t size)

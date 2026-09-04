@@ -291,13 +291,17 @@ void process_cm2dm_message(struct bh_chip *chip)
 
 void ina228_power_update(void)
 {
-	struct sensor_value sensor_val;
+	struct sensor_value sensor_val = {0};
 
-	sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER);
-	sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val);
+	if (sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER) != 0 ||
+	    sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val) != 0 ||
+	    sensor_val.val1 < 0 || sensor_val.val1 > UINT16_MAX) {
+		/* Do not refresh SMC's power sample on a failed or invalid read. */
+		return;
+	}
 
 	/* Only use integer part of sensor value */
-	int16_t power = sensor_val.val1 & 0xFFFF;
+	uint16_t power = (uint16_t)sensor_val.val1;
 
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		bh_chip_set_input_power(chip, power);

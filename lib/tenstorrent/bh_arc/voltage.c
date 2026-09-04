@@ -12,6 +12,7 @@
 #include "voltage.h"
 #include "regulator.h"
 #include "dvfs.h"
+#include "throttler.h"
 
 #define VDD_BOOT            750
 /* Bound checks for VDD_MAX and VDD_MIN (in mV) */
@@ -53,7 +54,7 @@ void CalculateTargVoltage(void)
 	voltage_arbiter.targ_voltage = MIN(targ_voltage, voltage_arbiter.vdd_max);
 
 	/* Apply forced voltage at the end, regardless of any limits */
-	if (voltage_arbiter.forced_voltage != 0) {
+	if (voltage_arbiter.forced_voltage != 0 && !ThrottlerStrictRuntimePowerLimitActive()) {
 		voltage_arbiter.targ_voltage = voltage_arbiter.forced_voltage;
 	}
 }
@@ -89,6 +90,12 @@ uint8_t ForceVdd(uint32_t voltage)
 	if ((voltage > voltage_arbiter.vdd_max || voltage < voltage_arbiter.vdd_min) &&
 	    (voltage != 0)) {
 		return 1;
+	}
+	/* A forced voltage bypasses the normal AICLK/VF request. Once DMC has
+	 * installed the board-power policy, only releasing an old override is safe.
+	 */
+	if (ThrottlerStrictRuntimePowerLimitActive() && voltage != 0U) {
+		return 2;
 	}
 
 	if (dvfs_enabled) {

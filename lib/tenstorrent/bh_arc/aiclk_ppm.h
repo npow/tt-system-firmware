@@ -10,11 +10,15 @@
 #include <stdbool.h>
 
 /* Bounds checks for FMAX and FMIN (in MHz) */
-#define AICLK_FMAX_MAX        1400.0F
-#define AICLK_FMAX_MIN        800.0F
-#define AICLK_FMIN_MAX        1400.0F
-#define AICLK_FMIN_MIN        200.0F
-#define AICLK_RESET_SAFE_FREQ 250.0F
+#define AICLK_FMAX_MAX                 1400.0F
+#define AICLK_FMAX_MIN                 800.0F
+#define AICLK_FMIN_MAX                 1400.0F
+#define AICLK_FMIN_MIN                 200.0F
+#define AICLK_RESET_SAFE_FREQ          250.0F
+/* DVFS runs once per millisecond. This limits startup slew, not steady-state
+ * frequency: a 1350 MHz target remains fully reachable.
+ */
+#define AICLK_POWER_SLEW_UP_MHZ_PER_MS 1U
 
 /**
  * @brief AICLK maximum frequency arbiters
@@ -80,6 +84,7 @@ union aiclk_targ_freq_info {
 };
 
 void aiclk_update_busy(void);
+void SetAiclkPowerSlew(bool enable);
 void SetAiclkArbMax(enum aiclk_arb_max arb_max, float freq);
 void SetAiclkArbMin(enum aiclk_arb_min arb_min, float freq);
 void EnableArbMax(enum aiclk_arb_max arb_max, bool enable);
@@ -104,5 +109,10 @@ union aiclk_targ_freq_info get_targ_aiclk_info(void);
 struct response;
 union request;
 uint8_t throttler_counter_handler(const union request *request, struct response *response);
+
+#if defined(CONFIG_ZTEST)
+uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms);
+void AiclkTestClearCharacterizationOverrides(void);
+#endif
 
 #endif

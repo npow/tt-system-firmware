@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <zephyr/sys/atomic.h>
+#include <zephyr/spinlock.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
@@ -23,6 +25,14 @@
 static uint32_t power_limit;
 static uint32_t max_board_power_limit;
 static bool strict_runtime_power_limit;
+static atomic_t runtime_power_fast_clamp_active;
+static atomic_t runtime_power_sample_seen;
+static atomic_t runtime_power_sample_stale;
+static atomic_t runtime_power_sample_timestamp_ms;
+static atomic_t runtime_power_sample_watchdog_started_ms;
+static struct k_spinlock runtime_power_sample_lock;
+static uint16_t runtime_input_power;
+static uint16_t runtime_peak_power;
 
 static bool doppler;
 static bool doppler_slow;
@@ -39,8 +49,20 @@ static const bool thermal_throttling = true;
 static uint32_t kernel_throttler_stop_nops_freq;
 static uint32_t kernel_throttler_stop_nops_freq_default;
 
-#define kThrottlerAiclkScaleFactor 500.0F
-#define DEFAULT_BOARD_POWER_LIMIT  150
+#define kThrottlerAiclkScaleFactor             500.0F
+#define DEFAULT_BOARD_POWER_LIMIT              150
+#define DOPPLER_SHORT_WINDOW_SAMPLES           16U
+#define RUNTIME_POWER_CONTROL_HEADROOM_PERCENT 5U
+/* Clamp on the first complete sample at the electrical limit. Release below
+ * the controller target so sampling noise cannot chatter the state.
+ */
+#define RUNTIME_POWER_FAST_LIMIT_PERCENT       100U
+#define RUNTIME_POWER_FAST_RELEASE_PERCENT     95U
+/* DMC posts INA228 power every 1 ms. Allow normal scheduling jitter, while a
+ * stopped stream prevents any further upward clock movement.
+ */
+#define RUNTIME_POWER_SAMPLE_FRESHNESS_MS      10U
+#define RUNTIME_POWER_FIRST_SAMPLE_TIMEOUT_MS  100U
 
 LOG_MODULE_REGISTER(throttler);
 
@@ -167,11 +189,126 @@ static void SetThrottlerLimit(ThrottlerId id, float limit)
 	throttler[id].limit = clamped_limit;
 }
 
+static void ResetBoardPowerHistory(uint16_t current_power);
+static void ResetDopplerTransientState(void);
+
+static void StartRuntimePowerSampleWatchdog(uint32_t now_ms)
+{
+	k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+	atomic_set(&runtime_power_sample_watchdog_started_ms, now_ms);
+	atomic_clear(&runtime_power_sample_seen);
+	atomic_clear(&runtime_power_sample_stale);
+	runtime_peak_power = runtime_input_power;
+	k_spin_unlock(&runtime_power_sample_lock, key);
+}
+
+/* Caller holds runtime_power_sample_lock. */
+static void UpdateRuntimePowerFastClampLocked(void)
+{
+	uint16_t retained_power = MAX(runtime_input_power, runtime_peak_power);
+	uint32_t clamp_limit = power_limit * RUNTIME_POWER_FAST_LIMIT_PERCENT / 100U;
+	uint32_t release_limit = power_limit * RUNTIME_POWER_FAST_RELEASE_PERCENT / 100U;
+
+	if (strict_runtime_power_limit && clamp_limit != 0U && retained_power >= clamp_limit) {
+		atomic_set(&runtime_power_fast_clamp_active, 1);
+	} else if (!strict_runtime_power_limit || release_limit == 0U ||
+		   retained_power <= release_limit) {
+		atomic_clear(&runtime_power_fast_clamp_active);
+	}
+}
+
+void ThrottlerRecordInputPowerSample(uint32_t now_ms, uint16_t input_power)
+{
+	k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+	runtime_input_power = input_power;
+	runtime_peak_power = MAX(runtime_peak_power, input_power);
+	UpdateRuntimePowerFastClampLocked();
+	atomic_set(&runtime_power_sample_timestamp_ms, now_ms);
+	atomic_set(&runtime_power_sample_seen, 1);
+	atomic_clear(&runtime_power_sample_stale);
+	k_spin_unlock(&runtime_power_sample_lock, key);
+}
+
+uint16_t ThrottlerGetInputPower(void)
+{
+	uint16_t input_power;
+	k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+	input_power = runtime_input_power;
+	k_spin_unlock(&runtime_power_sample_lock, key);
+	return input_power;
+}
+
+static uint16_t ConsumeRuntimePowerPeak(void)
+{
+	uint16_t peak_power;
+	k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+	peak_power = MAX(runtime_peak_power, runtime_input_power);
+	runtime_peak_power = runtime_input_power;
+	k_spin_unlock(&runtime_power_sample_lock, key);
+	return peak_power;
+}
+
+static bool RuntimePowerSampleExpired(uint32_t now_ms)
+{
+	uint32_t reference_ms;
+	uint32_t timeout_ms;
+	k_spinlock_key_t key;
+
+	if (!strict_runtime_power_limit) {
+		return false;
+	}
+
+	key = k_spin_lock(&runtime_power_sample_lock);
+	if (atomic_get(&runtime_power_sample_seen)) {
+		reference_ms = (uint32_t)atomic_get(&runtime_power_sample_timestamp_ms);
+		timeout_ms = RUNTIME_POWER_SAMPLE_FRESHNESS_MS;
+	} else {
+		reference_ms = (uint32_t)atomic_get(&runtime_power_sample_watchdog_started_ms);
+		timeout_ms = RUNTIME_POWER_FIRST_SAMPLE_TIMEOUT_MS;
+	}
+	k_spin_unlock(&runtime_power_sample_lock, key);
+
+	/* Unsigned subtraction remains valid across the 32-bit uptime wrap. */
+	return now_ms - reference_ms >= timeout_ms;
+}
+
+static bool UpdateRuntimePowerFreshnessGuard(uint32_t now_ms)
+{
+	bool expired = RuntimePowerSampleExpired(now_ms);
+
+	if (expired) {
+		return atomic_cas(&runtime_power_sample_stale, 0, 1);
+	}
+
+	atomic_clear(&runtime_power_sample_stale);
+	return false;
+}
+
 static void apply_board_power_limit(uint32_t new_power_limit)
 {
+	uint32_t controller_limit = new_power_limit;
+
+	if (strict_runtime_power_limit) {
+		controller_limit =
+			new_power_limit * (100U - RUNTIME_POWER_CONTROL_HEADROOM_PERCENT) / 100U;
+	}
+
 	power_limit = new_power_limit;
-	SetThrottlerLimit(kThrottlerBoardPower, power_limit);
-	SetThrottlerLimit(kThrottlerDopplerSlow, power_limit);
+	SetThrottlerLimit(kThrottlerBoardPower, controller_limit);
+	SetThrottlerLimit(kThrottlerDopplerSlow, controller_limit);
+	ResetBoardPowerHistory(ThrottlerGetInputPower());
+	ResetDopplerTransientState();
+	SetAiclkPowerSlew(strict_runtime_power_limit);
+	{
+		k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+		UpdateRuntimePowerFastClampLocked();
+		k_spin_unlock(&runtime_power_sample_lock, key);
+	}
 	UpdateTelemetryBoardPowerLimit(power_limit);
 }
 
@@ -191,8 +328,11 @@ static void BroadcastKernelThrottleState(void)
 	if (tensixes_enabled) {
 		sys_trace_named_event("kernel_throttle", throttle_counter & 1, 0);
 		NOC2AXITensixBroadcastTlbSetup(kNocRing, kNocTlb, kKernelThrottleAddress,
-					       kNoc2AxiOrderingStrict);
+					       kNoc2AxiOrderingPostedStrict);
 		NOC2AXIWrite32(kNocRing, kNocTlb, kKernelThrottleAddress, throttle_counter);
+		/* Never fence this write. Power throttling must not wait for a stalled
+		 * Tensix or NOC completion and thereby make ARC/PCIe unresponsive.
+		 */
 	}
 }
 
@@ -245,6 +385,21 @@ ZBUS_CHAN_ADD_OBS(tensix_state_chan, doppler_tensix_state_listener, 0);
 
 void InitThrottlers(void)
 {
+	strict_runtime_power_limit = false;
+	max_board_power_limit = 0U;
+	power_limit = 0U;
+	atomic_clear(&runtime_power_fast_clamp_active);
+	atomic_clear(&runtime_power_sample_seen);
+	atomic_clear(&runtime_power_sample_stale);
+	atomic_clear(&runtime_power_sample_timestamp_ms);
+	atomic_clear(&runtime_power_sample_watchdog_started_ms);
+	{
+		k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+		runtime_input_power = 0U;
+		runtime_peak_power = 0U;
+		k_spin_unlock(&runtime_power_sample_lock, key);
+	}
 	doppler = tt_bh_fwtable_get_fw_table(fwtable_dev)->feature_enable.doppler_en;
 	doppler_slow = doppler;
 	doppler_t2 = doppler;
@@ -324,16 +479,40 @@ static void UpdateThrottlerArb(ThrottlerId id)
 static uint16_t board_power_history[1000];
 static uint16_t *board_power_history_cursor = board_power_history;
 static uint32_t board_power_sum;
+static uint16_t board_power_short_history[DOPPLER_SHORT_WINDOW_SAMPLES];
+static uint16_t *board_power_short_history_cursor = board_power_short_history;
+static uint32_t board_power_short_sum;
 static bool kernel_nops_enabled;
 
 static uint8_t t2_count;
 static uint8_t t3_count;
+
+static void ResetDopplerTransientState(void)
+{
+	t2_count = 0U;
+	t3_count = 0U;
+}
 
 #define ADVANCE_CIRCULAR_POINTER(pointer, array)                                                   \
 	do {                                                                                       \
 		if (++(pointer) == (array) + ARRAY_SIZE(array))                                    \
 			(pointer) = (array);                                                       \
 	} while (false)
+
+static void ResetBoardPowerHistory(uint16_t current_power)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(board_power_history); i++) {
+		board_power_history[i] = current_power;
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(board_power_short_history); i++) {
+		board_power_short_history[i] = current_power;
+	}
+
+	board_power_history_cursor = board_power_history;
+	board_power_sum = current_power * ARRAY_SIZE(board_power_history);
+	board_power_short_history_cursor = board_power_short_history;
+	board_power_short_sum = current_power * ARRAY_SIZE(board_power_short_history);
+}
 
 static uint16_t UpdateMovingAveragePower(uint16_t current_power)
 {
@@ -345,6 +524,16 @@ static uint16_t UpdateMovingAveragePower(uint16_t current_power)
 	return board_power_sum / ARRAY_SIZE(board_power_history);
 }
 
+static uint16_t UpdateShortAveragePower(uint16_t current_power)
+{
+	board_power_short_sum += current_power - *board_power_short_history_cursor;
+	*board_power_short_history_cursor = current_power;
+
+	ADVANCE_CIRCULAR_POINTER(board_power_short_history_cursor, board_power_short_history);
+
+	return board_power_short_sum / ARRAY_SIZE(board_power_short_history);
+}
+
 static bool DopplerActive(void)
 {
 	return doppler && power_limit > 0;
@@ -352,17 +541,12 @@ static bool DopplerActive(void)
 
 static uint32_t GetDopplerT2PowerLimit(void)
 {
-	/* Preserve the board-qualified transient envelope at the DMC-provided
-	 * default. A host-requested limit is intended to protect the surrounding
-	 * system as well as control sustained power, so give it much less transient
-	 * headroom before forcing kernel NOPs.
-	 */
-	return strict_runtime_power_limit ? power_limit * 11U / 10U : power_limit * 2U;
+	return strict_runtime_power_limit ? power_limit : power_limit * 2U;
 }
 
 static uint32_t GetDopplerT3PowerLimit(void)
 {
-	return strict_runtime_power_limit ? power_limit * 6U / 5U : power_limit * 5U / 2U;
+	return strict_runtime_power_limit ? power_limit * 11U / 10U : power_limit * 5U / 2U;
 }
 
 #if defined(CONFIG_ZTEST)
@@ -375,19 +559,93 @@ uint32_t ThrottlerGetDopplerT3PowerLimit(void)
 {
 	return GetDopplerT3PowerLimit();
 }
+
+uint32_t ThrottlerGetDopplerSlowLimit(void)
+{
+	return (uint32_t)throttler[kThrottlerDopplerSlow].limit;
+}
+
+void ThrottlerTestResetRuntimePowerState(void)
+{
+	strict_runtime_power_limit = false;
+	max_board_power_limit = 0U;
+	power_limit = 0U;
+	atomic_clear(&runtime_power_fast_clamp_active);
+	atomic_clear(&runtime_power_sample_seen);
+	atomic_clear(&runtime_power_sample_stale);
+	atomic_clear(&runtime_power_sample_timestamp_ms);
+	atomic_clear(&runtime_power_sample_watchdog_started_ms);
+	{
+		k_spinlock_key_t key = k_spin_lock(&runtime_power_sample_lock);
+
+		runtime_input_power = 0U;
+		runtime_peak_power = 0U;
+		k_spin_unlock(&runtime_power_sample_lock, key);
+	}
+	EnableArbMax(aiclk_arb_max_doppler_critical, false);
+	kernel_nops_enabled = false;
+	SetAiclkPowerSlew(false);
+}
+
+void ThrottlerTestStartRuntimePowerSampleWatchdog(uint32_t now_ms)
+{
+	StartRuntimePowerSampleWatchdog(now_ms);
+}
+
+void ThrottlerTestRecordInputPowerSampleAtPower(uint32_t now_ms, uint16_t input_power)
+{
+	ThrottlerRecordInputPowerSample(now_ms, input_power);
+}
+
+uint16_t ThrottlerTestConsumeRuntimePowerPeak(void)
+{
+	return ConsumeRuntimePowerPeak();
+}
+
+bool ThrottlerTestRuntimePowerSampleExpired(uint32_t now_ms)
+{
+	return RuntimePowerSampleExpired(now_ms);
+}
+
+bool ThrottlerTestUpdateRuntimePowerFreshnessGuard(uint32_t now_ms)
+{
+	return UpdateRuntimePowerFreshnessGuard(now_ms);
+}
+
+uint16_t ThrottlerTestUpdateBoardPowerHistory(uint16_t current_power)
+{
+	uint16_t average_power = UpdateMovingAveragePower(current_power);
+	uint16_t short_average_power = UpdateShortAveragePower(current_power);
+
+	return strict_runtime_power_limit
+		       ? MAX(current_power, MAX(average_power, short_average_power))
+		       : average_power;
+}
+
+void ThrottlerTestResetBoardPowerHistory(uint16_t current_power)
+{
+	ResetBoardPowerHistory(current_power);
+}
 #endif
 
 static void UpdateDoppler(const TelemetryInternalData *telemetry)
 {
-	uint16_t current_power = GetInputPower();
+	bool fast_clamp_active = atomic_get(&runtime_power_fast_clamp_active) != 0;
+	bool sample_stale = atomic_get(&runtime_power_sample_stale) != 0;
+	uint16_t current_power = ConsumeRuntimePowerPeak();
 	uint16_t average_power = UpdateMovingAveragePower(current_power);
+	uint16_t short_average_power = UpdateShortAveragePower(current_power);
+	uint16_t control_power =
+		strict_runtime_power_limit
+			? MAX(current_power, MAX(average_power, short_average_power))
+			: average_power;
 
-	UpdateThrottler(kThrottlerDopplerSlow, average_power);
+	UpdateThrottler(kThrottlerDopplerSlow, control_power);
 
 	/* Doppler T2 throttler: 10 consecutive samples over its transient limit. */
 	uint32_t t2_power_limit = GetDopplerT2PowerLimit();
 
-	if (current_power > t2_power_limit) {
+	if (current_power >= t2_power_limit) {
 		if (t2_count < UINT8_MAX) {
 			t2_count++;
 		}
@@ -395,12 +653,13 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 		t2_count = 0;
 	}
 
-	bool t2_triggered = t2_count >= 10 && doppler_t2;
+	uint8_t t2_required_samples = strict_runtime_power_limit ? 1U : 10U;
+	bool t2_triggered = t2_count >= t2_required_samples && doppler_t2;
 
 	/* Doppler T3 throttler: 2 consecutive samples over its critical limit. */
 	uint32_t t3_power_limit = GetDopplerT3PowerLimit();
 
-	if (current_power > t3_power_limit) {
+	if (current_power >= t3_power_limit) {
 		if (t3_count < UINT8_MAX) {
 			t3_count++;
 		}
@@ -408,13 +667,19 @@ static void UpdateDoppler(const TelemetryInternalData *telemetry)
 		t3_count = 0;
 	}
 
-	bool t3_triggered = t3_count >= 2 && doppler_t3;
+	uint8_t t3_required_samples = strict_runtime_power_limit ? 1U : 2U;
+	bool t3_triggered = t3_count >= t3_required_samples && doppler_t3;
 
 	/* AICLK=Fmin isn't always enough to get below the board power limit. */
 	bool start_nops = GetAiclkTarg() == GetAiclkFmin() && current_power > power_limit;
-	bool stop_nops = GetAiclkTarg() == GetAiclkFmax() && current_power < power_limit;
+	uint32_t runtime_release_power = power_limit * RUNTIME_POWER_FAST_RELEASE_PERCENT / 100U;
+	bool stop_nops = strict_runtime_power_limit
+				 ? !fast_clamp_active && !sample_stale &&
+					   current_power <= runtime_release_power
+				 : GetAiclkTarg() == GetAiclkFmax() && current_power < power_limit;
 
-	bool critical_throttling = t2_triggered || t3_triggered;
+	bool critical_throttling =
+		fast_clamp_active || sample_stale || t2_triggered || t3_triggered;
 
 	bool new_kernel_nops_enabled =
 		((kernel_nops_enabled || start_nops) && !stop_nops) || critical_throttling;
@@ -467,6 +732,11 @@ static void UpdateKernelThrottler(float current_power, float tdp_limit)
 void CalculateThrottlers(void)
 {
 	TelemetryInternalData telemetry_internal_data;
+	uint32_t now_ms = k_uptime_get_32();
+
+	if (UpdateRuntimePowerFreshnessGuard(now_ms)) {
+		LOG_WRN("Board-power sample stale or missing; clamping until it resumes");
+	}
 
 	ReadTelemetryInternal(1, &telemetry_internal_data);
 
@@ -476,7 +746,7 @@ void CalculateThrottlers(void)
 		UpdateThrottler(kThrottlerTDP, telemetry_internal_data.vcore_power);
 		UpdateThrottler(kThrottlerFastTDC, telemetry_internal_data.vcore_current);
 		UpdateThrottler(kThrottlerTDC, telemetry_internal_data.vcore_current);
-		UpdateThrottler(kThrottlerBoardPower, GetInputPower());
+		UpdateThrottler(kThrottlerBoardPower, ThrottlerGetInputPower());
 
 		float current_power = telemetry_internal_data.vcore_power;
 		float tdp_limit = throttler[kThrottlerTDP].limit;
@@ -492,10 +762,27 @@ void CalculateThrottlers(void)
 	}
 }
 
+bool ThrottlerRuntimePowerClampActive(void)
+{
+	return atomic_get(&runtime_power_fast_clamp_active) != 0 ||
+	       atomic_get(&runtime_power_sample_stale) != 0;
+}
+
+bool ThrottlerStrictRuntimePowerLimitActive(void)
+{
+	return strict_runtime_power_limit;
+}
+
 uint8_t ThrottlerSetKernelThrottlerEnabled(uint32_t enabled)
 {
 	if (enabled > 1) {
 		return 1;
+	}
+	if (!enabled && ThrottlerRuntimePowerClampActive()) {
+		/* The Doppler fast path owns NOPs while the reversible clamp is
+		 * active; characterization controls cannot release them early.
+		 */
+		return 2;
 	}
 
 	LOG_INF("kernel throttler at aiclk floor %s", enabled ? "enabled" : "disabled");
@@ -542,6 +829,10 @@ uint8_t ThrottlerSetKernelThrottlerStopFreq(uint32_t frequency)
 
 int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 {
+	uint32_t firmware_power_limit;
+	uint32_t resolved_power_limit;
+	bool was_strict;
+
 	if (size != 2) {
 		return -1;
 	}
@@ -549,11 +840,31 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 	uint32_t cable_power_limit = sys_get_le16(data);
 
 	LOG_INF("Cable Power Limit: %u", cable_power_limit);
-	max_board_power_limit =
-		MIN(cable_power_limit,
-		    tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit);
-	strict_runtime_power_limit = false;
+	firmware_power_limit =
+		tt_bh_fwtable_get_fw_table(fwtable_dev)->chip_limits.board_power_limit;
+	if (cable_power_limit == 0U || firmware_power_limit == 0U) {
+		return -1;
+	}
+	resolved_power_limit = MIN(cable_power_limit, firmware_power_limit);
+	if (get_throttler_clamped_limit(kThrottlerBoardPower, resolved_power_limit) !=
+	    resolved_power_limit) {
+		return -1;
+	}
+
+	was_strict = strict_runtime_power_limit;
+	max_board_power_limit = resolved_power_limit;
+	/* A valid DMC/firmware maximum is the board's default safety policy. It
+	 * applies whether this board uses Doppler or the ordinary board-power PID.
+	 */
+	strict_runtime_power_limit = true;
+	if (strict_runtime_power_limit && !was_strict) {
+		StartRuntimePowerSampleWatchdog(k_uptime_get_32());
+	}
 	apply_board_power_limit(max_board_power_limit);
+	if (strict_runtime_power_limit) {
+		/* Start low and use the bounded upward slew; this does not change Fmax. */
+		SetAiclkArbMax(throttler[kThrottlerDopplerSlow].arb_max, GetAiclkFmin());
+	}
 
 	return 0;
 }
@@ -577,8 +888,19 @@ static uint8_t set_board_power_limit_handler(const union request *request,
 	}
 
 	LOG_INF("Runtime board power limit: %u", new_power_limit);
-	strict_runtime_power_limit = !request->set_board_power_limit.restore_default;
+	bool was_strict = strict_runtime_power_limit;
+
+	/* Restoring the default removes a host override; it must not disable the
+	 * cable/board safety policy installed by DMC during startup.
+	 */
+	strict_runtime_power_limit = new_power_limit > 0U;
+	if (strict_runtime_power_limit && !was_strict) {
+		StartRuntimePowerSampleWatchdog(k_uptime_get_32());
+	}
 	apply_board_power_limit(new_power_limit);
+	if (strict_runtime_power_limit) {
+		SetAiclkArbMax(throttler[kThrottlerDopplerSlow].arb_max, GetAiclkFmin());
+	}
 
 	return 0;
 }

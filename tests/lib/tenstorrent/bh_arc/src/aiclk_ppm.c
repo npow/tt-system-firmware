@@ -5,8 +5,10 @@
  */
 
 #include <zephyr/ztest.h>
+#include <zephyr/sys/byteorder.h>
 
 #include "aiclk_ppm.h"
+#include "throttler.h"
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/smc_msg.h>
 static uint32_t fmax;
@@ -63,6 +65,49 @@ static void reinit_arb(void *fixture)
 	}
 
 	set_busy(false);
+	AiclkTestClearCharacterizationOverrides();
+	ThrottlerTestResetRuntimePowerState();
+}
+
+ZTEST(aiclk_ppm, test_power_slew_reaches_max_without_same_tick_bypass)
+{
+	SetAiclkPowerSlew(true);
+
+	zassert_equal(AiclkTestApplyPowerSlew(800, 1350, 100), 801);
+	zassert_equal(AiclkTestApplyPowerSlew(801, 1350, 100), 801);
+	zassert_equal(AiclkTestApplyPowerSlew(801, 1350, 101), 802);
+	/* Falling clocks are never delayed. */
+	zassert_equal(AiclkTestApplyPowerSlew(1000, 800, 101), 800);
+
+	SetAiclkPowerSlew(false);
+	zassert_equal(AiclkTestApplyPowerSlew(800, 1350, 102), 1350);
+}
+
+ZTEST(aiclk_ppm, test_strict_power_max_wins_over_force_and_host_floor)
+{
+	uint8_t data[2];
+	union request req = {0};
+	struct response rsp = {0};
+	uint32_t strict_max = fmin + 100U;
+
+	sys_put_le16(300U, data);
+	zassert_ok(Dm2CmSetBoardPowerLimit(data, sizeof(data)));
+	ThrottlerTestRecordInputPowerSampleAtPower(k_uptime_get_32(), 200U);
+
+	SetAiclkArbMax(aiclk_arb_max_host_fmax, strict_max);
+	EnableArbMax(aiclk_arb_max_host_fmax, true);
+	req.characterisation_msg.command_code = TT_SMC_MSG_CHARACTERISATION;
+	req.characterisation_msg.submsg_ID = TT_SUB_MSG_SET_HOST_REQUESTED_FMIN;
+	req.characterisation_msg.submsg_data.fmin_value.value = fmax;
+	zassert_ok(msgqueue_request_push(0, &req));
+	process_message_queues();
+	zassert_ok(msgqueue_response_pop(0, &rsp));
+	zassert_ok(rsp.data[0]);
+
+	zassert_ok(ForceAiclk(fmax));
+	zassert_true(GetAiclkTarg() <= strict_max,
+		     "forced/host-min target %u bypassed strict max %u", GetAiclkTarg(),
+		     strict_max);
 }
 
 ZTEST(aiclk_ppm, test_no_arb_enabled)

@@ -18,6 +18,7 @@
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/sys_init_defines.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/misc/bh_fwtable.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/device.h>
@@ -44,17 +45,17 @@ typedef struct {
 } AiclkArb;
 
 typedef struct {
-	uint32_t curr_freq;   /* in MHz */
-	uint32_t targ_freq;   /* in MHz */
-	uint32_t boot_freq;   /* in MHz */
-	uint32_t fmax;        /* in MHz */
-	uint32_t fmin;        /* in MHz */
+	uint32_t curr_freq;           /* in MHz */
+	uint32_t targ_freq;           /* in MHz */
+	uint32_t boot_freq;           /* in MHz */
+	uint32_t fmax;                /* in MHz */
+	uint32_t fmin;                /* in MHz */
 	uint32_t host_requested_fmin; /* Host-requested minimum frequency floor, 0 = disabled */
-	uint32_t forced_freq; /* in MHz, a value of zero means disabled. */
-	bool reset_safe;      /* cap to reset-safe frequency after forced frequency is applied */
-	uint32_t sweep_en;    /* a value of one means enabled, otherwise disabled. */
-	uint32_t sweep_low;   /* in MHz */
-	uint32_t sweep_high;  /* in MHz */
+	uint32_t forced_freq;         /* in MHz, a value of zero means disabled. */
+	bool reset_safe;     /* cap to reset-safe frequency after forced frequency is applied */
+	uint32_t sweep_en;   /* a value of one means enabled, otherwise disabled. */
+	uint32_t sweep_low;  /* in MHz */
+	uint32_t sweep_high; /* in MHz */
 	union aiclk_targ_freq_info lim_arb_info; /*information on the limiting arbiter */
 	AiclkArb arbiter_max[aiclk_arb_max_count];
 	AiclkArb arbiter_min[aiclk_arb_min_count];
@@ -68,6 +69,9 @@ static AiclkPPM aiclk_ppm = {
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 
 static bool last_msg_busy;
+static bool power_slew_enabled;
+static bool power_slew_rise_valid;
+static uint32_t power_slew_last_rise_ms;
 
 static uint32_t final_arbiter_count[aiclk_arb_max_count];
 static uint32_t throttler_frozen_mask;
@@ -92,6 +96,47 @@ void EnableArbMin(enum aiclk_arb_min arb_min, bool enable)
 {
 	aiclk_ppm.arbiter_min[arb_min].enabled = enable;
 }
+
+static uint32_t ApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms)
+{
+	if (!power_slew_enabled || target_freq <= current_freq) {
+		return target_freq;
+	}
+
+	/* Synchronous host messages can invoke DVFS more than once in one tick.
+	 * Permit only one upward step per millisecond and never catch up after a
+	 * delayed pass. Downward movement remains immediate.
+	 */
+	if (power_slew_rise_valid && power_slew_last_rise_ms == now_ms) {
+		return current_freq;
+	}
+
+	power_slew_last_rise_ms = now_ms;
+	power_slew_rise_valid = true;
+	return MIN(target_freq, current_freq + AICLK_POWER_SLEW_UP_MHZ_PER_MS);
+}
+
+void SetAiclkPowerSlew(bool enable)
+{
+	if (power_slew_enabled != enable) {
+		power_slew_rise_valid = false;
+	}
+	power_slew_enabled = enable;
+}
+
+#if defined(CONFIG_ZTEST)
+uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms)
+{
+	return ApplyPowerSlew(current_freq, target_freq, now_ms);
+}
+
+void AiclkTestClearCharacterizationOverrides(void)
+{
+	aiclk_ppm.forced_freq = 0U;
+	aiclk_ppm.sweep_en = 0U;
+	aiclk_ppm.host_requested_fmin = 0U;
+}
+#endif
 
 void CalculateTargAiclk(void)
 {
@@ -139,6 +184,12 @@ void CalculateTargAiclk(void)
 	if (aiclk_ppm.host_requested_fmin > 0) {
 		effective_fmin_floor = MAX(effective_fmin_floor, aiclk_ppm.host_requested_fmin);
 	}
+	/* A characterization floor is a performance request, not permission to
+	 * override an active board-power maximum.
+	 */
+	if (ThrottlerStrictRuntimePowerLimitActive()) {
+		effective_fmin_floor = MIN(effective_fmin_floor, max_arb_freq);
+	}
 	if (aiclk_ppm.targ_freq < effective_fmin_floor) {
 		aiclk_ppm.targ_freq = effective_fmin_floor;
 		info.reason = limit_reason_fmin;
@@ -161,8 +212,30 @@ void CalculateTargAiclk(void)
 		info.arbiter = 0U;
 	}
 
+	/* Sweep/force controls are applied after normal arbitration. Reapply the
+	 * effective maximum while strict board-power control is active so every
+	 * workload remains bounded, including characterization software.
+	 */
+	if (ThrottlerStrictRuntimePowerLimitActive() && aiclk_ppm.targ_freq > max_arb_freq) {
+		aiclk_ppm.targ_freq = max_arb_freq;
+		info.reason = limit_reason_max_arb;
+		info.arbiter = max_arb;
+	}
+
 	if (aiclk_ppm.reset_safe && aiclk_ppm.targ_freq > AICLK_RESET_SAFE_FREQ) {
 		aiclk_ppm.targ_freq = AICLK_RESET_SAFE_FREQ;
+	}
+
+	aiclk_ppm.targ_freq =
+		ApplyPowerSlew(aiclk_ppm.curr_freq, aiclk_ppm.targ_freq, k_uptime_get_32());
+
+	/* A new DMC sample can assert the clamp after target calculation. Make the
+	 * final published value safe without resetting or gating any tile.
+	 */
+	if (ThrottlerRuntimePowerClampActive()) {
+		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
+		info.reason = limit_reason_max_arb;
+		info.arbiter = aiclk_arb_max_doppler_critical;
 	}
 
 	aiclk_ppm.lim_arb_info = info;
@@ -172,6 +245,9 @@ void CalculateTargAiclk(void)
 
 void DecreaseAiclk(void)
 {
+	if (ThrottlerRuntimePowerClampActive()) {
+		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
+	}
 	if (aiclk_ppm.targ_freq < aiclk_ppm.curr_freq) {
 		clock_control_set_rate(pll_dev_0,
 				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
@@ -183,6 +259,14 @@ void DecreaseAiclk(void)
 
 void IncreaseAiclk(void)
 {
+	/* Never commit an upward target calculated before an asynchronous sample
+	 * asserted the power clamp.
+	 */
+	if (ThrottlerRuntimePowerClampActive()) {
+		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
+		DecreaseAiclk();
+		return;
+	}
 	if (aiclk_ppm.targ_freq > aiclk_ppm.curr_freq) {
 		clock_control_set_rate(pll_dev_0,
 				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
@@ -253,6 +337,8 @@ static int InitAiclkPPM(void)
 	/* disable forcing of AICLK */
 	aiclk_ppm.forced_freq = 0;
 	aiclk_ppm.reset_safe = false;
+	power_slew_enabled = false;
+	power_slew_rise_valid = false;
 
 	/* disable AICLK sweep */
 	aiclk_ppm.sweep_en = 0;
