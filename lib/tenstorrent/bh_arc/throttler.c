@@ -25,6 +25,8 @@
 static uint32_t power_limit;
 static uint32_t max_board_power_limit;
 static bool strict_runtime_power_limit;
+static atomic_t runtime_power_controller_initialized;
+static atomic_t pending_max_board_power_limit;
 static atomic_t runtime_power_fast_clamp_active;
 static atomic_t runtime_power_sample_seen;
 static atomic_t runtime_power_sample_stale;
@@ -312,6 +314,35 @@ static void apply_board_power_limit(uint32_t new_power_limit)
 	UpdateTelemetryBoardPowerLimit(power_limit);
 }
 
+static void activate_default_board_power_limit(uint32_t board_power_limit)
+{
+	bool was_strict = strict_runtime_power_limit;
+
+	max_board_power_limit = board_power_limit;
+	strict_runtime_power_limit = true;
+	if (!was_strict) {
+		StartRuntimePowerSampleWatchdog(k_uptime_get_32());
+	}
+	apply_board_power_limit(max_board_power_limit);
+	/* Start low and use the bounded upward slew; this does not change Fmax. */
+	SetAiclkArbMax(throttler[kThrottlerDopplerSlow].arb_max, GetAiclkFmin());
+}
+
+static void complete_runtime_power_controller_init(void)
+{
+	uint32_t pending_limit;
+
+	/* Publish readiness before consuming the pending value. This ordering covers
+	 * both races with the DMC callback: a callback that observed not-ready has
+	 * already stored its value, while one that observes ready applies it itself.
+	 */
+	atomic_set(&runtime_power_controller_initialized, 1);
+	pending_limit = (uint32_t)atomic_get(&pending_max_board_power_limit);
+	if (pending_limit != 0U) {
+		activate_default_board_power_limit(pending_limit);
+	}
+}
+
 static uint32_t throttle_counter;
 static const uint32_t kKernelThrottleAddress = 0x10;
 static bool tensixes_enabled = true;
@@ -385,6 +416,7 @@ ZBUS_CHAN_ADD_OBS(tensix_state_chan, doppler_tensix_state_listener, 0);
 
 void InitThrottlers(void)
 {
+	atomic_clear(&runtime_power_controller_initialized);
 	strict_runtime_power_limit = false;
 	max_board_power_limit = 0U;
 	power_limit = 0U;
@@ -453,6 +485,8 @@ void InitThrottlers(void)
 
 	SetAiclkArbMax(aiclk_arb_max_doppler_critical, GetAiclkFmin());
 	EnableArbMax(aiclk_arb_max_doppler_critical, false); /* enabled when limit triggered */
+
+	complete_runtime_power_controller_init();
 }
 
 static void UpdateThrottler(ThrottlerId id, float value)
@@ -567,6 +601,8 @@ uint32_t ThrottlerGetDopplerSlowLimit(void)
 
 void ThrottlerTestResetRuntimePowerState(void)
 {
+	atomic_set(&runtime_power_controller_initialized, 1);
+	atomic_clear(&pending_max_board_power_limit);
 	strict_runtime_power_limit = false;
 	max_board_power_limit = 0U;
 	power_limit = 0U;
@@ -585,6 +621,16 @@ void ThrottlerTestResetRuntimePowerState(void)
 	EnableArbMax(aiclk_arb_max_doppler_critical, false);
 	kernel_nops_enabled = false;
 	SetAiclkPowerSlew(false);
+}
+
+void ThrottlerTestSetRuntimePowerControllerInitialized(bool initialized)
+{
+	atomic_set(&runtime_power_controller_initialized, initialized);
+}
+
+void ThrottlerTestCompleteRuntimePowerControllerInit(void)
+{
+	complete_runtime_power_controller_init();
 }
 
 void ThrottlerTestStartRuntimePowerSampleWatchdog(uint32_t now_ms)
@@ -831,7 +877,6 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 {
 	uint32_t firmware_power_limit;
 	uint32_t resolved_power_limit;
-	bool was_strict;
 
 	if (size != 2) {
 		return -1;
@@ -851,19 +896,13 @@ int32_t Dm2CmSetBoardPowerLimit(const uint8_t *data, uint8_t size)
 		return -1;
 	}
 
-	was_strict = strict_runtime_power_limit;
-	max_board_power_limit = resolved_power_limit;
-	/* A valid DMC/firmware maximum is the board's default safety policy. It
-	 * applies whether this board uses Doppler or the ordinary board-power PID.
+	/* DMC can publish this as soon as the SMBus target is registered, seven init
+	 * stages before InitDVFS initializes the throttlers. Retain it first; touching
+	 * the controller early would be lost when InitThrottlers resets its state.
 	 */
-	strict_runtime_power_limit = true;
-	if (strict_runtime_power_limit && !was_strict) {
-		StartRuntimePowerSampleWatchdog(k_uptime_get_32());
-	}
-	apply_board_power_limit(max_board_power_limit);
-	if (strict_runtime_power_limit) {
-		/* Start low and use the bounded upward slew; this does not change Fmax. */
-		SetAiclkArbMax(throttler[kThrottlerDopplerSlow].arb_max, GetAiclkFmin());
+	atomic_set(&pending_max_board_power_limit, resolved_power_limit);
+	if (atomic_get(&runtime_power_controller_initialized) != 0) {
+		activate_default_board_power_limit(resolved_power_limit);
 	}
 
 	return 0;

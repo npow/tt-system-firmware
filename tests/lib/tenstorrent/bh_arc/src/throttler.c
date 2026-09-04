@@ -104,6 +104,18 @@ ZTEST(throttler, test_dmc_default_enables_bounded_power_policy)
 	zassert_equal(ThrottlerGetDopplerSlowLimit(), 142);
 }
 
+ZTEST(throttler, test_dmc_default_received_before_controller_init_is_retained)
+{
+	ThrottlerTestSetRuntimePowerControllerInitialized(false);
+	set_dmc_board_power_limit(300);
+	zassert_false(ThrottlerStrictRuntimePowerLimitActive());
+
+	ThrottlerTestCompleteRuntimePowerControllerInit();
+	zassert_true(ThrottlerStrictRuntimePowerLimitActive());
+	zassert_equal(GetTelemetryTag(TAG_BOARD_POWER_LIMIT), 300);
+	zassert_equal(ThrottlerGetDopplerSlowLimit(), 285);
+}
+
 ZTEST(throttler, test_fast_clamp_retains_peak_and_releases_with_hysteresis)
 {
 	set_dmc_board_power_limit(300);

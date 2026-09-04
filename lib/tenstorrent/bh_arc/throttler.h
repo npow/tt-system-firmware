@@ -33,6 +33,8 @@ uint32_t ThrottlerGetDopplerT2PowerLimit(void);
 uint32_t ThrottlerGetDopplerT3PowerLimit(void);
 uint32_t ThrottlerGetDopplerSlowLimit(void);
 void ThrottlerTestResetRuntimePowerState(void);
+void ThrottlerTestSetRuntimePowerControllerInitialized(bool initialized);
+void ThrottlerTestCompleteRuntimePowerControllerInit(void);
 void ThrottlerTestStartRuntimePowerSampleWatchdog(uint32_t now_ms);
 void ThrottlerTestRecordInputPowerSampleAtPower(uint32_t now_ms, uint16_t input_power);
 uint16_t ThrottlerTestConsumeRuntimePowerPeak(void);
