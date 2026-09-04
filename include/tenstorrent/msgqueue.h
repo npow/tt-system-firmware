@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include <zephyr/sys/iterable_sections.h>
+#include <zephyr/sys/util.h>
 
 #define NUM_MSG_QUEUES         4
 #define MSG_QUEUE_SIZE         4
@@ -609,6 +610,7 @@ enum eth_reset_err {
 	ETH_RESET_ERR_CFG_LOOKUP = 6,
 	ETH_RESET_ERR_CFG_SIZE = 7,
 	ETH_RESET_ERR_CFG_LOAD = 8,
+	ETH_RESET_ERR_CLOCK = 9,
 };
 
 /** @brief Host request to trigger a chip reset
@@ -1104,19 +1106,32 @@ struct response {
 
 typedef uint8_t (*msgqueue_request_handler_t)(const union request *req, struct response *rsp);
 
+enum msgqueue_command_policy {
+	MSGQUEUE_COMMAND_UNSPECIFIED,
+	MSGQUEUE_COMMAND_DIAGNOSTIC,
+	MSGQUEUE_COMMAND_MUTATING,
+	MSGQUEUE_COMMAND_REQUEST_DEPENDENT,
+	MSGQUEUE_COMMAND_DENIED,
+};
+
 struct msgqueue_handler {
 	uint32_t msg_type;
 	msgqueue_request_handler_t handler;
+	enum msgqueue_command_policy policy;
 };
 
-#define REGISTER_MESSAGE(msg, func)                                                                \
+#define REGISTER_MESSAGE(msg, func, command_policy)                                                \
+	BUILD_ASSERT(command_policy != MSGQUEUE_COMMAND_UNSPECIFIED);                              \
 	const STRUCT_SECTION_ITERABLE(msgqueue_handler, registration_for_##msg) = {                \
 		.msg_type = msg,                                                                   \
 		.handler = func,                                                                   \
+		.policy = command_policy,                                                          \
 	}
 
 void process_message_queues(void);
-void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler);
+void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler,
+			       enum msgqueue_command_policy policy);
+enum msgqueue_command_policy msgqueue_get_command_policy(const union request *request);
 
 int msgqueue_request_push(uint32_t msgqueue_id, const union request *request);
 int msgqueue_request_pop(uint32_t msgqueue_id, union request *request);

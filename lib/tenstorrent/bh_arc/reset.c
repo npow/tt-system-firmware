@@ -77,9 +77,14 @@ bool is_cable_fault_mode(void)
 
 void bh_soft_reset_all_tensix(void)
 {
-	/* Broadcast to SOFT_RESET_0 of all Tensixes */
+	/*
+	 * Broadcast to SOFT_RESET_0 of all Tensixes.  This is a best-effort
+	 * cleanup operation: a strict write can block ARC forever if one tile is
+	 * stalled, taking PCIe management down with it.
+	 */
 	/* Harvesting is handled by broadcast disables of NocInit */
-	NOC2AXITensixBroadcastTlbSetup(kNocRing, kNocTlb, kSoftReset0Addr, kNoc2AxiOrderingStrict);
+	NOC2AXITensixBroadcastTlbSetup(kNocRing, kNocTlb, kSoftReset0Addr,
+				       kNoc2AxiOrderingPostedStrict);
 	NOC2AXIWrite32(kNocRing, kNocTlb, kSoftReset0Addr, kAllRiscSoftReset);
 }
 
@@ -187,112 +192,40 @@ SYS_INIT_APP(DeassertRiscvResets);
  */
 static __maybe_unused uint8_t ToggleTensixReset(const union request *req, struct response *rsp)
 {
-	/* Assert reset (active low) */
-	RESET_UNIT_TENSIX_RESET_reg_u tensix_reset = {.val = 0};
+	ARG_UNUSED(req);
+	ARG_UNUSED(rsp);
 
-	for (uint32_t i = 0; i < 8; i++) {
-		WriteReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + i * 4, tensix_reset.val);
-	}
-
-	/* Deassert reset */
-	tensix_reset.val = 0xffffffff;
-	for (uint32_t i = 0; i < 8; i++) {
-		WriteReg(RESET_UNIT_TENSIX_RESET_0_REG_ADDR + i * 4, tensix_reset.val);
-	}
-
-	return 0;
+	/* A tile reset destroys NOC endpoint state and requires REINIT_TENSIX,
+	 * whose remote reads can block ARC indefinitely on a stalled fabric.
+	 * Refuse the first half of that unsafe sequence rather than leaving the
+	 * card partially reset and management-unreachable.
+	 */
+	LOG_WRN("Rejecting unsafe runtime all-Tensix reset");
+	return 2;
 }
 
 #ifndef CONFIG_TT_SMC_RECOVERY
-REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_TENSIX_RESET, ToggleTensixReset);
+REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_TENSIX_RESET, ToggleTensixReset, MSGQUEUE_COMMAND_DENIED);
 #endif
 
 static __maybe_unused uint8_t ToggleSingleTensixReset(const union request *req,
 						      struct response *rsp)
 {
-	uint8_t noc_x = req->toggle_single_tensix_reset.noc_x;
-	uint8_t noc_y = req->toggle_single_tensix_reset.noc_y;
+	ARG_UNUSED(req);
+	ARG_UNUSED(rsp);
 
-	/* The host sends logical (post-translation) NOC coordinates.
-	 * Convert to physical (pre-translation) so NocToTensixPhysX/Y
-	 * can map them to the correct grid indices for the reset registers.
+	/* This path disables ARC translation before performing strict remote
+	 * tile reads. A stalled tile can therefore wedge ARC and also strand its
+	 * management routing. Keep it disabled until a bounded implementation is
+	 * available.
 	 */
-	uint8_t phys_x, phys_y;
-
-	NocLogicalToPhysical(noc_x, noc_y, &phys_x, &phys_y);
-
-	uint8_t tensix_col = NocToTensixPhysX(phys_x, 0);
-	uint8_t tensix_row = NocToTensixPhysY(phys_y, 0);
-
-	if (tensix_col >= NUM_TENSIX_X || tensix_row >= NUM_TENSIX_Y) {
-		rsp->data[0] = 1;
-		return 1;
-	}
-
-	uint8_t tensix_index = (NUM_TENSIX_Y * tensix_col) + tensix_row;
-	uint8_t reg_index = tensix_index / 32;
-	uint8_t bit_index = tensix_index % 32;
-
-	uint32_t tile_addr = RESET_UNIT_TENSIX_RESET_0_REG_ADDR + 4 * reg_index;
-	uint32_t risc_addr = RESET_UNIT_TENSIX_RISC_RESET_0_REG_ADDR + 4 * reg_index;
-
-	SetAiclkResetSafe(true);
-
-	/* RISC reset assert */
-	uint32_t risc_val = sys_read32(risc_addr);
-
-	sys_write32(risc_val & ~BIT(bit_index), risc_addr);
-
-	/* Tile reset assert */
-	uint32_t tensix_val = sys_read32(tile_addr);
-
-	sys_write32(tensix_val & ~BIT(bit_index), tile_addr);
-
-	/* Tile reset deassert */
-	sys_write32(tensix_val | BIT(bit_index), tile_addr);
-
-	/* The init functions use NOC2AXITlbSetup with
-	 * physical NOC coordinates; disable ARC translation first to
-	 * prevent double-translation.
-	 */
-	DisableArcNocTranslation();
-
-	NocInitSingleTile(phys_x, phys_y);
-	ProgramNocTranslationSingleTile(phys_x, phys_y);
-	EnableTensixCG(false, phys_x, phys_y);
-
-	/* RISC soft reset assert */
-	NOC2AXITlbSetup(kNocRing, kNocTlb, phys_x, phys_y, kSoftReset0Addr);
-	NOC2AXIWrite32(kNocRing, kNocTlb, kSoftReset0Addr, kAllRiscSoftReset);
-
-	RestoreArcNocTranslation();
-
-	/* RISC reset deassert */
-	sys_write32(risc_val | BIT(bit_index), risc_addr);
-
-	SetAiclkResetSafe(false);
-
-	tensix_inject_instruction(TENSIX_INSTRUCTION_UNPACR, 0, false, noc_x, noc_y);
-
-	/* NocInitSingleTile un-gates the tile clock.
-	 * If tensix was in low power, clock gate this tile.
-	 */
-	bool power_state;
-
-	bh_power_state_get(BH_POWER_DOMAIN_TENSIX, &power_state);
-	if (!power_state) {
-		/* ARC NOC translation has been restored above, so (like the
-		 * tensix_inject_instruction call) use the logical coordinates.
-		 */
-		SetSingleTileClockGate(noc_x, noc_y, true);
-	}
-
-	rsp->data[0] = 0;
-	return 0;
+	LOG_WRN("Rejecting unsafe runtime single-Tensix reset");
+	return 2;
 }
 
 #ifndef CONFIG_TT_SMC_RECOVERY
-REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_SINGLE_TENSIX_RESET, ToggleSingleTensixReset);
+REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_SINGLE_TENSIX_RESET, ToggleSingleTensixReset,
+		 MSGQUEUE_COMMAND_DENIED);
 #endif
 
 /**
@@ -304,20 +237,18 @@ REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_SINGLE_TENSIX_RESET, ToggleSingleTensixReset)
  */
 static __maybe_unused uint8_t ReinitTensix(const union request *req, struct response *rsp)
 {
-	ClearNocTranslation();
-	/* We technically don't have to re-program the entire NOC (only the Tensix NOC portions),
-	 * but it's simpler to reuse the same functions to re-program all of it.
-	 */
-	NocInit();
-	TensixInit();
-	if (bh_chip_info_feature_noc_translation_en()) {
-		InitNocTranslationFromHarvesting();
-	}
+	ARG_UNUSED(req);
+	ARG_UNUSED(rsp);
 
-	return 0;
+	/* NocInit performs strict remote reads from every tile after clearing
+	 * translation. One stalled endpoint can block ARC forever, so reject the
+	 * command instead of converting a workload failure into loss of the card.
+	 */
+	LOG_WRN("Rejecting unsafe runtime Tensix reinitialization");
+	return 2;
 }
 #ifndef CONFIG_TT_SMC_RECOVERY
-REGISTER_MESSAGE(TT_SMC_MSG_REINIT_TENSIX, ReinitTensix);
+REGISTER_MESSAGE(TT_SMC_MSG_REINIT_TENSIX, ReinitTensix, MSGQUEUE_COMMAND_DENIED);
 #endif
 
 static int DeassertTileResets(void)

@@ -32,12 +32,12 @@ enum VoltageCmdSource {
 
 uint32_t get_vcore(void);  /* returns voltage in mV. */
 uint32_t get_vcorem(void); /* returns voltage in mV. */
-void set_vcore(uint32_t voltage_in_mv);
-void set_vcorem(uint32_t voltage_in_mv);
-void set_gddr_vddr(PcbType board_type, uint32_t voltage_in_mv);
+uint32_t set_vcore(uint32_t voltage_in_mv);
+uint32_t set_vcorem(uint32_t voltage_in_mv);
+uint32_t set_gddr_vddr(PcbType board_type, uint32_t voltage_in_mv);
 float GetVcoreCurrent(void);
 float GetVcorePower(void);
-void SwitchVoutControl(enum VoltageCmdSource source);
+uint32_t SwitchVoutControl(enum VoltageCmdSource source);
 float GetGddrWestIoCurrent(void);
 float GetGddrEastIoCurrent(void);
 float GetGddrWestIoPower(void);

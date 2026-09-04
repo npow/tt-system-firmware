@@ -8,10 +8,6 @@
 #include <tenstorrent/msgqueue.h>
 #include "dw_apb_i2c.h"
 
-#define DATA_TOO_LARGE 0x01
-
-#define BYTE_GET(v, b) FIELD_GET(0xFFu << ((b) * 8), (v))
-
 /*
  * Response Buffer
  * |   | 0            | 1           | 2        | 3             |
@@ -47,28 +43,21 @@ static uint8_t i2c_message_handler(const union request *request, struct response
 	uint8_t I2C_mst_id = request->i2c_message.i2c_mst_id;
 	bool valid_id = IsValidI2CMasterId(I2C_mst_id);
 
+	ARG_UNUSED(response);
+
 	if (!valid_id) {
 		return !valid_id;
 	}
-	uint8_t I2C_slave_address = request->i2c_message.i2c_slave_address & 0x7F;
-	uint8_t num_write_bytes = request->i2c_message.num_write_bytes;
-	uint8_t num_read_bytes = request->i2c_message.num_read_bytes;
 
-	size_t remaining_write_size = sizeof(request->i2c_message.write_data);
-	size_t remaining_read_size = sizeof(response->data) - 1 * sizeof(response->data[0]);
-
-	if (num_write_bytes > remaining_write_size || num_read_bytes > remaining_read_size) {
-		return DATA_TOO_LARGE;
-	}
-
-	uint8_t *write_data_ptr = (uint8_t *)request->i2c_message.write_data;
-	uint8_t *read_data_ptr = (uint8_t *)&response->data[1];
-
-	I2CInit(I2CMst, I2C_slave_address, I2CStandardMode, I2C_mst_id);
-	uint32_t status = I2CTransaction(I2C_mst_id, write_data_ptr, num_write_bytes, read_data_ptr,
-					 num_read_bytes);
-
-	return status != 0;
+	/* Every Blackhole SMC I2C controller reaches a safety-critical function:
+	 * I2C0 is the live DMC telemetry target, I2C1 controls the PMBus regulators,
+	 * and I2C2 controls board power switches. A generic raw transaction can
+	 * therefore disable the power monitor or rails and bypass the DVFS/power
+	 * policy. Keep the message ABI visible, but reject it before any controller
+	 * or pad register is touched. Dedicated bounded messages provide the safe
+	 * runtime controls.
+	 */
+	return 1;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_I2C_MESSAGE, i2c_message_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_I2C_MESSAGE, i2c_message_handler, MSGQUEUE_COMMAND_DENIED);

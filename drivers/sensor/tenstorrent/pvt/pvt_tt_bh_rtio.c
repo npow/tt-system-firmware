@@ -122,19 +122,29 @@ typedef enum {
 static uint32_t selected_pd_delay_chain = 0xFF; /* Invalid initial value */
 static uint32_t new_delay_chain = 1;
 
-static void wait_sdif_ready(uint32_t status_reg_addr)
+static ReadStatus wait_sdif_ready(uint32_t status_reg_addr)
 {
 	pvt_cntl_sdif_status_reg_u sdif_status;
+	int64_t deadline = k_uptime_get() + SDIF_DONE_TIMEOUT_MS;
 
 	do {
 		sdif_status.val = sys_read32(status_reg_addr);
-	} while (sdif_status.f.sdif_busy == 1);
+		if (sdif_status.f.sdif_busy == 0) {
+			return ReadOk;
+		}
+	} while (k_uptime_get() <= deadline);
+
+	return SdifTimeout;
 }
 
-static void sdif_write(uint32_t status_reg_addr, uint32_t wr_data_reg_addr, uint32_t sdif_addr,
-		       uint32_t data)
+static ReadStatus sdif_write(uint32_t status_reg_addr, uint32_t wr_data_reg_addr,
+			     uint32_t sdif_addr, uint32_t data)
 {
-	wait_sdif_ready(status_reg_addr);
+	ReadStatus status = wait_sdif_ready(status_reg_addr);
+
+	if (status != ReadOk) {
+		return status;
+	}
 	pvt_cntl_sdif_reg_u sdif;
 
 	sdif.val = 0;
@@ -143,12 +153,14 @@ static void sdif_write(uint32_t status_reg_addr, uint32_t wr_data_reg_addr, uint
 	sdif.f.sdif_wrn = 1;
 	sdif.f.sdif_prog = 1;
 	sys_write32(sdif.val, wr_data_reg_addr);
+	return ReadOk;
 }
 
-static void select_delay_chain_and_start_pd_conv(uint32_t delay_chain)
+static ReadStatus select_delay_chain_and_start_pd_conv(uint32_t delay_chain)
 {
 	if (delay_chain != selected_pd_delay_chain) {
 		pd_ip_cfg0_u ip_cfg0;
+		ReadStatus status;
 
 		ip_cfg0.val = 0;
 		ip_cfg0.f.run_mode = 0; /* MODE_PD_CNV */
@@ -156,15 +168,23 @@ static void select_delay_chain_and_start_pd_conv(uint32_t delay_chain)
 		ip_cfg0.f.oscillator_select = delay_chain;
 		ip_cfg0.f.counter_gate = 0x3; /* W = 255 */
 
-		sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
-			   IP_CFG0_ADDR, ip_cfg0.val);
-		sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
-			   IP_CNTL_ADDR, 0x108);
+		status = sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR,
+				    PVT_CNTL_PD_CMN_SDIF_REG_ADDR, IP_CFG0_ADDR, ip_cfg0.val);
+		if (status != ReadOk) {
+			return status;
+		}
+		status = sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR,
+				    PVT_CNTL_PD_CMN_SDIF_REG_ADDR, IP_CNTL_ADDR, 0x108);
+		if (status != ReadOk) {
+			return status;
+		}
 
 		/* wait until delay chain takes effect */
 		k_usleep(250);
 		selected_pd_delay_chain = delay_chain;
 	}
+
+	return ReadOk;
 }
 
 typedef enum {
@@ -225,6 +245,9 @@ static ReadStatus read_ts(const struct device *dev, uint8_t chan, uint16_t *data
 	ReadStatus status = read_pvt_auto_mode(TS, chan, data, PVT_CNTL_TS_00_SDIF_DONE_REG_ADDR,
 					       PVT_CNTL_TS_00_SDIF_DATA_REG_ADDR);
 
+	if (status != ReadOk) {
+		return status;
+	}
 	*data -= pvt_cfg->therm_cali_delta[chan];
 	return status;
 }
@@ -235,10 +258,14 @@ static ReadStatus read_ts_avg(const struct device *dev, uint16_t *sum)
 
 	*sum = 0;
 	for (int i = 0; i < 8; i++) {
-		uint16_t data;
+		uint16_t data = 0;
+		ReadStatus status;
 
-		read_pvt_auto_mode(TS, i, &data, PVT_CNTL_TS_00_SDIF_DONE_REG_ADDR,
-				   PVT_CNTL_TS_00_SDIF_DATA_REG_ADDR);
+		status = read_pvt_auto_mode(TS, i, &data, PVT_CNTL_TS_00_SDIF_DONE_REG_ADDR,
+					    PVT_CNTL_TS_00_SDIF_DATA_REG_ADDR);
+		if (status != ReadOk) {
+			return status;
+		}
 
 		*sum += data - pvt_cfg->therm_cali_delta[i];
 	}
@@ -270,10 +297,28 @@ static ReadStatus read_vm(uint32_t id, uint16_t *data)
 
 static ReadStatus read_pd(uint32_t id, uint32_t delay_chain, uint16_t *data)
 {
-	select_delay_chain_and_start_pd_conv(delay_chain);
+	ReadStatus status = select_delay_chain_and_start_pd_conv(delay_chain);
+
+	if (status != ReadOk) {
+		return status;
+	}
 
 	return read_pvt_auto_mode(PD, id, data, PVT_CNTL_PD_00_SDIF_DONE_REG_ADDR,
 				  PVT_CNTL_PD_00_SDIF_DATA_REG_ADDR);
+}
+
+static int pvt_status_to_errno(ReadStatus status)
+{
+	switch (status) {
+	case ReadOk:
+		return 0;
+	case SdifTimeout:
+		return -ETIMEDOUT;
+	case SampleFault:
+	case IncorrectSampleType:
+	default:
+		return -EIO;
+	}
 }
 
 static void pvt_tt_bh_submit_sample(struct rtio_iodev_sqe *iodev_sqe)
@@ -345,7 +390,7 @@ static void pvt_tt_bh_submit_sample(struct rtio_iodev_sqe *iodev_sqe)
 
 		if (status != ReadOk) {
 			LOG_ERR("Failed to read data %d", status);
-			rtio_iodev_sqe_err(iodev_sqe, status);
+			rtio_iodev_sqe_err(iodev_sqe, pvt_status_to_errno(status));
 			return;
 		}
 	}
@@ -371,6 +416,11 @@ void pvt_tt_bh_submit(const struct device *sensor, struct rtio_iodev_sqe *sqe)
 
 	struct rtio_work_req *req = rtio_work_req_alloc();
 
+	if (req == NULL) {
+		LOG_ERR("PVT RTIO work pool exhausted");
+		rtio_iodev_sqe_err(sqe, -ENOMEM);
+		return;
+	}
 	rtio_work_req_submit(req, sqe, pvt_tt_bh_submit_sample);
 }
 

@@ -26,4 +26,4 @@ static uint8_t toggle_blinky_handler(const union request *request, struct respon
 	return 0;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_BLINKY, toggle_blinky_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_BLINKY, toggle_blinky_handler, MSGQUEUE_COMMAND_DENIED);

@@ -32,6 +32,8 @@ static struct k_timer fan_ctrl_update_timer;
 static struct k_work fan_ctrl_update_worker;
 static int fan_ctrl_update_interval = 1000;
 
+#define FAN_TELEMETRY_MAX_STALENESS_MS 2500U
+
 static uint16_t fan_rpm;   /* Fan RPM from tach */
 static uint32_t fan_speed; /* % */
 static bool fan_speed_forced;
@@ -94,11 +96,23 @@ STATIC uint32_t fan_curve(float max_asic_temp, float max_gddr_temp)
 static void update_fan_speed(void)
 {
 	TelemetryInternalData telemetry_internal_data;
+	bool telemetry_valid;
 
 	/* Telemetry & computations continue to run even when speed is forced so that they stay
 	 * up-to-date.
 	 */
 	ReadTelemetryInternal(1, &telemetry_internal_data);
+	telemetry_valid = ReadTelemetryInternalCached(FAN_TELEMETRY_MAX_STALENESS_MS,
+						      &telemetry_internal_data);
+	if (!telemetry_valid) {
+		max_asic_temp = 200.0f;
+		max_gddr_temp = 200.0f;
+		if (!fan_speed_forced) {
+			fan_speed = 100;
+			UpdateFanSpeedRequest(fan_speed);
+		}
+		return;
+	}
 	max_asic_temp =
 		alpha * telemetry_internal_data.asic_temperature + (1 - alpha) * max_asic_temp;
 
@@ -149,7 +163,14 @@ void init_fan_ctrl(void)
 	TelemetryInternalData telemetry_internal_data;
 
 	ReadTelemetryInternal(1, &telemetry_internal_data);
-	max_asic_temp = telemetry_internal_data.asic_temperature;
+	if (ReadTelemetryInternalCached(FAN_TELEMETRY_MAX_STALENESS_MS, &telemetry_internal_data)) {
+		max_asic_temp = telemetry_internal_data.asic_temperature;
+	} else {
+		max_asic_temp = 200.0f;
+		max_gddr_temp = 200.0f;
+		fan_speed = 100;
+		UpdateFanSpeedRequest(fan_speed);
+	}
 
 	/* start a periodic timer that expires once every fan_ctrl_update_interval */
 	k_timer_start(&fan_ctrl_update_timer, K_MSEC(fan_ctrl_update_interval),
@@ -180,7 +201,7 @@ static uint8_t force_fan_speed(const union request *request, struct response *re
 
 	return 0;
 }
-REGISTER_MESSAGE(TT_SMC_MSG_FORCE_FAN_SPEED, force_fan_speed);
+REGISTER_MESSAGE(TT_SMC_MSG_FORCE_FAN_SPEED, force_fan_speed, MSGQUEUE_COMMAND_DENIED);
 
 void DmcFanSpeedFeedback(uint32_t speed_percentage)
 {

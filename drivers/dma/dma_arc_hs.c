@@ -83,6 +83,13 @@ enum arc_dma_channel_state {
 
 struct arc_dma_channel {
 	enum arc_dma_channel_state state;
+	/*
+	 * The ARC DMA block has no documented way to abort an in-flight
+	 * transaction.  Once a synchronous transfer times out, do not reuse the
+	 * channel: a late completion could otherwise be mistaken for a new
+	 * transfer or write into a buffer that is no longer valid.
+	 */
+	bool poisoned;
 	dma_callback_t callback;
 	void *callback_arg;
 	struct dma_config config;
@@ -113,6 +120,8 @@ struct arc_dma_data {
 	struct arc_dma_channel *channels;
 	atomic_t channels_atomic[ARC_DMA_ATOMIC_WORDS];
 	struct k_spinlock lock;
+	/* Serializes the blocking helper and its shared descriptor array. */
+	struct k_mutex transfer_lock;
 	/* Static block array for splitting large transfers - sized by max descriptors */
 	struct dma_block_config *transfer_blocks;
 	/* Polling support - only used when interrupts are not available */
@@ -188,6 +197,7 @@ static int dma_arc_hs_config(const struct device *dev, uint32_t channel, struct 
 	const struct arc_dma_config *dev_config = dev->config;
 	struct arc_dma_data *data = dev->data;
 	struct arc_dma_channel *chan;
+	k_spinlock_key_t key;
 
 	if (channel >= dev_config->channels) {
 		LOG_ERR("Invalid channel %u", channel);
@@ -218,30 +228,36 @@ static int dma_arc_hs_config(const struct device *dev, uint32_t channel, struct 
 		return -EINVAL;
 	}
 
-	K_SPINLOCK(&data->lock) {
-		chan = &data->channels[channel];
+	key = k_spin_lock(&data->lock);
+	chan = &data->channels[channel];
 
-		/* Implicit channel allocation - allocate if not already allocated */
-		if (chan->state == ARC_DMA_FREE) {
-			/* Update atomic bitmap for consistency with DMA framework */
-			atomic_set_bit(data->channels_atomic, channel);
-			LOG_DBG("Implicitly allocated channel %u", channel);
-		} else {
-			LOG_DBG("Channel %u already allocated", channel);
-		}
-
-		chan->config = *config;
-		chan->callback = config->dma_callback;
-		chan->callback_arg = config->user_data;
-		chan->state = ARC_DMA_PREPARED;
-
-		/* Make a copy of the first block configuration */
-		if (config->head_block) {
-			chan->block_config = *config->head_block;
-			/* Update the config to point to our copy */
-			chan->config.head_block = &chan->block_config;
-		}
+	if (chan->poisoned) {
+		k_spin_unlock(&data->lock, key);
+		LOG_ERR("DMA channel %u is quarantined after a timeout", channel);
+		return -EIO;
 	}
+
+	/* Implicit channel allocation - allocate if not already allocated */
+	if (chan->state == ARC_DMA_FREE) {
+		/* Update atomic bitmap for consistency with DMA framework */
+		atomic_set_bit(data->channels_atomic, channel);
+		LOG_DBG("Implicitly allocated channel %u", channel);
+	} else {
+		LOG_DBG("Channel %u already allocated", channel);
+	}
+
+	chan->config = *config;
+	chan->callback = config->dma_callback;
+	chan->callback_arg = config->user_data;
+	chan->state = ARC_DMA_PREPARED;
+
+	/* Make a copy of the first block configuration */
+	if (config->head_block) {
+		chan->block_config = *config->head_block;
+		/* Update the config to point to our copy */
+		chan->config.head_block = &chan->block_config;
+	}
+	k_spin_unlock(&data->lock, key);
 
 	LOG_DBG("Configured channel %u", channel);
 	return 0;
@@ -268,6 +284,11 @@ static int dma_arc_hs_start(const struct device *dev, uint32_t channel)
 	/* Mark all channels in the linking chain as PREPARED, similar to dma_emul */
 	while (true) {
 		chan = &data->channels[current_channel];
+		if (chan->poisoned) {
+			LOG_ERR("DMA channel %u is quarantined after a timeout", current_channel);
+			k_spin_unlock(&data->lock, data_key);
+			return -EIO;
+		}
 
 		if (chan->state == ARC_DMA_FREE) {
 			LOG_ERR("Channel %u not allocated", current_channel);
@@ -558,6 +579,10 @@ static int dma_arc_hs_get_status(const struct device *dev, uint32_t channel,
 
 	data_key = k_spin_lock(&data->lock);
 	chan = &data->channels[channel];
+	if (chan->poisoned) {
+		k_spin_unlock(&data->lock, data_key);
+		return -EIO;
+	}
 
 	/* Check if channel is allocated */
 	if (chan->state == ARC_DMA_FREE) {
@@ -660,6 +685,13 @@ int dma_arc_hs_transfer(const struct device *dev, uint32_t channel, const void *
 		return -EINVAL;
 	}
 
+	/*
+	 * transfer_blocks is shared by this device, and every P150A user uses the
+	 * same single configured channel.  Keep configuration, start and polling
+	 * one indivisible synchronous operation.
+	 */
+	k_mutex_lock(&data->transfer_lock, K_FOREVER);
+
 	/* Use statically allocated transfer_blocks array (no malloc needed) */
 	struct dma_block_config *blocks = data->transfer_blocks;
 
@@ -693,20 +725,24 @@ int dma_arc_hs_transfer(const struct device *dev, uint32_t channel, const void *
 
 	rc = dma_config(dev, channel, &cfg);
 	if (rc < 0) {
-		return rc;
+		goto out;
 	}
 
 	rc = dma_start(dev, channel);
 	if (rc < 0) {
-		return rc;
+		goto out;
 	}
 
 	end_time = sys_timepoint_calc(timeout);
 
 	do {
-		if (dma_get_status(dev, channel, &stat) == 0 && !stat.busy) {
+		rc = dma_get_status(dev, channel, &stat);
+		if (rc == 0 && !stat.busy) {
 			dma_stop(dev, channel);
-			return 0;
+			goto out;
+		}
+		if (rc < 0) {
+			break;
 		}
 
 		/* Update timeout with remaining time */
@@ -718,9 +754,26 @@ int dma_arc_hs_transfer(const struct device *dev, uint32_t channel, const void *
 		}
 	} while (!K_TIMEOUT_EQ(timeout, K_NO_WAIT));
 
-	/* Timeout expired */
+	/*
+	 * Stopping only changes software state; the hardware request may still
+	 * complete.  Quarantine this channel for the rest of the boot before any
+	 * caller can configure another transfer on it.
+	 */
 	dma_stop(dev, channel);
-	return -ETIMEDOUT;
+	{
+		k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+		data->channels[channel].poisoned = true;
+		k_spin_unlock(&data->lock, key);
+	}
+	if (rc >= 0) {
+		rc = -ETIMEDOUT;
+	}
+	LOG_ERR("DMA channel %u quarantined after incomplete transfer: %d", channel, rc);
+
+out:
+	k_mutex_unlock(&data->transfer_lock);
+	return rc;
 }
 
 #if !DT_ALL_INST_HAS_PROP_STATUS_OKAY(interrupts)
@@ -933,9 +986,11 @@ static int dma_arc_hs_init(const struct device *dev)
 	data->dma_ctx.dma_channels = config->channels;
 	data->dma_ctx.atomic = data->channels_atomic;
 	memset(data->channels_atomic, 0, sizeof(data->channels_atomic));
+	k_mutex_init(&data->transfer_lock);
 
 	for (i = 0; i < config->channels; i++) {
 		data->channels[i].state = ARC_DMA_FREE;
+		data->channels[i].poisoned = false;
 		data->channels[i].callback = NULL;
 		data->channels[i].callback_arg = NULL;
 		data->channels[i].block_count = 0;

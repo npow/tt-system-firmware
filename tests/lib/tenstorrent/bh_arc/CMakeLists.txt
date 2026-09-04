@@ -11,7 +11,7 @@ target_include_directories(app PRIVATE ../../../../include)
 target_include_directories(app PRIVATE ../../../../lib/tenstorrent/bh_arc)
 
 # ───── Paths to inputs and tools ─────────────────────────────────────────
-set(TTSF_ROOT     "${ZEPHYR_BASE}/../tt-system-firmware")
+get_filename_component(TTSF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 set(PROTO_DIR     "${TTSF_ROOT}/drivers/misc/bh_fwtable/spirom_protobufs")
 set(TXT_DIR       "${TTSF_ROOT}/boards/tenstorrent/tt_blackhole/spirom_data_tables/P150B")
 set(ENC_SCRIPT    "${TTSF_ROOT}/scripts/encode_spirom_bins.py")

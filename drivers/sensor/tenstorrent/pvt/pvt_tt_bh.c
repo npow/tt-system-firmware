@@ -286,14 +286,24 @@ static inline void pvt_tt_bh_interrupt_config(void)
 	}
 }
 
-/* PVT clocks work in range of 4-8MHz and are derived from APB clock */
-/* target a PVT clock of 8 MHz */
-static inline void pvt_tt_bh_clock_config(void)
+/* PVT clocks work in range of 4-8MHz and are derived from APB clock. */
+/* Target a PVT clock of 8 MHz. */
+static int pvt_tt_bh_clock_config(void)
 {
 	uint32_t apb_clk = 0;
+	int ret;
 
-	clock_control_get_rate(pll_dev_1, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_APBCLK,
-			       &apb_clk);
+	if (pll_dev_1 == NULL || !device_is_ready(pll_dev_1)) {
+		LOG_ERR("APB PLL is unavailable");
+		return -ENODEV;
+	}
+
+	ret = clock_control_get_rate(
+		pll_dev_1, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_APBCLK, &apb_clk);
+	if (ret != 0 || apb_clk == 0U) {
+		LOG_ERR("Cannot determine APB clock for PVT: %d (%u MHz)", ret, apb_clk);
+		return ret != 0 ? ret : -EIO;
+	}
 	pvt_cntl_clk_synth_reg_u clk_synt;
 
 	clk_synt.val = PVT_CNTL_CLK_SYNTH_REG_DEFAULT;
@@ -307,6 +317,11 @@ static inline void pvt_tt_bh_clock_config(void)
 	const uint32_t target_clock_MHz = 8;
 	uint32_t half_cycle = DIV_ROUND_UP(apb_clk, 2 * target_clock_MHz);
 
+	if (half_cycle == 0U || half_cycle > UINT8_MAX + 1U) {
+		LOG_ERR("APB clock %u MHz gives invalid PVT divider %u", apb_clk, half_cycle);
+		return -ERANGE;
+	}
+
 	clk_synt.f.clk_synth_lo = half_cycle - 1;
 	clk_synt.f.clk_synth_hi = half_cycle - 1;
 	clk_synt.f.clk_synth_hold = 2;
@@ -314,21 +329,33 @@ static inline void pvt_tt_bh_clock_config(void)
 	sys_write32(clk_synt.val, PVT_CNTL_TS_CMN_CLK_SYNTH_REG_ADDR);
 	sys_write32(clk_synt.val, PVT_CNTL_PD_CMN_CLK_SYNTH_REG_ADDR);
 	sys_write32(clk_synt.val, PVT_CNTL_VM_CMN_CLK_SYNTH_REG_ADDR);
+
+	return 0;
 }
 
-static void wait_sdif_ready(uint32_t status_reg_addr)
+static int wait_sdif_ready(uint32_t status_reg_addr)
 {
 	pvt_cntl_sdif_status_reg_u sdif_status;
+	int64_t deadline = k_uptime_get() + 10;
 
 	do {
 		sdif_status.val = sys_read32(status_reg_addr);
-	} while (sdif_status.f.sdif_busy == 1);
+		if (sdif_status.f.sdif_busy == 0) {
+			return 0;
+		}
+	} while (k_uptime_get() <= deadline);
+
+	return -ETIMEDOUT;
 }
 
-static void sdif_write(uint32_t status_reg_addr, uint32_t wr_data_reg_addr, uint32_t sdif_addr,
-		       uint32_t data)
+static int sdif_write(uint32_t status_reg_addr, uint32_t wr_data_reg_addr, uint32_t sdif_addr,
+		      uint32_t data)
 {
-	wait_sdif_ready(status_reg_addr);
+	int ret = wait_sdif_ready(status_reg_addr);
+
+	if (ret != 0) {
+		return ret;
+	}
 	pvt_cntl_sdif_reg_u sdif;
 
 	sdif.val = PVT_CNTL_SDIF_REG_DEFAULT;
@@ -337,16 +364,17 @@ static void sdif_write(uint32_t status_reg_addr, uint32_t wr_data_reg_addr, uint
 	sdif.f.sdif_wrn = 1;
 	sdif.f.sdif_prog = 1;
 	sys_write32(sdif.val, wr_data_reg_addr);
+	return 0;
 }
 
-static void enable_aging_meas(void)
+static int enable_aging_meas(void)
 {
 	pd_ip_cfg0_u ip_cfg0;
 
 	ip_cfg0.val = 0;
 	ip_cfg0.f.oscillator_enable = ALL_AGING_OSC;
-	sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
-		   IP_CFG0_ADDR, ip_cfg0.val);
+	return sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
+			  IP_CFG0_ADDR, ip_cfg0.val);
 }
 
 int pvt_tt_bh_attr_get(const struct device *dev, enum sensor_channel chan,
@@ -443,37 +471,67 @@ static int pvt_tt_bh_init(const struct device *dev)
 		return ret;
 	}
 
-	/* Enable Process + Voltage + Thermal monitors */
+	/* Do not enable PVT monitors until the APB-derived clock is verified. */
+	ret = pvt_tt_bh_clock_config();
+	if (ret != 0) {
+		return ret;
+	}
 	pvt_tt_bh_interrupt_config();
-	pvt_tt_bh_clock_config();
 
 	/* Configure TS */
-	sdif_write(PVT_CNTL_TS_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_TS_CMN_SDIF_REG_ADDR, IP_TMR_ADDR,
-		   0x100); /* 256 cycles for TS */
+	ret = sdif_write(PVT_CNTL_TS_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_TS_CMN_SDIF_REG_ADDR,
+			 IP_TMR_ADDR, 0x100); /* 256 cycles for TS */
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* MODE_RUN_0, 8-bit resolution */
 	ts_ip_cfg0_u ts_ip_cfg0 = {.f.run_mode = 0, .f.resolution = 2};
 
-	sdif_write(PVT_CNTL_TS_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_TS_CMN_SDIF_REG_ADDR,
-		   IP_CFG0_ADDR, ts_ip_cfg0.val);
-	sdif_write(PVT_CNTL_TS_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_TS_CMN_SDIF_REG_ADDR,
-		   IP_CNTL_ADDR, 0x108); /* ip_run_cont */
+	ret = sdif_write(PVT_CNTL_TS_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_TS_CMN_SDIF_REG_ADDR,
+			 IP_CFG0_ADDR, ts_ip_cfg0.val);
+	if (ret != 0) {
+		return ret;
+	}
+	ret = sdif_write(PVT_CNTL_TS_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_TS_CMN_SDIF_REG_ADDR,
+			 IP_CNTL_ADDR, 0x108); /* ip_run_cont */
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* Configure PD */
-	sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR, IP_TMR_ADDR,
-		   0x0); /* 0 cycles for PD */
-	sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
-		   IP_CNTL_ADDR, 0x100); /* ip_auto to release reset and pd */
-	enable_aging_meas();
+	ret = sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
+			 IP_TMR_ADDR, 0x0); /* 0 cycles for PD */
+	if (ret != 0) {
+		return ret;
+	}
+	ret = sdif_write(PVT_CNTL_PD_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_PD_CMN_SDIF_REG_ADDR,
+			 IP_CNTL_ADDR, 0x100); /* ip_auto to release reset and pd */
+	if (ret != 0) {
+		return ret;
+	}
+	ret = enable_aging_meas();
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* Configure VM */
-	sdif_write(PVT_CNTL_VM_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_VM_CMN_SDIF_REG_ADDR, IP_TMR_ADDR,
-		   0x40); /* 64 cycles for VM */
-	sdif_write(PVT_CNTL_VM_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_VM_CMN_SDIF_REG_ADDR,
-		   IP_CFG0_ADDR,
-		   0x1000); /* use 14-bit resolution, MODE_RUN_0, select supply check */
-	sdif_write(PVT_CNTL_VM_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_VM_CMN_SDIF_REG_ADDR,
-		   IP_CNTL_ADDR, 0x108); /* ip_auto to release reset and pd */
+	ret = sdif_write(PVT_CNTL_VM_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_VM_CMN_SDIF_REG_ADDR,
+			 IP_TMR_ADDR, 0x40); /* 64 cycles for VM */
+	if (ret != 0) {
+		return ret;
+	}
+	ret = sdif_write(PVT_CNTL_VM_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_VM_CMN_SDIF_REG_ADDR,
+			 IP_CFG0_ADDR,
+			 0x1000); /* use 14-bit resolution, MODE_RUN_0, select supply check */
+	if (ret != 0) {
+		return ret;
+	}
+	ret = sdif_write(PVT_CNTL_VM_CMN_SDIF_STATUS_REG_ADDR, PVT_CNTL_VM_CMN_SDIF_REG_ADDR,
+			 IP_CNTL_ADDR, 0x108); /* ip_auto to release reset and pd */
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* Wait for all sensors to power up, TS takes 256 ip_clk cycles */
 	k_usleep(100);

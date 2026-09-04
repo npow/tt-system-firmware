@@ -149,24 +149,52 @@ int bh_chip_write_logs(struct bh_chip *chip, char *log_data, size_t log_size)
 	return ret;
 }
 
-void bh_chip_assert_asic_reset(const struct bh_chip *chip)
+int bh_chip_assert_asic_reset(const struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.asic_reset, 1);
+	return gpio_pin_set_dt(&chip->config.asic_reset, 1);
 }
 
-void bh_chip_deassert_asic_reset(const struct bh_chip *chip)
+int bh_chip_deassert_asic_reset(const struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.asic_reset, 0);
+	return gpio_pin_set_dt(&chip->config.asic_reset, 0);
 }
 
-void bh_chip_assert_spi_reset(const struct bh_chip *chip)
+int bh_chip_hold_asic_reset_for_recovery(struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.spi_reset, 1);
+	int ret = bh_chip_assert_asic_reset(chip);
+
+	chip->data.pgood_recovery_pending = true;
+	bh_chip_queue_reset(chip, BH_CHIP_RESET_FULL);
+	return ret;
 }
 
-void bh_chip_deassert_spi_reset(const struct bh_chip *chip)
+int bh_chip_deassert_asic_reset_if_pgood(struct bh_chip *chip)
 {
-	gpio_pin_set_dt(&chip->config.spi_reset, 0);
+	int pgood = gpio_pin_get_dt(&chip->config.pgood);
+
+	if (pgood <= 0) {
+		/* A low rail, or an unreadable PGOOD input, must fail closed. Keep the
+		 * ASIC in reset and make the stable-rise recovery request durable.
+		 */
+		int reset_ret = bh_chip_hold_asic_reset_for_recovery(chip);
+
+		if (pgood < 0) {
+			return pgood;
+		}
+		return reset_ret != 0 ? reset_ret : -EAGAIN;
+	}
+
+	return bh_chip_deassert_asic_reset(chip);
+}
+
+int bh_chip_assert_spi_reset(const struct bh_chip *chip)
+{
+	return gpio_pin_set_dt(&chip->config.spi_reset, 1);
+}
+
+int bh_chip_deassert_spi_reset(const struct bh_chip *chip)
+{
+	return gpio_pin_set_dt(&chip->config.spi_reset, 0);
 }
 
 int bh_chip_reset_chip(struct bh_chip *chip, bool force_reset)
@@ -187,6 +215,48 @@ int bh_chip_reset_chip(struct bh_chip *chip, bool force_reset)
 		return ret;
 	}
 	return ret2;
+}
+
+void bh_chip_queue_reset(struct bh_chip *chip, enum bh_chip_reset_type reset_type)
+{
+	if (reset_type == BH_CHIP_RESET_NONE) {
+		return;
+	}
+
+	/* A full recovery subsumes a PERST-only recovery. A new request is urgent even
+	 * when an older failed request is waiting in its retry backoff.
+	 */
+	if (reset_type > chip->data.pending_reset_type) {
+		chip->data.pending_reset_type = reset_type;
+	}
+	chip->data.reset_retry_at_ms = k_uptime_get_32();
+	if (chip->data.reset_retry_delay_ms == 0U) {
+		chip->data.reset_retry_delay_ms = BH_CHIP_RESET_RETRY_INITIAL_MS;
+	}
+}
+
+bool bh_chip_reset_due(const struct bh_chip *chip, uint32_t now_ms)
+{
+	return chip->data.pending_reset_type != BH_CHIP_RESET_NONE &&
+	       (int32_t)(now_ms - chip->data.reset_retry_at_ms) >= 0;
+}
+
+void bh_chip_reset_complete(struct bh_chip *chip)
+{
+	chip->data.pending_reset_type = BH_CHIP_RESET_NONE;
+	chip->data.reset_retry_at_ms = 0U;
+	chip->data.reset_retry_delay_ms = BH_CHIP_RESET_RETRY_INITIAL_MS;
+}
+
+void bh_chip_reset_retry(struct bh_chip *chip, uint32_t now_ms)
+{
+	uint32_t delay_ms = chip->data.reset_retry_delay_ms;
+
+	if (delay_ms == 0U) {
+		delay_ms = BH_CHIP_RESET_RETRY_INITIAL_MS;
+	}
+	chip->data.reset_retry_at_ms = now_ms + delay_ms;
+	chip->data.reset_retry_delay_ms = MIN(delay_ms * 2U, BH_CHIP_RESET_RETRY_MAX_MS);
 }
 
 void therm_trip_detected(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
@@ -226,12 +296,21 @@ int therm_trip_gpio_setup(struct bh_chip *chip)
 void pgood_change_detected(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	struct bh_chip *chip = CONTAINER_OF(cb, struct bh_chip, pgood_cb);
+	int pgood;
 
 	/* Sample PGOOD to see if it rose or fell */
 	/* TODO: could setup rising interrupt only after falling triggered */
-	if (gpio_pin_get_dt(&chip->config.pgood)) {
+	pgood = gpio_pin_get_dt(&chip->config.pgood);
+	if (pgood > 0) {
 		chip->data.pgood_rise_triggered = true;
 	} else {
+		if (pgood < 0) {
+			LOG_ERR("Failed to read PGOOD after edge: %d; treating as a fall", pgood);
+			/* Also poll for recovery: a read error may not produce another GPIO
+			 * edge when the input becomes readable again.
+			 */
+			chip->data.pgood_rise_triggered = true;
+		}
 		chip->data.pgood_fall_triggered = true;
 	}
 	tt_event_post(TT_EVENT_PGOOD);
@@ -263,33 +342,35 @@ int pgood_gpio_setup(struct bh_chip *chip)
 
 void handle_pgood_event(struct bh_chip *chip, struct gpio_dt_spec board_fault_led)
 {
-	if (chip->data.pgood_fall_triggered && !chip->data.pgood_severe_fault) {
+	if (chip->data.pgood_fall_triggered) {
 		int64_t current_uptime_ms = k_uptime_get();
 		/* Assert board fault */
-		gpio_pin_set_dt(&board_fault_led, 1);
+		if (board_fault_led.port != NULL) {
+			gpio_pin_set_dt(&board_fault_led, 1);
+		}
 		/* Report over SMBus - to add later */
-		/* Assert ASIC reset */
-		bh_chip_assert_asic_reset(chip);
+		/* Keep the ASIC in reset until PGOOD rises and recovery succeeds. */
+		int ret = bh_chip_hold_asic_reset_for_recovery(chip);
+
+		if (ret != 0) {
+			LOG_ERR("Failed to assert ASIC reset after PGOOD fell: %d", ret);
+		}
 		/* If pgood went down again within 1 second */
 		if (chip->data.pgood_last_trip_ms != 0 &&
 		    current_uptime_ms - chip->data.pgood_last_trip_ms < 1000) {
-			/* Assert more severe fault over IPMI - to add later */
+			/* Preserve this as a diagnostic latch, not a recovery inhibit. */
 			chip->data.pgood_severe_fault = true;
 		}
 		chip->data.pgood_last_trip_ms = current_uptime_ms;
 		chip->data.pgood_fall_triggered = false;
 	}
-	if (chip->data.pgood_rise_triggered && !chip->data.pgood_severe_fault) {
-		/* Follow out of reset procedure */
-		bh_chip_reset_chip(chip, true);
-		/*
-		 * Ensure the board fault led will not be deasserted post powercycle during
-		 * assembly test
+	if (chip->data.pgood_rise_triggered) {
+		/* A severe/repeated trip remains visible diagnostically, but must never
+		 * suppress recovery once PGOOD is high. The DMC retry loop verifies that
+		 * PGOOD remains high and clears the fault LED only after reset succeeds.
 		 */
-		if (!IS_ENABLED(CONFIG_TT_ASSEMBLY_TEST)) {
-			/* Clear board fault */
-			gpio_pin_set_dt(&board_fault_led, 0);
-		}
+		chip->data.pgood_recovery_pending = true;
+		bh_chip_queue_reset(chip, BH_CHIP_RESET_FULL);
 		chip->data.pgood_rise_triggered = false;
 	}
 }

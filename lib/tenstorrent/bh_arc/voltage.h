@@ -6,6 +6,7 @@
 #ifndef VOLTAGE_H
 #define VOLTAGE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef enum {
@@ -25,7 +26,7 @@ typedef struct {
 
 extern VoltageArbiter voltage_arbiter;
 
-void VoltageChange(void);
+bool VoltageChange(void);
 void VoltageArbRequest(VoltageRequestor req, uint32_t voltage);
 void CalculateTargVoltage(void);
 int InitVoltagePPM(void);

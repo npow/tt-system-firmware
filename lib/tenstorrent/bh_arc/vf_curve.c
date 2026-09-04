@@ -143,5 +143,7 @@ static uint8_t get_freq_curve_from_voltage_handler(const union request *request,
 	return 0;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_GET_VOLTAGE_CURVE_FROM_FREQ, get_voltage_curve_from_freq_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_GET_FREQ_CURVE_FROM_VOLTAGE, get_freq_curve_from_voltage_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_GET_VOLTAGE_CURVE_FROM_FREQ, get_voltage_curve_from_freq_handler,
+		 MSGQUEUE_COMMAND_DIAGNOSTIC);
+REGISTER_MESSAGE(TT_SMC_MSG_GET_FREQ_CURVE_FROM_VOLTAGE, get_freq_curve_from_voltage_handler,
+		 MSGQUEUE_COMMAND_DIAGNOSTIC);

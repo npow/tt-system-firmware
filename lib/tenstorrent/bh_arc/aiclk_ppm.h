@@ -84,18 +84,19 @@ union aiclk_targ_freq_info {
 };
 
 void aiclk_update_busy(void);
+void aiclk_update_busy_locked(void);
 void SetAiclkPowerSlew(bool enable);
 void SetAiclkArbMax(enum aiclk_arb_max arb_max, float freq);
 void SetAiclkArbMin(enum aiclk_arb_min arb_min, float freq);
 void EnableArbMax(enum aiclk_arb_max arb_max, bool enable);
 void EnableArbMin(enum aiclk_arb_min arb_min, bool enable);
 void CalculateTargAiclk(void);
-void DecreaseAiclk(void);
-void IncreaseAiclk(void);
+bool DecreaseAiclk(void);
+bool IncreaseAiclk(void);
 void InitArbMaxVoltage(void);
 float GetThrottlerArbMax(enum aiclk_arb_max arb_max);
 uint8_t ForceAiclk(uint32_t freq);
-void SetAiclkResetSafe(bool enable);
+bool SetAiclkResetSafe(bool enable);
 uint32_t GetAiclkTarg(void);
 uint32_t GetMaxAiclkForVoltage(uint32_t voltage);
 uint32_t GetAiclkFmin(void);
@@ -113,6 +114,7 @@ uint8_t throttler_counter_handler(const union request *request, struct response 
 #if defined(CONFIG_ZTEST)
 uint32_t AiclkTestApplyPowerSlew(uint32_t current_freq, uint32_t target_freq, uint32_t now_ms);
 void AiclkTestClearCharacterizationOverrides(void);
+void AiclkTestFailDvfsControlChange(bool fail);
 #endif
 
 #endif

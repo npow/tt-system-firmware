@@ -75,5 +75,5 @@ AsicState get_asic_state(void)
 	return asic_state;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_ASIC_STATE0, asic_state_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_ASIC_STATE3, asic_state_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_ASIC_STATE0, asic_state_handler, MSGQUEUE_COMMAND_MUTATING);
+REGISTER_MESSAGE(TT_SMC_MSG_ASIC_STATE3, asic_state_handler, MSGQUEUE_COMMAND_MUTATING);

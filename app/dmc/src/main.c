@@ -101,8 +101,7 @@ static bool process_reset_req(struct bh_chip *chip, uint8_t msg_id, uint32_t msg
 	switch (msg_data) {
 	case kCm2DmResetLevelAsic:
 		LOG_INF("Received ARC reset request");
-		bh_chip_cancel_bus_transfer_clear(chip);
-		bh_chip_reset_chip(chip, true);
+		bh_chip_queue_reset(chip, BH_CHIP_RESET_FULL);
 		break;
 
 	case kCm2DmResetLevelDmc:
@@ -295,13 +294,17 @@ void ina228_power_update(void)
 
 	if (sensor_sample_fetch_chan(ina228, SENSOR_CHAN_POWER) != 0 ||
 	    sensor_channel_get(ina228, SENSOR_CHAN_POWER, &sensor_val) != 0 ||
-	    sensor_val.val1 < 0 || sensor_val.val1 > UINT16_MAX) {
+	    sensor_val.val1 < 0 || sensor_val.val1 > UINT16_MAX || sensor_val.val2 < 0 ||
+	    sensor_val.val2 >= 1000000) {
 		/* Do not refresh SMC's power sample on a failed or invalid read. */
 		return;
 	}
 
-	/* Only use integer part of sensor value */
-	uint16_t power = (uint16_t)sensor_val.val1;
+	/* Enforce against the full sensor reading: a positive fraction rounds up,
+	 * while the maximum representable watt value saturates safely.
+	 */
+	uint16_t power = (uint16_t)MIN((uint32_t)sensor_val.val1 + (sensor_val.val2 > 0),
+				       (uint32_t)UINT16_MAX);
 
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		bh_chip_set_input_power(chip, power);
@@ -431,28 +434,8 @@ static void handle_therm_trip(void)
 				pwm_set_cycles(max6639_pwm_dev, 0, UINT8_MAX, UINT8_MAX, 0);
 			}
 
-			/* Prioritize the system rebooting over the therm trip handler */
-			if (!atomic_get(&chip->data.trigger_reset)) {
-				/* Technically trigger_reset could have been set here but I
-				 * think I'm happy to eat the non-enum in that case
-				 */
-				chip->data.performing_reset = true;
-				/* Set the bus cancel following the logic of
-				 * (reset_triggered && !performing_reset)
-				 */
-				bh_chip_cancel_bus_transfer_clear(chip);
-
-				chip->data.therm_trip_count++;
-				bh_chip_reset_chip(chip, true);
-
-				/* Set the bus cancel following the logic of
-				 * (reset_triggered && !performing_reset)
-				 */
-				if (atomic_get(&chip->data.trigger_reset)) {
-					bh_chip_cancel_bus_transfer_set(chip);
-				}
-				chip->data.performing_reset = false;
-			}
+			chip->data.therm_trip_count++;
+			bh_chip_queue_reset(chip, BH_CHIP_RESET_FULL);
 		}
 	}
 }
@@ -461,14 +444,27 @@ static void handle_watchdog_reset(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		if (chip->data.arc_wdog_triggered) {
+			int ret;
+			int teardown_ret;
+
 			chip->data.arc_wdog_triggered = false;
 			bh_chip_cancel_bus_transfer_clear(chip);
 			/* Read PC from ARC and record it */
-			jtag_setup(chip->config.jtag);
-			jtag_reset(chip->config.jtag);
-			jtag_axi_read32(chip->config.jtag, RESET_UNIT_ARC_PC_CORE_0,
-					&chip->data.arc_hang_pc);
-			jtag_teardown(chip->config.jtag);
+			ret = jtag_setup(chip->config.jtag);
+			if (ret == 0) {
+				ret = jtag_reset(chip->config.jtag);
+			}
+			if (ret == 0) {
+				ret = jtag_axi_read32(chip->config.jtag, RESET_UNIT_ARC_PC_CORE_0,
+						      &chip->data.arc_hang_pc);
+			}
+			teardown_ret = jtag_teardown(chip->config.jtag);
+			if (ret == 0) {
+				ret = teardown_ret;
+			}
+			if (ret != 0) {
+				LOG_WRN("Failed to capture ARC PC after watchdog: %d", ret);
+			}
 			/* Clear watchdog state */
 			chip->data.auto_reset_timeout = 0;
 
@@ -480,12 +476,7 @@ static void handle_watchdog_reset(void)
 				pwm_set_cycles(max6639_pwm_dev, 0, UINT8_MAX, UINT8_MAX, 0);
 			}
 
-			chip->data.performing_reset = true;
-			bh_chip_reset_chip(chip, true);
-			/* Clear bus transfer cancel flag */
-			bh_chip_cancel_bus_transfer_clear(chip);
-
-			chip->data.performing_reset = false;
+			bh_chip_queue_reset(chip, BH_CHIP_RESET_FULL);
 		}
 	}
 }
@@ -494,31 +485,8 @@ static void handle_perst(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		if (atomic_set(&chip->data.trigger_reset, false)) {
-			chip->data.performing_reset = true;
 			chip->data.last_cm2dm_seq_num_valid = false;
-			/*
-			 * Set the bus cancel following the logic of (reset_triggered &&
-			 * !performing_reset)
-			 */
-			bh_chip_cancel_bus_transfer_clear(chip);
-
-			bharc_disable_i2cbus(&chip->config.arc);
-			jtag_bootrom_reset_asic(chip);
-			jtag_bootrom_set_cable_power_limit(chip, chip->data.cable_power_limit);
-			jtag_bootrom_soft_reset_arc(chip);
-			jtag_bootrom_teardown(chip);
-			bharc_enable_i2cbus(&chip->config.arc);
-
-			/*
-			 * Set the bus cancel following the logic of (reset_triggered &&
-			 * !performing_reset)
-			 */
-			if (atomic_get(&chip->data.trigger_reset)) {
-				bh_chip_cancel_bus_transfer_set(chip);
-			}
-			chip->data.therm_trip_count = 0;
-			chip->data.arc_hang_pc = 0;
-			chip->data.performing_reset = false;
+			bh_chip_queue_reset(chip, BH_CHIP_RESET_PERST);
 		}
 	}
 }
@@ -527,6 +495,146 @@ static void handle_pgood_change(void)
 {
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
 		handle_pgood_event(chip, board_fault_led);
+	}
+}
+
+static int perform_perst_reset(struct bh_chip *chip)
+{
+	bool jtag_attempted = false;
+	bool jtag_ready = false;
+	int cleanup_ret;
+	int ret;
+
+	ret = bharc_disable_i2cbus(&chip->config.arc);
+	if (ret != 0) {
+		goto enable_i2c;
+	}
+
+	jtag_attempted = true;
+	ret = jtag_bootrom_reset_asic(chip);
+	if (ret != 0) {
+		goto enable_i2c;
+	}
+	jtag_ready = true;
+
+	ret = jtag_bootrom_set_cable_power_limit(chip, chip->data.cable_power_limit);
+	if (ret == 0) {
+		ret = jtag_bootrom_soft_reset_arc(chip);
+	}
+
+	if (jtag_ready) {
+		cleanup_ret = jtag_bootrom_teardown(chip);
+		if (ret == 0) {
+			ret = cleanup_ret;
+		}
+	}
+enable_i2c:
+	cleanup_ret = bharc_enable_i2cbus(&chip->config.arc);
+	if (ret == 0) {
+		ret = cleanup_ret;
+	}
+	if (ret != 0 && jtag_attempted) {
+		cleanup_ret = bh_chip_deassert_spi_reset(chip);
+		if (cleanup_ret != 0) {
+			LOG_ERR("Failed to deassert SPI reset after PERST error: %d", cleanup_ret);
+		}
+		cleanup_ret = bh_chip_deassert_asic_reset_if_pgood(chip);
+		if (cleanup_ret != 0 && cleanup_ret != -EAGAIN) {
+			LOG_ERR("Failed to restore ASIC reset after PERST error: %d", cleanup_ret);
+		}
+	}
+
+	return ret;
+}
+
+static void handle_pending_resets(void)
+{
+	ARRAY_FOR_EACH_BH_CHIP(chip) {
+		uint32_t now_ms = k_uptime_get_32();
+		int pgood;
+		int ret;
+
+		if (!bh_chip_reset_due(chip, now_ms)) {
+			continue;
+		}
+
+		/* Do not enter the JTAG sequence while its rail is known to be down.
+		 * A later PGOOD rise makes the queued request immediately eligible again.
+		 */
+		pgood = gpio_pin_get_dt(&chip->config.pgood);
+		if (pgood <= 0) {
+			int reset_ret = bh_chip_hold_asic_reset_for_recovery(chip);
+
+			if (pgood < 0) {
+				LOG_ERR("Failed to read PGOOD before reset: %d", pgood);
+			}
+			if (reset_ret != 0) {
+				LOG_ERR("Failed to retain ASIC reset while PGOOD was unavailable: "
+					"%d",
+					reset_ret);
+			}
+			bh_chip_reset_retry(chip, now_ms);
+			continue;
+		}
+
+		enum bh_chip_reset_type reset_type = chip->data.pending_reset_type;
+
+		chip->data.performing_reset = true;
+		chip->data.last_cm2dm_seq_num_valid = false;
+		bh_chip_cancel_bus_transfer_clear(chip);
+
+		if (reset_type == BH_CHIP_RESET_PERST) {
+			ret = perform_perst_reset(chip);
+		} else {
+			ret = bh_chip_reset_chip(chip, true);
+		}
+		if (ret == 0) {
+			/* A fall during the reset sequence must not be reported as recovery.
+			 * Reassert reset immediately and retain the request for a stable rise.
+			 */
+			pgood = gpio_pin_get_dt(&chip->config.pgood);
+			if (pgood <= 0) {
+				int reset_ret = bh_chip_hold_asic_reset_for_recovery(chip);
+
+				if (reset_ret != 0) {
+					LOG_ERR("Failed to reassert ASIC reset after unstable "
+						"PGOOD: %d",
+						reset_ret);
+				}
+				ret = pgood < 0 ? pgood : -EAGAIN;
+			}
+		}
+
+		if (ret == 0) {
+			bh_chip_reset_complete(chip);
+			if (reset_type == BH_CHIP_RESET_PERST) {
+				chip->data.therm_trip_count = 0;
+				chip->data.arc_hang_pc = 0;
+			}
+
+			/* Clear the visual fault only after a stable-high PGOOD reset succeeds.
+			 * The severe-fault bit intentionally stays latched for diagnostics.
+			 */
+			pgood = gpio_pin_get_dt(&chip->config.pgood);
+			if (chip->data.pgood_recovery_pending && pgood > 0) {
+				chip->data.pgood_recovery_pending = false;
+				if (!IS_ENABLED(CONFIG_TT_ASSEMBLY_TEST) &&
+				    board_fault_led.port != NULL) {
+					gpio_pin_set_dt(&board_fault_led, 0);
+				}
+			}
+		} else {
+			LOG_ERR("Chip reset failed (%d); retaining request for retry", ret);
+			bh_chip_reset_retry(chip, k_uptime_get_32());
+		}
+
+		chip->data.performing_reset = false;
+		if (chip->data.pending_reset_type != BH_CHIP_RESET_NONE ||
+		    atomic_get(&chip->data.trigger_reset)) {
+			bh_chip_cancel_bus_transfer_set(chip);
+		} else {
+			bh_chip_cancel_bus_transfer_clear(chip);
+		}
 	}
 }
 
@@ -610,6 +718,7 @@ static K_TIMER_DEFINE(board_power_update_timer, board_power_update_expired, NULL
 
 int main(void)
 {
+	bool bootrom_ready = true;
 	int ret;
 	int bist_rc;
 
@@ -676,20 +785,22 @@ int main(void)
 				return ret;
 			}
 
-			bharc_disable_i2cbus(&chip->config.arc);
-
 			/* Store power limit for use in runtime resets */
 			chip->data.cable_power_limit = max_power;
-			ret = jtag_bootrom_reset_sequence(chip, false, max_power);
-			/* Always enable I2C bus */
-			bharc_enable_i2cbus(&chip->config.arc);
+			ret = bh_chip_reset_chip(chip, false);
 			if (ret != 0) {
-				LOG_ERR("%s() failed: %d", "jtag_bootrom_reset", ret);
-				return ret;
+				/* Keep DMC alive so the bounded retry loop can recover the ASIC
+				 * without requiring a host or board power cycle.
+				 */
+				LOG_ERR("Initial chip reset failed: %d; scheduling retry", ret);
+				bootrom_ready = false;
+				bh_chip_queue_reset(chip, BH_CHIP_RESET_FULL);
 			}
 		}
 
-		LOG_DBG("Bootrom workaround successfully applied");
+		if (bootrom_ready) {
+			LOG_DBG("Bootrom workaround successfully applied");
+		}
 	}
 
 	ARRAY_FOR_EACH_BH_CHIP(chip) {
@@ -720,6 +831,8 @@ int main(void)
 		handle_perst();
 
 		handle_pgood_change();
+
+		handle_pending_resets();
 
 		/* send_init_data only triggers once per chip (per reset). */
 		send_init_data();

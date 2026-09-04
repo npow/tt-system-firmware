@@ -256,13 +256,12 @@ static void CntlInitV2ParamInit(uint8_t pcie_inst, uint64_t board_id, uint32_t v
 static void InitResetInterrupt(uint8_t pcie_inst)
 {
 #if CONFIG_ARC
-	if (pcie_inst == 0) {
-		IRQ_CONNECT(IRQNUM_PCIE0_ERR_INTR, 0, ChipResetRequest, IRQNUM_PCIE0_ERR_INTR, 0);
-		irq_enable(IRQNUM_PCIE0_ERR_INTR);
-	} else if (pcie_inst == 1) {
-		IRQ_CONNECT(IRQNUM_PCIE1_ERR_INTR, 0, ChipResetRequest, IRQNUM_PCIE1_ERR_INTR, 0);
-		irq_enable(IRQNUM_PCIE1_ERR_INTR);
-	}
+	/* Do not turn an internal PCIe-controller error IRQ into an automatic
+	 * ASIC reset while the host may have in-flight MMIO/DMA. On Odin this
+	 * can surface as a root-port completion timeout and host-firmware reset.
+	 * Recovery must be initiated by host AER/DPC or an explicit reset request.
+	 */
+	ARG_UNUSED(pcie_inst);
 #else
 	ARG_UNUSED(pcie_inst);
 #endif
@@ -460,18 +459,27 @@ static int pcie_init(void)
 	struct bh_pci_property pci0_property_table;
 	struct bh_pci_property pci1_property_table;
 	struct CntlInitV2Param param;
+	PCIeInitStatus status;
 
 	bh_chip_info_pci_property(0, &pci0_property_table);
 	bh_chip_info_pci_property(1, &pci1_property_table);
 
 	if (pci0_property_table.pcie_mode != BH_PCIE_MODE_DISABLED) {
 		CntlInitV2ParamInit(0, board_id, vendor_id, &pci0_property_table, &param);
-		PCIeInit(&param);
+		status = PCIeInit(&param);
+		if (status != PCIeInitOk) {
+			LOG_ERR("PCIe0 initialization failed: %d", status);
+			return -EIO;
+		}
 	}
 
 	if (pci1_property_table.pcie_mode != BH_PCIE_MODE_DISABLED) {
 		CntlInitV2ParamInit(1, board_id, vendor_id, &pci1_property_table, &param);
-		PCIeInit(&param);
+		status = PCIeInit(&param);
+		if (status != PCIeInitOk) {
+			LOG_ERR("PCIe1 initialization failed: %d", status);
+			return -EIO;
+		}
 	}
 
 	InitResetInterrupt(0);

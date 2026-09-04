@@ -48,7 +48,30 @@ static struct {
 	uint8_t chip_reset_asic_called: 1;
 	uint8_t chip_reset_dmc_called: 1;
 } chip_reset_state;
-static uint8_t reset_type;
+/* Zero means no reset. Valid reset levels are stored as level + 1 so the
+ * first requester can atomically latch both the pending state and reset type.
+ */
+static atomic_t pending_reset;
+
+static atomic_val_t encode_reset_level(Cm2DmResetLevel reset_level)
+{
+	return (atomic_val_t)reset_level + 1;
+}
+
+static Cm2DmResetLevel decode_reset_level(atomic_val_t pending)
+{
+	return (Cm2DmResetLevel)(pending - 1);
+}
+
+bool Cm2DmResetPending(void)
+{
+	return atomic_get(&pending_reset) != 0;
+}
+
+static bool latch_reset_level(Cm2DmResetLevel reset_level)
+{
+	return atomic_cas(&pending_reset, 0, encode_reset_level(reset_level));
+}
 
 void PostCm2DmMsg(Cm2DmMsgId msg_id, uint32_t data)
 {
@@ -124,6 +147,10 @@ int32_t Cm2DmMsgAckSmbusHandler(const uint8_t *data, uint8_t size)
 
 void IssueChipReset(Cm2DmResetLevel reset_level)
 {
+	/* Hardware and host reset requests share one first-writer-wins latch. */
+	(void)latch_reset_level(reset_level);
+	reset_level = decode_reset_level(atomic_get(&pending_reset));
+
 	lock_down_for_reset();
 	chip_reset_state.chip_reset_asic_called |= reset_level == kCm2DmResetLevelAsic;
 	chip_reset_state.chip_reset_dmc_called |= reset_level == kCm2DmResetLevelDmc;
@@ -179,10 +206,30 @@ void ReportGddrThermTrip(GddrThermTripReason reason)
 void reset_request_handler(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
-	IssueChipReset(reset_type);
+	atomic_val_t pending = atomic_get(&pending_reset);
+
+	if (pending != 0) {
+		IssueChipReset(decode_reset_level(pending));
+	}
 }
 
 K_TIMER_DEFINE(reset_timer, reset_request_handler, NULL);
+
+#ifdef CONFIG_ZTEST
+void Cm2DmResetTestClear(void)
+{
+	k_timer_stop(&reset_timer);
+	atomic_clear(&pending_reset);
+	memset(&chip_reset_state, 0, sizeof(chip_reset_state));
+}
+
+Cm2DmResetLevel Cm2DmResetTestPendingLevel(void)
+{
+	atomic_val_t pending = atomic_get(&pending_reset);
+
+	return pending == 0 ? (Cm2DmResetLevel)-1 : decode_reset_level(pending);
+}
+#endif
 
 /**
  * @brief Handler for @ref TT_SMC_MSG_TRIGGER_RESET
@@ -190,26 +237,30 @@ K_TIMER_DEFINE(reset_timer, reset_request_handler, NULL);
  */
 static uint8_t reset_dm_handler(const union request *request, struct response *response)
 {
-	reset_type = request->trigger_reset.reset_level;
+	Cm2DmResetLevel reset_level = request->trigger_reset.reset_level;
 
 	/* Don't expect a response from the dmfw so need to check here for a valid reset level */
 	uint8_t ret = 0;
 
-	switch (reset_type) {
+	switch (reset_level) {
 	case kCm2DmResetLevelAsic:
 	case kCm2DmResetLevelDmc:
-		/* Delay slightly to allow SMC response to be sent before reset occurs */
-		k_timer_start(&reset_timer, K_MSEC(5), K_NO_WAIT);
+		if (latch_reset_level(reset_level)) {
+			/* Delay slightly to allow SMC response to be sent before reset occurs */
+			k_timer_start(&reset_timer, K_MSEC(5), K_NO_WAIT);
+		} else {
+			ret = EALREADY;
+		}
 		break;
 	default:
 		/* Can never be zero because that case is covered by asic reset */
-		ret = reset_type;
+		ret = reset_level;
 	}
 
 	return ret;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_TRIGGER_RESET, reset_dm_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_TRIGGER_RESET, reset_dm_handler, MSGQUEUE_COMMAND_MUTATING);
 
 /**
  * @brief Handler for host request to ping DMC
@@ -241,7 +292,7 @@ static uint8_t ping_dm_handler(const union request *request, struct response *re
 	return 0;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_PING_DM, ping_dm_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_PING_DM, ping_dm_handler, MSGQUEUE_COMMAND_DIAGNOSTIC);
 
 /**
  * @brief Handler for @ref TT_SMC_MSG_SET_WDT_TIMEOUT
@@ -288,7 +339,8 @@ static uint8_t set_watchdog_timeout(const union request *request, struct respons
 	return 0 - ret;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_SET_WDT_TIMEOUT, set_watchdog_timeout);
+REGISTER_MESSAGE(TT_SMC_MSG_SET_WDT_TIMEOUT, set_watchdog_timeout,
+		 MSGQUEUE_COMMAND_REQUEST_DEPENDENT);
 
 int32_t Dm2CmSendDataHandler(const uint8_t *data, uint8_t size)
 {

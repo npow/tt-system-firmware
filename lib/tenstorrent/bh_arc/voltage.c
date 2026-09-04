@@ -25,12 +25,16 @@ static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtab
 
 VoltageArbiter voltage_arbiter;
 
-void VoltageChange(void)
+bool VoltageChange(void)
 {
 	if (voltage_arbiter.targ_voltage != voltage_arbiter.curr_voltage) {
-		set_vcore(voltage_arbiter.targ_voltage);
+		if (set_vcore(voltage_arbiter.targ_voltage) != 0) {
+			return false;
+		}
 		voltage_arbiter.curr_voltage = voltage_arbiter.targ_voltage;
 	}
+
+	return true;
 }
 
 void VoltageArbRequest(VoltageRequestor req, uint32_t voltage)
@@ -74,13 +78,17 @@ int InitVoltagePPM(void)
 	for (VoltageRequestor i = 0; i < VoltageReqCount; i++) {
 		voltage_arbiter.req_voltage[i] = voltage_arbiter.vdd_min;
 	}
-	set_vcore(VDD_BOOT);
+	if (set_vcore(VDD_BOOT) != 0) {
+		return -1;
+	}
 	voltage_arbiter.curr_voltage = VDD_BOOT;
 	voltage_arbiter.targ_voltage = voltage_arbiter.curr_voltage;
 
 	/* Change VCOREM to 0.85 V to enforce the rule VCOREM - 300 mV <= VCORE <= VCOREM + 100mV */
 	/* Thus allowing VCORE in the range of 0.55 V to 0.95 V */
-	set_vcorem(850);
+	if (set_vcorem(850) != 0) {
+		return -1;
+	}
 
 	return 0;
 }
@@ -98,18 +106,31 @@ uint8_t ForceVdd(uint32_t voltage)
 		return 2;
 	}
 
+	if (!DVFSControlLock()) {
+		return 3;
+	}
+
+	uint8_t status = 0;
+
 	if (dvfs_enabled) {
 		voltage_arbiter.forced_voltage = voltage;
-		DVFSChange();
+		if (!DVFSChangeLocked()) {
+			status = 3;
+		}
 	} else {
 		/* restore to boot voltage */
 		if (voltage == 0) {
 			voltage = VDD_BOOT;
+			voltage_arbiter.forced_voltage = 0U;
 		}
 
-		set_vcore(voltage);
+		if (set_vcore(voltage) != 0) {
+			status = 3;
+		}
 	}
-	return 0;
+
+	DVFSControlUnlock();
+	return status;
 }
 
 /**
@@ -123,4 +144,4 @@ static uint8_t ForceVddHandler(const union request *request, struct response *re
 	return ForceVdd(forced_voltage);
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_FORCE_VDD, ForceVddHandler);
+REGISTER_MESSAGE(TT_SMC_MSG_FORCE_VDD, ForceVddHandler, MSGQUEUE_COMMAND_DENIED);

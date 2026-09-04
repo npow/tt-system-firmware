@@ -191,24 +191,19 @@ bool PcieDmaReadTransfer(uint64_t chip_addr, uint64_t host_addr, uint32_t transf
  */
 static uint8_t pcie_dma_transfer_handler(const union request *request, struct response *response)
 {
-	uint8_t completion_data = request->pcie_dma_transfer.completion_data;
-	uint32_t transfer_size_bytes = request->pcie_dma_transfer.transfer_size_bytes;
-	uint64_t chip_addr = request->pcie_dma_transfer.chip_addr;
-	uint64_t host_addr = request->pcie_dma_transfer.host_addr;
-	uint64_t msi_completion_addr = request->pcie_dma_transfer.msi_completion_addr;
+	ARG_UNUSED(request);
+	ARG_UNUSED(response);
 
-	bool accept;
-
-	if (request->command_code == TT_SMC_MSG_PCIE_DMA_HOST_TO_CHIP_TRANSFER) {
-		accept = PcieDmaReadTransfer(chip_addr, host_addr, transfer_size_bytes,
-					     msi_completion_addr, completion_data);
-	} else {
-		accept = PcieDmaWriteTransfer(chip_addr, host_addr, transfer_size_bytes,
-					      msi_completion_addr, completion_data);
-	}
-
-	return accept ? 0 : 1;
+	/* The request supplies unrestricted chip, host and completion addresses,
+	 * but this interface has no ownership/IOMMU contract with the host driver.
+	 * Accepting it would let a raw message overwrite firmware/MMIO or issue an
+	 * unmapped PCIe transaction that escalates through AER/DPC. Keep the ABI
+	 * visible and fail before reading or programming the HDMA engine.
+	 */
+	return 1;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_PCIE_DMA_HOST_TO_CHIP_TRANSFER, pcie_dma_transfer_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_PCIE_DMA_CHIP_TO_HOST_TRANSFER, pcie_dma_transfer_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_PCIE_DMA_HOST_TO_CHIP_TRANSFER, pcie_dma_transfer_handler,
+		 MSGQUEUE_COMMAND_DENIED);
+REGISTER_MESSAGE(TT_SMC_MSG_PCIE_DMA_CHIP_TO_HOST_TRANSFER, pcie_dma_transfer_handler,
+		 MSGQUEUE_COMMAND_DENIED);

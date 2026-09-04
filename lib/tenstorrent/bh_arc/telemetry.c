@@ -175,6 +175,7 @@ static struct telemetry_table telemetry_table = {
 		[72] = {TAG_NOP_ON_DURATION, TELEM_OFFSET(TAG_NOP_ON_DURATION)},
 		[73] = {TAG_FW_CAPABILITIES_0, TELEM_OFFSET(TAG_FW_CAPABILITIES_0)},
 		[74] = {TAG_FW_ACTIVE_CONFIG_0, TELEM_OFFSET(TAG_FW_ACTIVE_CONFIG_0)},
+		[75] = {TAG_RUNTIME_POWER_STATUS, TELEM_OFFSET(TAG_RUNTIME_POWER_STATUS)},
 	},
 };
 /* clang-format on */
@@ -258,6 +259,12 @@ void UpdateTelemetryKernelThrottler(bool enabled, uint32_t stop_nops_freq)
 	active_config.bits.kernel_nops_at_aiclk_fmin = enabled ? 1U : 0U;
 	telemetry[TAG_FW_ACTIVE_CONFIG_0] = active_config.u32_all;
 	telemetry[TAG_KERNEL_THROTTLER] = (enabled ? 1U : 0U) | ((stop_nops_freq & 0xFFFFU) << 16U);
+}
+
+void UpdateTelemetryRuntimePowerStatus(uint32_t status)
+{
+	/* One aligned word is the host-visible publication boundary. */
+	telemetry[TAG_RUNTIME_POWER_STATUS] = status;
 }
 
 telemetry_feature_flags_bits_0_t GetActiveFeatures(void)

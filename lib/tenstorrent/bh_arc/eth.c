@@ -300,10 +300,17 @@ static int read_eth_remote32(uint8_t eth_inst, uint32_t ring, uint64_t address, 
 	rc = tt_dma_config(dma_noc, ETH_RUNTIME_TELEMETRY_DMA_CHANNEL, &config, &coords);
 	if (rc == 0) {
 		rc = dma_start(dma_noc, ETH_RUNTIME_TELEMETRY_DMA_CHANNEL);
+		if (rc == -ETIMEDOUT) {
+			dma_stop(dma_noc, ETH_RUNTIME_TELEMETRY_DMA_CHANNEL);
+		}
 	}
 	if (rc == 0) {
 		rc = wait_for_eth_dma(ETH_RUNTIME_TELEMETRY_DMA_CHANNEL,
 				      ETH_RUNTIME_TELEMETRY_TIMEOUT_MS);
+		if (rc != 0) {
+			/* NoC DMA has no abort; stop quarantines the whole engine. */
+			dma_stop(dma_noc, ETH_RUNTIME_TELEMETRY_DMA_CHANNEL);
+		}
 	}
 	if (rc != 0) {
 		/* dma_stop() cannot cancel an in-flight NOC request. Permanently stop
@@ -625,10 +632,17 @@ static int wipe_l1(void)
 
 			if (rc == 0) {
 				rc = dma_start(dma_noc, ETH_WIPE_DMA_CHANNEL);
+				if (rc == -ETIMEDOUT) {
+					dma_stop(dma_noc, ETH_WIPE_DMA_CHANNEL);
+				}
 			}
 			if (rc == 0) {
 				rc = wait_for_eth_dma(ETH_WIPE_DMA_CHANNEL,
 						      ETH_WIPE_DMA_TIMEOUT_MS);
+				if (rc != 0) {
+					/* NoC DMA has no abort; stop quarantines the engine. */
+					dma_stop(dma_noc, ETH_WIPE_DMA_CHANNEL);
+				}
 			}
 			if (rc != 0) {
 				return rc;
@@ -820,7 +834,10 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 		}
 	}
 
-	SetAiclkResetSafe(true);
+	if (!SetAiclkResetSafe(true)) {
+		rsp->data[1] = ETH_RESET_ERR_CLOCK;
+		return 1;
+	}
 
 	RESET_UNIT_ETH_RESET_reg_u eth_reset = {.val = ReadReg(RESET_UNIT_ETH_RESET_REG_ADDR)};
 
@@ -844,7 +861,10 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 	eth_reset.f.eth_risc_reset_n |= mask;
 	WriteReg(RESET_UNIT_ETH_RESET_REG_ADDR, eth_reset.val);
 
-	SetAiclkResetSafe(false);
+	if (!SetAiclkResetSafe(false)) {
+		rsp->data[1] = ETH_RESET_ERR_CLOCK;
+		return 1;
+	}
 
 	if (!skip_fw) {
 		uint8_t buf[SCRATCHPAD_SIZE] __aligned(4);
@@ -886,7 +906,7 @@ static uint8_t toggle_eth_reset_handler(const union request *req, struct respons
 	return 0;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_ETH_RESET, toggle_eth_reset_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_ETH_RESET, toggle_eth_reset_handler, MSGQUEUE_COMMAND_DENIED);
 
 static int eth_init(void)
 {

@@ -89,7 +89,22 @@ struct tt_bh_dma_noc_config {
  */
 struct tt_bh_dma_noc_data {
 	struct k_spinlock lock;
+	/*
+	 * Completion is tracked with device-wide response counters and the
+	 * hardware exposes no abort operation.  A timed-out request makes every
+	 * logical channel unsafe to reuse until the device is reset.
+	 */
+	atomic_t poisoned;
 };
+
+static void quarantine_noc_dma(const struct device *dev, uint32_t channel)
+{
+	struct tt_bh_dma_noc_data *dma_data = dev->data;
+
+	if (atomic_cas(&dma_data->poisoned, 0, 1)) {
+		LOG_ERR("NoC DMA quarantined after channel %u timed out", channel);
+	}
+}
 
 static bool noc_wait_cmd_ready(void)
 {
@@ -241,6 +256,11 @@ static int tt_bh_dma_noc_config(const struct device *dev, uint32_t channel,
 	const struct tt_bh_dma_noc_config *dma_cfg =
 		(const struct tt_bh_dma_noc_config *)dev->config;
 
+	if (atomic_get(&dma_data->poisoned) != 0) {
+		LOG_ERR("NoC DMA is quarantined after an incomplete transfer");
+		return -EIO;
+	}
+
 	if (config->block_count == 0) {
 		LOG_ERR("No block configuration provided");
 		return -EINVAL;
@@ -363,6 +383,11 @@ static int tt_bh_dma_noc_start_per_to_mem(const struct device *dev, uint32_t cha
 static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 {
 	const struct tt_bh_dma_noc_config *cfg = (const struct tt_bh_dma_noc_config *)dev->config;
+	struct tt_bh_dma_noc_data *dma_data = dev->data;
+
+	if (atomic_get(&dma_data->poisoned) != 0) {
+		return -EIO;
+	}
 
 	if (channel >= cfg->num_channels) {
 		LOG_ERR("Invalid channel %u", channel);
@@ -406,6 +431,9 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 
 			ret = tt_bh_dma_noc_start_mem_to_per(dev, channel);
 			if (ret != 0) {
+				if (ret == -ETIMEDOUT) {
+					quarantine_noc_dma(dev, channel);
+				}
 				return ret;
 			}
 
@@ -416,15 +444,22 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 			struct dma_status status;
 
 			do {
-				dma_get_status(dev, channel, &status);
+				ret = dma_get_status(dev, channel, &status);
+				if (ret != 0) {
+					return ret;
+				}
 			} while (status.busy && !sys_timepoint_expired(timeout));
 
-			if (sys_timepoint_expired(timeout)) {
+			if (status.busy) {
+				quarantine_noc_dma(dev, channel);
 				return -ETIMEDOUT;
 			}
 
 			ret = tt_bh_dma_noc_start_per_to_mem(dev, channel);
 			if (ret != 0) {
+				if (ret == -ETIMEDOUT) {
+					quarantine_noc_dma(dev, channel);
+				}
 				return ret;
 			}
 
@@ -432,10 +467,14 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 			timeout = sys_timepoint_calc(K_MSEC(NOC_DMA_TIMEOUT_MS));
 
 			do {
-				dma_get_status(dev, channel, &status);
+				ret = dma_get_status(dev, channel, &status);
+				if (ret != 0) {
+					return ret;
+				}
 			} while (status.busy && !sys_timepoint_expired(timeout));
 
-			if (sys_timepoint_expired(timeout)) {
+			if (status.busy) {
+				quarantine_noc_dma(dev, channel);
 				return -ETIMEDOUT;
 			}
 
@@ -447,10 +486,18 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 			break;
 		}
 		case MEMORY_TO_PERIPHERAL: {
-			return tt_bh_dma_noc_start_mem_to_per(dev, channel);
+			ret = tt_bh_dma_noc_start_mem_to_per(dev, channel);
+			if (ret == -ETIMEDOUT) {
+				quarantine_noc_dma(dev, channel);
+			}
+			return ret;
 		}
 		case PERIPHERAL_TO_MEMORY: {
-			return tt_bh_dma_noc_start_per_to_mem(dev, channel);
+			ret = tt_bh_dma_noc_start_per_to_mem(dev, channel);
+			if (ret == -ETIMEDOUT) {
+				quarantine_noc_dma(dev, channel);
+			}
+			return ret;
 		}
 		case TT_BH_DMA_NOC_CHANNEL_DIRECTION_BROADCAST: {
 			/* Use pre translation coords as NOC translation has enabled. */
@@ -467,6 +514,9 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 				current_block->block_size, false, &chan_data->state.last_noc_cmd,
 				&chan_data->state.last_expected_acks);
 
+			if (ret == -ETIMEDOUT) {
+				quarantine_noc_dma(dev, channel);
+			}
 			return ret;
 		}
 		default:
@@ -482,7 +532,10 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 			    cfg->channels[linked_chan].state.configured) {
 				if (chan_data->config.dest_chaining_en ||
 				    chan_data->config.source_chaining_en) {
-					tt_bh_dma_noc_start(dev, linked_chan);
+					ret = tt_bh_dma_noc_start(dev, linked_chan);
+					if (ret != 0) {
+						return ret;
+					}
 				}
 			}
 		}
@@ -493,6 +546,9 @@ static int tt_bh_dma_noc_start(const struct device *dev, uint32_t channel)
 
 static int tt_bh_dma_noc_init(const struct device *dev)
 {
+	struct tt_bh_dma_noc_data *dma_data = dev->data;
+
+	atomic_clear(&dma_data->poisoned);
 	return 0;
 }
 
@@ -501,6 +557,11 @@ static int tt_bh_dma_noc_get_status(const struct device *dev, uint32_t channel,
 {
 	const struct tt_bh_dma_noc_config *dma_cfg =
 		(const struct tt_bh_dma_noc_config *)dev->config;
+	struct tt_bh_dma_noc_data *dma_data = dev->data;
+
+	if (atomic_get(&dma_data->poisoned) != 0) {
+		return -EIO;
+	}
 
 	if (channel >= dma_cfg->num_channels) {
 		return -EINVAL;
@@ -520,6 +581,14 @@ static int tt_bh_dma_noc_get_status(const struct device *dev, uint32_t channel,
 
 static int tt_bh_dma_noc_stop(const struct device *dev, uint32_t channel)
 {
+	const struct tt_bh_dma_noc_config *dma_cfg = dev->config;
+
+	if (channel >= dma_cfg->num_channels) {
+		return -EINVAL;
+	}
+
+	/* There is no hardware abort.  Stop therefore means quarantine. */
+	quarantine_noc_dma(dev, channel);
 	return 0;
 }
 

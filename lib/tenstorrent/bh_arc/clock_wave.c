@@ -67,4 +67,4 @@ static uint8_t switch_clk_scheme_handler(const union request *request, struct re
 	switch_clk_scheme(clk_scheme);
 	return 0;
 }
-REGISTER_MESSAGE(TT_SMC_MSG_SWITCH_CLK_SCHEME, switch_clk_scheme_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_SWITCH_CLK_SCHEME, switch_clk_scheme_handler, MSGQUEUE_COMMAND_DENIED);

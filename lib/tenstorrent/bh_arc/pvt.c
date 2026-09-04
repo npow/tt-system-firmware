@@ -143,6 +143,6 @@ static uint8_t read_vm_handler(const union request *request, struct response *re
 	return ret;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_READ_TS, read_ts_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_READ_PD, read_pd_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_READ_VM, read_vm_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_READ_TS, read_ts_handler, MSGQUEUE_COMMAND_DIAGNOSTIC);
+REGISTER_MESSAGE(TT_SMC_MSG_READ_PD, read_pd_handler, MSGQUEUE_COMMAND_DIAGNOSTIC);
+REGISTER_MESSAGE(TT_SMC_MSG_READ_VM, read_vm_handler, MSGQUEUE_COMMAND_DIAGNOSTIC);

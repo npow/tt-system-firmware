@@ -63,6 +63,8 @@ LOG_MODULE_REGISTER(tensix_init, CONFIG_TT_APP_LOG_LEVEL);
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 static const struct device *const dma_noc = DEVICE_DT_GET(DT_NODELABEL(dma1));
 static const struct device *const flash = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(spi_flash));
+/* A timed-out NoC read can complete late, so its ARC destination must outlive the call. */
+static uint8_t tensix_wipe_staging[CONFIG_TT_BH_ARC_SCRATCHPAD_SIZE] __aligned(64);
 
 /* Enable CG_CTRL_EN in each non-harvested Tensix node and set CG hystersis to 2. */
 /* This requires NOC init so that broadcast is set up properly. */
@@ -157,28 +159,34 @@ static int run_noc_dma(struct dma_config *config, struct tt_bh_dma_noc_coords *c
 
 	ret = dma_start(dma_noc, 1);
 	if (ret != 0) {
+		if (ret == -ETIMEDOUT) {
+			dma_stop(dma_noc, 1);
+		}
 		return ret;
 	}
 
-	return wait_for_noc_dma();
+	ret = wait_for_noc_dma();
+	if (ret != 0) {
+		/* NoC DMA has no abort; stop quarantines the whole engine. */
+		dma_stop(dma_noc, 1);
+	}
+	return ret;
 }
 
 static int wipe_l1(void)
 {
 	uint64_t addr = 0;
 	uint8_t tensix_x, tensix_y;
-	/* NOC2AXI to Tensix L1 transactions must be aligned to 64 bytes */
-	uint8_t sram_buffer[CONFIG_TT_BH_ARC_SCRATCHPAD_SIZE] __aligned(64);
 
 	GetEnabledTensix(&tensix_x, &tensix_y);
 
 	/* wipe SCRATCHPAD_SIZE of the chosen tensix */
-	memset(sram_buffer, 0, sizeof(sram_buffer));
+	memset(tensix_wipe_staging, 0, sizeof(tensix_wipe_staging));
 
 	struct dma_block_config block = {
 		.source_address = addr,
-		.dest_address = (uintptr_t)sram_buffer,
-		.block_size = sizeof(sram_buffer),
+		.dest_address = (uintptr_t)tensix_wipe_staging,
+		.block_size = sizeof(tensix_wipe_staging),
 	};
 
 	struct dma_config config = {.channel_direction = MEMORY_TO_PERIPHERAL,
@@ -201,7 +209,7 @@ static int wipe_l1(void)
 	}
 
 	/* wipe entire L1 of the chosen tensix */
-	uint32_t offset = sizeof(sram_buffer);
+	uint32_t offset = sizeof(tensix_wipe_staging);
 
 	while (offset < TENSIX_L1_SIZE) {
 		uint32_t size = MIN(offset, TENSIX_L1_SIZE - offset);

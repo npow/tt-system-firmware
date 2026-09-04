@@ -5,6 +5,7 @@
  */
 
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/kernel.h>
 #include <string.h>
 #include "timer.h"
 #include "dw_apb_i2c.h"
@@ -154,6 +155,41 @@ typedef union {
 extern uint8_t asic_state;
 /* i2c_target_config for Zephyr callbacks in I2C slave mode */
 struct i2c_target_config i2c_target_config[3];
+K_MUTEX_DEFINE(i2c0_lock);
+K_MUTEX_DEFINE(i2c1_lock);
+K_MUTEX_DEFINE(i2c2_lock);
+
+#define I2C_LOCK_TIMEOUT_MS 250
+
+static struct k_mutex *GetI2CLock(uint32_t id)
+{
+	switch (id) {
+	case 0:
+		return &i2c0_lock;
+	case 1:
+		return &i2c1_lock;
+	case 2:
+		return &i2c2_lock;
+	default:
+		return NULL;
+	}
+}
+
+int I2CLock(uint32_t id)
+{
+	struct k_mutex *lock = GetI2CLock(id);
+
+	return lock == NULL ? -EINVAL : k_mutex_lock(lock, K_MSEC(I2C_LOCK_TIMEOUT_MS));
+}
+
+void I2CUnlock(uint32_t id)
+{
+	struct k_mutex *lock = GetI2CLock(id);
+
+	if (lock != NULL) {
+		k_mutex_unlock(lock);
+	}
+}
 
 static inline uint32_t GetI2CBaseAddress(uint32_t id)
 {
@@ -260,7 +296,7 @@ void I2CRecoverBus(uint32_t id)
 	WriteReg(GetI2CRegAddr(id, GET_I2C_OFFSET(IC_ENABLE)), 1);
 }
 
-static void WaitTxFifoEmpty(uint32_t id)
+static uint32_t WaitTxFifoEmpty(uint32_t id)
 {
 	uint32_t ic_status = 0;
 	uint64_t ts = k_uptime_get();
@@ -274,13 +310,15 @@ static void WaitTxFifoEmpty(uint32_t id)
 							(CONFIG_TT_BH_ARC_I2C_TIMEOUT_DURATION),
 							(0))) {
 				I2CRecoverBus(id);
-				break;
+				return -ETIMEDOUT;
 			}
 		}
 	} while ((ic_status & DW_APB_I2C_IC_STATUS_TFE_MASK) == 0);
+
+	return 0;
 }
 
-static void WaitTxFifoNotFull(uint32_t id)
+static uint32_t WaitTxFifoNotFull(uint32_t id)
 {
 	uint32_t ic_status = 0;
 	uint64_t ts = k_uptime_get();
@@ -293,13 +331,15 @@ static void WaitTxFifoNotFull(uint32_t id)
 							(CONFIG_TT_BH_ARC_I2C_TIMEOUT_DURATION),
 							(0))) {
 				I2CRecoverBus(id);
-				break;
+				return -ETIMEDOUT;
 			}
 		}
 	} while ((ic_status & DW_APB_I2C_IC_STATUS_TFNF_MASK) == 0);
+
+	return 0;
 }
 
-static void WaitMasterIdle(uint32_t id)
+static uint32_t WaitMasterIdle(uint32_t id)
 {
 	uint32_t ic_status = 0;
 	uint64_t ts = k_uptime_get();
@@ -312,16 +352,23 @@ static void WaitMasterIdle(uint32_t id)
 							(CONFIG_TT_BH_ARC_I2C_TIMEOUT_DURATION),
 							(0))) {
 				I2CRecoverBus(id);
-				break;
+				return -ETIMEDOUT;
 			}
 		}
 	} while (ic_status & DW_APB_I2C_IC_STATUS_MST_ACTIVITY_MASK);
+
+	return 0;
 }
 
-static void WriteTxFifo(uint32_t id, uint32_t data)
+static uint32_t WriteTxFifo(uint32_t id, uint32_t data)
 {
-	WaitTxFifoNotFull(id);
+	uint32_t status = WaitTxFifoNotFull(id);
+
+	if (status != 0) {
+		return status;
+	}
 	WriteReg(GetI2CRegAddr(id, GET_I2C_OFFSET(IC_DATA_CMD)), data);
+	return 0;
 }
 
 /* TODO: this function should log tx abort in CSM. */
@@ -416,14 +463,21 @@ void I2CInitGPIO(uint32_t id)
 }
 
 /* Initialize I2C controller by setting up I2C pads and configuration settings. */
-void I2CInit(I2CMode mode, uint32_t slave_addr, I2CSpeedMode speed, uint32_t id)
+uint32_t I2CInit(I2CMode mode, uint32_t slave_addr, I2CSpeedMode speed, uint32_t id)
 {
 	if (asic_state == A3State) {
-		return;
+		return IC_ABRT_A3_STATE;
 	}
 
-	WaitTxFifoEmpty(id);
-	WaitMasterIdle(id);
+	uint32_t status = WaitTxFifoEmpty(id);
+
+	if (status != 0) {
+		return status;
+	}
+	status = WaitMasterIdle(id);
+	if (status != 0) {
+		return status;
+	}
 
 	I2CInitGPIO(id);
 
@@ -474,6 +528,7 @@ void I2CInit(I2CMode mode, uint32_t slave_addr, I2CSpeedMode speed, uint32_t id)
 
 	WriteReg(GetI2CRegAddr(id, GET_I2C_OFFSET(IC_ENABLE)), 1);
 	Wait(10 * WAIT_1US);
+	return 0;
 }
 
 /* Generalized transaction function called by I2CWriteBytes and I2CReadBytes, implements SMBUS write
@@ -490,7 +545,11 @@ uint32_t I2CTransaction(uint32_t id, const uint8_t *write_data, uint32_t write_l
 	for (uint32_t i = 0; i < write_len; i++) {
 		uint32_t last_byte_flag = (read_len == 0 && i == write_len - 1) ? IC_DATA_STOP : 0;
 
-		WriteTxFifo(id, write_data[i] | IC_DATA_WRITE | last_byte_flag);
+		uint32_t status = WriteTxFifo(id, write_data[i] | IC_DATA_WRITE | last_byte_flag);
+
+		if (status != 0) {
+			return status;
+		}
 	}
 
 	uint32_t ic_error = 0;
@@ -513,7 +572,10 @@ uint32_t I2CTransaction(uint32_t id, const uint8_t *write_data, uint32_t write_l
 	for (uint32_t i = 0; i < read_len; i++) {
 		uint32_t last_byte_flag = (i == read_len - 1) ? IC_DATA_STOP : 0;
 
-		WriteTxFifo(id, IC_DATA_READ | last_byte_flag);
+		ic_error = WriteTxFifo(id, IC_DATA_READ | last_byte_flag);
+		if (ic_error) {
+			return ic_error;
+		}
 		ic_error = I2CReadRxFifo(id, &read_data[i]);
 		if (ic_error) {
 			return ic_error;
@@ -535,14 +597,23 @@ uint32_t I2CWriteBytes(uint32_t id, uint16_t command, uint32_t command_byte_size
 		uint32_t last_byte_flag =
 			(data_byte_size == 0 && i == command_byte_size - 1) ? IC_DATA_STOP : 0;
 
-		WriteTxFifo(id, cmd_buf[i] | IC_DATA_WRITE | last_byte_flag);
+		uint32_t status = WriteTxFifo(id, cmd_buf[i] | IC_DATA_WRITE | last_byte_flag);
+
+		if (status != 0) {
+			return status;
+		}
 	}
 
 	if (p_write_buf != NULL) {
 		for (uint32_t i = 0; i < data_byte_size; i++) {
 			uint32_t last_byte_flag = (i == data_byte_size - 1) ? IC_DATA_STOP : 0;
 
-			WriteTxFifo(id, p_write_buf[i] | IC_DATA_WRITE | last_byte_flag);
+			uint32_t status =
+				WriteTxFifo(id, p_write_buf[i] | IC_DATA_WRITE | last_byte_flag);
+
+			if (status != 0) {
+				return status;
+			}
 		}
 	}
 

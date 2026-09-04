@@ -18,7 +18,9 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(clock_control_tt_bh);
 
-#define PLL_LOCK_TIMEOUT_MS 400
+#define PLL_LOCK_TIMEOUT_MS               10U
+#define REFCLK_CYCLES_PER_MS              50000U
+#define RESET_UNIT_REFCLK_CNT_LO_REG_ADDR 0x800300E0U
 
 #define PLL_CNTL_0_OFFSET             0x00
 #define PLL_CNTL_1_OFFSET             0x04
@@ -158,7 +160,14 @@ struct clock_control_tt_bh_config {
 struct clock_control_tt_bh_data {
 	struct tt_bh_pll_settings settings;
 
-	struct k_spinlock lock;
+	struct k_mutex lock;
+	/* A failed rollback leaves the PLL powered down and the clock mux on refclk.
+	 * Do not accept ordinary rate changes until an explicit init-state request
+	 * has rebuilt a verified PLL configuration.
+	 */
+	bool safe_bypass;
+	/* safe_bypass is a usable rate source only after its register readback. */
+	bool safe_bypass_verified;
 };
 
 static uint32_t clock_control_tt_bh_read_reg(const struct clock_control_tt_bh_config *config,
@@ -209,20 +218,146 @@ static void clock_control_tt_bh_config_ext_postdivs(const struct clock_control_t
 	clock_control_tt_bh_write_reg(config, PLL_USE_POSTDIV_OFFSET, settings->use_postdiv.val);
 }
 
+/*
+ * Put the PLL into the documented reference-clock path. This is the final
+ * containment path after both a requested configuration and the saved
+ * known-good configuration have failed verification. Bypass is active-low:
+ * bypass=0 selects refclk rather than the PLL output.
+ */
+static int clock_control_tt_bh_force_safe_bypass(const struct clock_control_tt_bh_config *config)
+{
+	union tt_bh_pll_cntl_0_reg pll_cntl_0;
+
+	pll_cntl_0.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_0_OFFSET);
+	pll_cntl_0.f.bypass = 0;
+	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+	k_busy_wait(3);
+
+	/* Do not propagate a potentially unsuitable PLL/post-divider output. */
+	clock_control_tt_bh_write_reg(config, PLL_USE_POSTDIV_OFFSET, 0);
+	pll_cntl_0.val = 0;
+	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+
+	pll_cntl_0.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_0_OFFSET);
+	if (pll_cntl_0.f.pd != 0U || pll_cntl_0.f.bypass != 0U ||
+	    clock_control_tt_bh_read_reg(config, PLL_USE_POSTDIV_OFFSET) != 0U) {
+		LOG_ERR("PLL %d failed to enter verified refclk safe bypass", config->inst);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static int clock_control_tt_bh_wait_lock(uint8_t inst)
 {
 	union tt_bh_pll_cntl_wrapper_lock_reg pll_lock_reg;
-	uint64_t start = k_uptime_get();
+	uint32_t start = sys_read32(RESET_UNIT_REFCLK_CNT_LO_REG_ADDR);
+	uint32_t timeout_cycles = PLL_LOCK_TIMEOUT_MS * REFCLK_CYCLES_PER_MS;
 
 	do {
 		pll_lock_reg.val = sys_read32(PLL_CNTL_WRAPPER_PLL_LOCK_REG_ADDR);
 		if (pll_lock_reg.val & BIT(inst)) {
 			return 0;
 		}
-	} while (k_uptime_get() - start < PLL_LOCK_TIMEOUT_MS);
+	} while (sys_read32(RESET_UNIT_REFCLK_CNT_LO_REG_ADDR) - start < timeout_cycles);
 
 	LOG_ERR("PLL %d failed to lock within %d ms", inst, PLL_LOCK_TIMEOUT_MS);
 	return -ETIMEDOUT;
+}
+
+static int clock_control_tt_bh_verify_settings(const struct clock_control_tt_bh_config *config,
+					       const struct tt_bh_pll_settings *settings)
+{
+	union tt_bh_pll_cntl_0_reg pll_cntl_0;
+
+	if (clock_control_tt_bh_read_reg(config, PLL_CNTL_1_OFFSET) != settings->pll_cntl_1.val ||
+	    clock_control_tt_bh_read_reg(config, PLL_CNTL_2_OFFSET) != settings->pll_cntl_2.val ||
+	    clock_control_tt_bh_read_reg(config, PLL_CNTL_3_OFFSET) != settings->pll_cntl_3.val ||
+	    clock_control_tt_bh_read_reg(config, PLL_CNTL_5_OFFSET) != settings->pll_cntl_5.val ||
+	    clock_control_tt_bh_read_reg(config, PLL_USE_POSTDIV_OFFSET) !=
+		    settings->use_postdiv.val) {
+		LOG_ERR("PLL %d configuration readback failed", config->inst);
+		return -EIO;
+	}
+
+	pll_cntl_0.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_0_OFFSET);
+	if (pll_cntl_0.f.pd != 1U || pll_cntl_0.f.bypass != 1U) {
+		LOG_ERR("PLL %d did not leave bypass/power state", config->inst);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/* Program a configuration without changing software state. The caller owns
+ * the device mutex and must either verify the result or restore a saved
+ * configuration before exposing the result to other users.
+ */
+static int clock_control_tt_bh_program_settings(const struct clock_control_tt_bh_config *config,
+						const struct tt_bh_pll_settings *settings)
+{
+	union tt_bh_pll_cntl_0_reg pll_cntl_0;
+	int ret;
+
+	/* Before turning off PLL, select refclk so the mux cannot switch glitchily. */
+	pll_cntl_0.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_0_OFFSET);
+	pll_cntl_0.f.bypass = 0;
+	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+
+	k_busy_wait(3);
+
+	/* Power down PLL and disable PLL reset. */
+	pll_cntl_0.val = 0;
+	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+
+	clock_control_tt_bh_config_vco(config, settings);
+
+	/* Power sequence requires PLLEN get asserted 1us after all inputs are stable. */
+	/* Wait 5x this time to be conservative. */
+	k_busy_wait(5);
+
+	/* Power up PLL. */
+	pll_cntl_0.f.pd = 1;
+	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+
+	ret = clock_control_tt_bh_wait_lock(config->inst);
+	if (ret != 0) {
+		return ret;
+	}
+
+	clock_control_tt_bh_config_ext_postdivs(config, settings);
+	k_busy_wait_ns(300);
+
+	/* Select the locked PLL output. */
+	pll_cntl_0.f.bypass = 1;
+	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+	k_busy_wait_ns(300);
+
+	return 0;
+}
+
+static int clock_control_tt_bh_restore_known_good(const struct clock_control_tt_bh_config *config,
+						  struct clock_control_tt_bh_data *data,
+						  const struct tt_bh_pll_settings *known_good)
+{
+	int ret = clock_control_tt_bh_program_settings(config, known_good);
+
+	if (ret == 0) {
+		ret = clock_control_tt_bh_verify_settings(config, known_good);
+	}
+	if (ret == 0) {
+		data->settings = *known_good;
+		data->safe_bypass = false;
+		data->safe_bypass_verified = false;
+		LOG_WRN("PLL %d restored known-good configuration", config->inst);
+		return 0;
+	}
+
+	LOG_ERR("PLL %d rollback failed (%d); entering refclk safe-bypass containment",
+		config->inst, ret);
+	data->safe_bypass = true;
+	data->safe_bypass_verified = clock_control_tt_bh_force_safe_bypass(config) == 0;
+	return ret;
 }
 
 static uint32_t clock_control_tt_bh_get_ext_postdiv(uint8_t postdiv_index,
@@ -313,49 +448,28 @@ static uint32_t clock_control_tt_bh_get_freq(const struct clock_control_tt_bh_co
 	return (config->refclk_rate * pll_cntl_1.f.fbdiv) / (pll_cntl_1.f.refdiv * eff_postdiv);
 }
 
-static void clock_control_tt_bh_update(const struct clock_control_tt_bh_config *config,
-				       struct clock_control_tt_bh_data *data,
-				       const struct tt_bh_pll_settings *settings)
+static int clock_control_tt_bh_update(const struct clock_control_tt_bh_config *config,
+				      struct clock_control_tt_bh_data *data,
+				      const struct tt_bh_pll_settings *settings)
 {
-	union tt_bh_pll_cntl_0_reg pll_cntl_0;
+	const struct tt_bh_pll_settings known_good = data->settings;
+	int ret;
 
-	/* Before turning off PLL, bypass PLL so glitch free mux has no chance to switch */
-	pll_cntl_0.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_0_OFFSET);
-	pll_cntl_0.f.bypass = 0;
+	ret = clock_control_tt_bh_program_settings(config, settings);
+	if (ret == 0) {
+		ret = clock_control_tt_bh_verify_settings(config, settings);
+	}
+	if (ret == 0) {
+		data->settings = *settings;
+		data->safe_bypass = false;
+		data->safe_bypass_verified = false;
+		return 0;
+	}
 
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
+	LOG_ERR("PLL %d update failed (%d); restoring known-good configuration", config->inst, ret);
+	(void)clock_control_tt_bh_restore_known_good(config, data, &known_good);
 
-	k_busy_wait(3);
-
-	/* Power down PLL and disable PLL reset */
-	pll_cntl_0.val = 0;
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	clock_control_tt_bh_config_vco(config, settings);
-
-	/* Power sequence requires PLLEN get asserted 1us after all inputs are stable. */
-	/* Wait 5x this time to be conservative */
-	k_busy_wait(5);
-
-	/* Power up PLLs */
-	pll_cntl_0.f.pd = 1;
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	/* Wait for PLLs to lock */
-	clock_control_tt_bh_wait_lock(config->inst);
-
-	/* Setup external postdivs */
-	clock_control_tt_bh_config_ext_postdivs(config, settings);
-
-	k_busy_wait_ns(300);
-
-	/* Disable PLL bypass */
-	pll_cntl_0.f.bypass = 1;
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	k_busy_wait_ns(300);
-
-	data->settings = *settings;
+	return ret;
 }
 
 static int clock_control_tt_bh_enable(const struct device *dev, clock_control_subsys_t sys,
@@ -365,7 +479,17 @@ static int clock_control_tt_bh_enable(const struct device *dev, clock_control_su
 	struct clock_control_tt_bh_config *config =
 		(struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
-	struct tt_bh_pll_settings settings = data->settings;
+	struct tt_bh_pll_settings settings;
+	int ret;
+
+	if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
+		return -EBUSY;
+	}
+	if (data->safe_bypass) {
+		ret = -EIO;
+		goto out;
+	}
+	settings = data->settings;
 
 	switch (clock) {
 	case CLOCK_CONTROL_TT_BH_CLOCK_L2CPUCLK_0:
@@ -382,11 +506,14 @@ static int clock_control_tt_bh_enable(const struct device *dev, clock_control_su
 		break;
 
 	default:
-		return -ENOSYS;
+		ret = -ENOSYS;
+		goto out;
 	}
 
-	clock_control_tt_bh_update(config, data, &settings);
-	return 0;
+	ret = clock_control_tt_bh_update(config, data, &settings);
+out:
+	k_mutex_unlock(&data->lock);
+	return ret;
 }
 static int clock_control_tt_bh_on(const struct device *dev, clock_control_subsys_t sys)
 {
@@ -410,13 +537,23 @@ static int clock_control_tt_bh_get_rate(const struct device *dev, clock_control_
 	const struct clock_control_tt_bh_config *config =
 		(const struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
-	k_spinlock_key_t key;
 
-	if (k_spin_trylock(&data->lock, &key) < 0) {
+	if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
 		return -EBUSY;
 	}
 
 	enum clock_control_tt_bh_clock clock = (enum clock_control_tt_bh_clock)(uintptr_t)sys;
+
+	if (data->safe_bypass) {
+		if (!data->safe_bypass_verified) {
+			k_mutex_unlock(&data->lock);
+			return -EIO;
+		}
+		/* The safe-state mux is explicitly on refclk, not the stale PLL dividers. */
+		*rate = config->refclk_rate;
+		k_mutex_unlock(&data->lock);
+		return 0;
+	}
 
 	switch (clock) {
 	case CLOCK_CONTROL_TT_BH_CLOCK_AICLK:
@@ -447,11 +584,11 @@ static int clock_control_tt_bh_get_rate(const struct device *dev, clock_control_
 		*rate = clock_control_tt_bh_get_freq(config, 3);
 		break;
 	default:
-		k_spin_unlock(&data->lock, key);
+		k_mutex_unlock(&data->lock);
 		return -ENOTSUP;
 	}
 
-	k_spin_unlock(&data->lock, key);
+	k_mutex_unlock(&data->lock);
 	return 0;
 }
 
@@ -467,13 +604,20 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 	const struct clock_control_tt_bh_config *config =
 		(const struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
-	k_spinlock_key_t key;
 
-	if (k_spin_trylock(&data->lock, &key) < 0) {
+	if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
 		return -EBUSY;
 	}
 
 	enum clock_control_tt_bh_clock clock = (enum clock_control_tt_bh_clock)(uintptr_t)sys;
+
+	/* A reset path may request INIT_STATE to rebuild the PLL, but ordinary rate
+	 * changes must not touch a PLL latched in reference-clock containment.
+	 */
+	if (data->safe_bypass && clock != CLOCK_CONTROL_TT_BH_INIT_STATE) {
+		k_mutex_unlock(&data->lock);
+		return -EIO;
+	}
 
 	if (clock == CLOCK_CONTROL_TT_BH_CLOCK_GDDRMEMCLK) {
 		struct tt_bh_pll_settings settings = data->settings;
@@ -481,7 +625,7 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 			config->refclk_rate, (uint32_t)rate, settings.pll_cntl_1,
 			settings.pll_cntl_5, settings.use_postdiv, 0);
 		if (fbdiv == 0) {
-			k_spin_unlock(&data->lock, key);
+			k_mutex_unlock(&data->lock);
 			return -EINVAL;
 		}
 		settings.pll_cntl_1.f.fbdiv = fbdiv;
@@ -489,16 +633,23 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 				    settings.pll_cntl_1.f.refdiv;
 
 		if (!IN_RANGE(vco_freq, VCO_MIN_FREQ, VCO_MAX_FREQ)) {
-			k_spin_unlock(&data->lock, key);
+			k_mutex_unlock(&data->lock);
 			return -ERANGE;
 		}
 
-		clock_control_tt_bh_update(config, data, &settings);
+		int ret = clock_control_tt_bh_update(config, data, &settings);
+
+		if (ret != 0) {
+			k_mutex_unlock(&data->lock);
+			return ret;
+		}
 	} else if (clock == CLOCK_CONTROL_TT_BH_CLOCK_AICLK) {
+		const struct tt_bh_pll_settings known_good = data->settings;
 		uint32_t target_fbdiv;
 		union tt_bh_pll_cntl_1_reg pll_cntl_1;
 		union tt_bh_pll_cntl_5_reg pll_cntl_5;
 		union tt_bh_pll_use_postdiv_reg use_postdiv;
+		int ret;
 
 		pll_cntl_1.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_1_OFFSET);
 		pll_cntl_5.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_5_OFFSET);
@@ -506,6 +657,10 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 		target_fbdiv =
 			clock_control_tt_bh_calculate_fbdiv(config->refclk_rate, (uint32_t)rate,
 							    pll_cntl_1, pll_cntl_5, use_postdiv, 0);
+		if (target_fbdiv == 0) {
+			k_mutex_unlock(&data->lock);
+			return -EINVAL;
+		}
 
 		while (pll_cntl_1.f.fbdiv != target_fbdiv) {
 			if (target_fbdiv > pll_cntl_1.f.fbdiv) {
@@ -517,17 +672,41 @@ static int clock_control_tt_bh_set_rate(const struct device *dev, clock_control_
 			clock_control_tt_bh_write_reg(config, PLL_CNTL_1_OFFSET, pll_cntl_1.val);
 			k_busy_wait_ns(100);
 		}
+
+		ret = clock_control_tt_bh_wait_lock(config->inst);
+		if (ret != 0) {
+			LOG_ERR("AICLK update failed (%d); restoring known-good configuration",
+				ret);
+			(void)clock_control_tt_bh_restore_known_good(config, data, &known_good);
+			k_mutex_unlock(&data->lock);
+			return ret;
+		}
+
+		pll_cntl_1.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_1_OFFSET);
+		if (pll_cntl_1.f.fbdiv != target_fbdiv) {
+			LOG_ERR("AICLK fbdiv readback %u != target %u", pll_cntl_1.f.fbdiv,
+				target_fbdiv);
+			(void)clock_control_tt_bh_restore_known_good(config, data, &known_good);
+			k_mutex_unlock(&data->lock);
+			return -EIO;
+		}
+		data->settings.pll_cntl_1 = pll_cntl_1;
 	} else if (clock == CLOCK_CONTROL_TT_BH_INIT_STATE) {
 		struct tt_bh_pll_settings settings = config->init_settings;
 
-		clock_control_tt_bh_update(config, data, &settings);
+		int ret = clock_control_tt_bh_update(config, data, &settings);
+
+		if (ret != 0) {
+			k_mutex_unlock(&data->lock);
+			return ret;
+		}
 		clock_control_enable_clk_counters(config);
 	} else {
-		k_spin_unlock(&data->lock, key);
+		k_mutex_unlock(&data->lock);
 		return -ENOTSUP;
 	}
 
-	k_spin_unlock(&data->lock, key);
+	k_mutex_unlock(&data->lock);
 	return 0;
 }
 
@@ -537,9 +716,8 @@ static int clock_control_tt_bh_configure(const struct device *dev, clock_control
 	const struct clock_control_tt_bh_config *config =
 		(const struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
-	k_spinlock_key_t key;
 
-	if (k_spin_trylock(&data->lock, &key) < 0) {
+	if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
 		return -EBUSY;
 	}
 
@@ -559,11 +737,11 @@ static int clock_control_tt_bh_configure(const struct device *dev, clock_control
 		/* Disable all external postdivs on all PLLs */
 		clock_control_tt_bh_write_reg(config, PLL_USE_POSTDIV_OFFSET, 0);
 
-		k_spin_unlock(&data->lock, key);
+		k_mutex_unlock(&data->lock);
 		return 0;
 	}
 
-	k_spin_unlock(&data->lock, key);
+	k_mutex_unlock(&data->lock);
 	return -ENOTSUP;
 }
 
@@ -572,59 +750,23 @@ static int clock_control_tt_bh_init(const struct device *dev)
 	const struct clock_control_tt_bh_config *config =
 		(const struct clock_control_tt_bh_config *)dev->config;
 	struct clock_control_tt_bh_data *data = (struct clock_control_tt_bh_data *)dev->data;
-	k_spinlock_key_t key;
 	int ret;
 
-	if (k_spin_trylock(&data->lock, &key) < 0) {
+	k_mutex_init(&data->lock);
+	if (k_mutex_lock(&data->lock, K_NO_WAIT) != 0) {
 		return -EBUSY;
 	}
 
 	data->settings = config->init_settings;
-	union tt_bh_pll_cntl_0_reg pll_cntl_0;
-
-	/* Before turning off PLL, bypass PLL so glitch free mux has no chance to switch */
-	pll_cntl_0.val = clock_control_tt_bh_read_reg(config, PLL_CNTL_0_OFFSET);
-	pll_cntl_0.f.bypass = 0;
-
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	k_busy_wait(3);
-
-	/* Power down PLL and disable PLL reset */
-	pll_cntl_0.val = 0;
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	clock_control_tt_bh_config_vco(config, &config->init_settings);
-
-	/* Power sequence requires PLLEN get asserted 1us after all inputs are stable. */
-	/* Wait 5x this time to be conservative */
-	k_busy_wait(5);
-
-	/* Power up PLLs */
-	pll_cntl_0.f.pd = 1;
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	/* Wait for PLLs to lock */
-	ret = clock_control_tt_bh_wait_lock(config->inst);
-	if (ret < 0) {
-		return ret;
+	data->safe_bypass = false;
+	data->safe_bypass_verified = false;
+	ret = clock_control_tt_bh_update(config, data, &config->init_settings);
+	if (ret == 0) {
+		clock_control_enable_clk_counters(config);
 	}
 
-	/* Setup external postdivs */
-	clock_control_tt_bh_config_ext_postdivs(config, &config->init_settings);
-
-	k_busy_wait_ns(300);
-
-	/* Disable PLL bypass */
-	pll_cntl_0.f.bypass = 1;
-	clock_control_tt_bh_write_reg(config, PLL_CNTL_0_OFFSET, pll_cntl_0.val);
-
-	k_busy_wait_ns(300);
-
-	clock_control_enable_clk_counters(config);
-
-	k_spin_unlock(&data->lock, key);
-	return 0;
+	k_mutex_unlock(&data->lock);
+	return ret;
 }
 
 static DEVICE_API(clock_control,

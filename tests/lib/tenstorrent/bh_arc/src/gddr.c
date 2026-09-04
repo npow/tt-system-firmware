@@ -12,7 +12,7 @@
 #include "gddr.h"
 #include "noc2axi.h"
 #include "reg_mock.h"
-static const uint32_t mrisc_tlb = 13U;
+static const uint32_t mrisc_tlb = 12U;
 static const uint32_t mrisc_msg_reg = ARC_NOC0_BASE_ADDR + (mrisc_tlb << NOC_TLB_LOG_SIZE) +
 				      (MRISC_MSG_REGISTER & NOC_TLB_WINDOW_ADDR_MASK);
 

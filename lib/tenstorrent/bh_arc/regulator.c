@@ -5,6 +5,7 @@
  */
 
 #include "avs.h"
+#include "dvfs.h"
 #include "dw_apb_i2c.h"
 #include "init.h"
 #include "regulator.h"
@@ -75,6 +76,42 @@ LOG_MODULE_REGISTER(regulator);
 static uint8_t vout_cmd_source = VoutCommand;
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 
+static uint32_t PmbusRead(uint32_t slave_addr, uint16_t command, uint8_t *data, uint32_t data_size)
+{
+	uint32_t status;
+
+	if (I2CLock(PMBUS_MST_ID) != 0) {
+		return -EINVAL;
+	}
+	status = I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+	if (status != 0) {
+		I2CUnlock(PMBUS_MST_ID);
+		return status;
+	}
+	status = I2CReadBytes(PMBUS_MST_ID, command, PMBUS_CMD_BYTE_SIZE, data, data_size,
+			      PMBUS_FLIP_BYTES);
+	I2CUnlock(PMBUS_MST_ID);
+	return status;
+}
+
+static uint32_t PmbusWrite(uint32_t slave_addr, uint16_t command, const uint8_t *data,
+			   uint32_t data_size)
+{
+	uint32_t status;
+
+	if (I2CLock(PMBUS_MST_ID) != 0) {
+		return -EINVAL;
+	}
+	status = I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
+	if (status != 0) {
+		I2CUnlock(PMBUS_MST_ID);
+		return status;
+	}
+	status = I2CWriteBytes(PMBUS_MST_ID, command, PMBUS_CMD_BYTE_SIZE, data, data_size);
+	I2CUnlock(PMBUS_MST_ID);
+	return status;
+}
+
 static float ConvertLinear11ToFloat(uint16_t value)
 {
 	int16_t exponent = (value >> 11) & 0x1f;
@@ -96,33 +133,36 @@ static float ConvertGddrIoCurrentToFloat(uint16_t value)
 /* The function returns the core current in A. */
 float GetVcoreCurrent(void)
 {
-	I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t iout;
+	uint16_t iout = 0;
 
-	I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&iout,
-		     READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (PmbusRead(P0V8_VCORE_ADDR, READ_IOUT, (uint8_t *)&iout, READ_IOUT_DATA_BYTE_SIZE) !=
+	    0) {
+		return FLT_MAX;
+	}
 	return ConvertLinear11ToFloat(iout);
 }
 
 /* The function returns the GDDR west IO rail current in A. */
 float GetGddrWestIoCurrent(void)
 {
-	I2CInit(I2CMst, GDDRIO_WEST_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t iout;
+	uint16_t iout = 0;
 
-	I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&iout,
-		     READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (PmbusRead(GDDRIO_WEST_ADDR, READ_IOUT, (uint8_t *)&iout, READ_IOUT_DATA_BYTE_SIZE) !=
+	    0) {
+		return FLT_MAX;
+	}
 	return ConvertGddrIoCurrentToFloat(iout);
 }
 
 /* The function returns the GDDR east IO rail current in A. */
 float GetGddrEastIoCurrent(void)
 {
-	I2CInit(I2CMst, GDDRIO_EAST_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t iout;
+	uint16_t iout = 0;
 
-	I2CReadBytes(PMBUS_MST_ID, READ_IOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&iout,
-		     READ_IOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (PmbusRead(GDDRIO_EAST_ADDR, READ_IOUT, (uint8_t *)&iout, READ_IOUT_DATA_BYTE_SIZE) !=
+	    0) {
+		return FLT_MAX;
+	}
 	return ConvertGddrIoCurrentToFloat(iout);
 }
 
@@ -141,73 +181,74 @@ float GetGddrEastIoPower(void)
 /* The function returns the core power in W. */
 float GetVcorePower(void)
 {
-	I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
-	uint16_t pout;
+	uint16_t pout = 0;
 
-	I2CReadBytes(PMBUS_MST_ID, READ_POUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&pout,
-		     READ_POUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (PmbusRead(P0V8_VCORE_ADDR, READ_POUT, (uint8_t *)&pout, READ_POUT_DATA_BYTE_SIZE) !=
+	    0) {
+		return FLT_MAX;
+	}
 	return ConvertLinear11ToFloat(pout);
 }
 
-static void set_max20730(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
+static uint32_t set_max20730(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	float vref = voltage_in_mv / (1 + rfb1 / rfb2);
 	uint16_t vout_cmd = vref * LINEAR_FORMAT_CONSTANT * 0.001f;
 
-	I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		      VOUT_COMMAND_DATA_BYTE_SIZE);
+	uint32_t status = PmbusWrite(slave_addr, VOUT_COMMAND, (uint8_t *)&vout_cmd,
+				     VOUT_COMMAND_DATA_BYTE_SIZE);
 
 	/* delay to flush i2c transaction and voltage change */
 	WaitUs(250);
+	return status;
 }
 
-static void set_mpm3695(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
+static uint32_t set_mpm3695(uint32_t slave_addr, uint32_t voltage_in_mv, float rfb1, float rfb2)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	uint16_t vout_cmd = voltage_in_mv * 0.5f / SCALE_LOOP / (1 + rfb1 / rfb2);
 
-	I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		      VOUT_COMMAND_DATA_BYTE_SIZE);
+	uint32_t status = PmbusWrite(slave_addr, VOUT_COMMAND, (uint8_t *)&vout_cmd,
+				     VOUT_COMMAND_DATA_BYTE_SIZE);
 
 	/* delay to flush i2c transaction and voltage change */
 	WaitUs(250);
+	return status;
 }
 
 /* Set MAX20816 voltage using I2C, MAX20816 is used for Vcore and Vcorem */
-static void i2c_set_max20816(uint32_t slave_addr, uint32_t voltage_in_mv)
+static uint32_t i2c_set_max20816(uint32_t slave_addr, uint32_t voltage_in_mv)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	uint16_t vout_cmd = 2 * voltage_in_mv;
 
-	I2CWriteBytes(PMBUS_MST_ID, VOUT_COMMAND, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		      VOUT_COMMAND_DATA_BYTE_SIZE);
+	uint32_t status = PmbusWrite(slave_addr, VOUT_COMMAND, (uint8_t *)&vout_cmd,
+				     VOUT_COMMAND_DATA_BYTE_SIZE);
 
 	/* 100us to flush the tx of i2c + 150us to cover voltage switch from 0.65V to 0.95V with
 	 * 50us of margin
 	 */
 	WaitUs(250);
+	return status;
 }
 
 /* Returns MAX20816 output volage in mV. */
-static float i2c_get_max20816(uint32_t slave_addr)
+static uint32_t i2c_get_max20816(uint32_t slave_addr)
 {
-	I2CInit(I2CMst, slave_addr, I2CFastMode, PMBUS_MST_ID);
 	uint16_t vout_cmd = 0;
 
-	I2CReadBytes(PMBUS_MST_ID, READ_VOUT, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&vout_cmd,
-		     READ_VOUT_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (PmbusRead(slave_addr, READ_VOUT, (uint8_t *)&vout_cmd, READ_VOUT_DATA_BYTE_SIZE) != 0) {
+		return UINT32_MAX;
+	}
 
-	return vout_cmd * 0.5f;
+	return vout_cmd / 2U;
 }
 
-void set_vcore(uint32_t voltage_in_mv)
+uint32_t set_vcore(uint32_t voltage_in_mv)
 {
 	if (vout_cmd_source == AVSVoutCommand) {
-		AVSWriteVoltage(voltage_in_mv, AVS_VCORE_RAIL);
-	} else {
-		i2c_set_max20816(P0V8_VCORE_ADDR, voltage_in_mv);
+		return AVSWriteVoltage(voltage_in_mv, AVS_VCORE_RAIL);
 	}
+
+	return i2c_set_max20816(P0V8_VCORE_ADDR, voltage_in_mv);
 }
 
 uint32_t get_vcore(void)
@@ -215,9 +256,9 @@ uint32_t get_vcore(void)
 	return i2c_get_max20816(P0V8_VCORE_ADDR);
 }
 
-void set_vcorem(uint32_t voltage_in_mv)
+uint32_t set_vcorem(uint32_t voltage_in_mv)
 {
-	i2c_set_max20816(P0V8_VCOREM_ADDR, voltage_in_mv);
+	return i2c_set_max20816(P0V8_VCOREM_ADDR, voltage_in_mv);
 }
 
 uint32_t get_vcorem(void)
@@ -226,34 +267,56 @@ uint32_t get_vcorem(void)
 }
 
 /* Set GDDR VDDR voltage for corner parts before DRAM training */
-void set_gddr_vddr(PcbType board_type, uint32_t voltage_in_mv)
+uint32_t set_gddr_vddr(PcbType board_type, uint32_t voltage_in_mv)
 {
 	if (board_type == PcbTypeOrionSLT) {
-		set_max20730(CB_GDDR_VDDR_WEST_ADDR, voltage_in_mv, CB_GDDR_VDDR_FB1,
-			     CB_GDDR_VDDR_FB2);
-		set_max20730(CB_GDDR_VDDR_EAST_ADDR, voltage_in_mv, CB_GDDR_VDDR_FB1,
-			     CB_GDDR_VDDR_FB2);
-	} else {
-		set_mpm3695(GDDR_VDDR_ADDR, voltage_in_mv, GDDR_VDDR_FB1, GDDR_VDDR_FB2);
+		uint32_t west_status = set_max20730(CB_GDDR_VDDR_WEST_ADDR, voltage_in_mv,
+						    CB_GDDR_VDDR_FB1, CB_GDDR_VDDR_FB2);
+		uint32_t east_status = set_max20730(CB_GDDR_VDDR_EAST_ADDR, voltage_in_mv,
+						    CB_GDDR_VDDR_FB1, CB_GDDR_VDDR_FB2);
+
+		return west_status != 0 ? west_status : east_status;
 	}
+
+	return set_mpm3695(GDDR_VDDR_ADDR, voltage_in_mv, GDDR_VDDR_FB1, GDDR_VDDR_FB2);
 }
 
-void SwitchVoutControl(enum VoltageCmdSource source)
+uint32_t SwitchVoutControl(enum VoltageCmdSource source)
 {
-	I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
-	struct OperationBits operation;
+	uint32_t status;
+	struct OperationBits operation = {0};
 
-	I2CReadBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
-		     OPERATION_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (source > AVSVoutCommand) {
+		return -EINVAL;
+	}
+	if (I2CLock(PMBUS_MST_ID) != 0) {
+		return -EINVAL;
+	}
+	status = I2CInit(I2CMst, P0V8_VCORE_ADDR, I2CFastMode, PMBUS_MST_ID);
+	if (status != 0) {
+		I2CUnlock(PMBUS_MST_ID);
+		return status;
+	}
+	status = I2CReadBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
+			      OPERATION_DATA_BYTE_SIZE, PMBUS_FLIP_BYTES);
+	if (status != 0) {
+		I2CUnlock(PMBUS_MST_ID);
+		return status;
+	}
 	operation.transition_control =
 		1; /* copy vout command when control is passed from AVSBus to PMBus */
 	operation.voltage_command_source = source;
-	I2CWriteBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
-		      OPERATION_DATA_BYTE_SIZE);
+	status = I2CWriteBytes(PMBUS_MST_ID, OPERATION, PMBUS_CMD_BYTE_SIZE, (uint8_t *)&operation,
+			       OPERATION_DATA_BYTE_SIZE);
+	I2CUnlock(PMBUS_MST_ID);
+	if (status != 0) {
+		return status;
+	}
 
 	/* 100us to flush the tx of i2c */
 	WaitUs(100);
 	vout_cmd_source = source;
+	return 0;
 }
 
 uint32_t RegulatorInit(PcbType board_type)
@@ -284,7 +347,17 @@ uint32_t RegulatorInit(PcbType board_type)
 			const struct regulator_config *regulator_config =
 				regulators_config->regulator_config + i;
 
-			I2CInit(I2CMst, regulator_config->address, I2CFastMode, PMBUS_MST_ID);
+			if (I2CLock(PMBUS_MST_ID) != 0) {
+				aggregate_i2c_errors |= EINVAL;
+				continue;
+			}
+			i2c_error = I2CInit(I2CMst, regulator_config->address, I2CFastMode,
+					    PMBUS_MST_ID);
+			if (i2c_error != 0) {
+				aggregate_i2c_errors |= i2c_error;
+				I2CUnlock(PMBUS_MST_ID);
+				continue;
+			}
 
 			for (uint32_t j = 0; j < regulator_config->count; j++) {
 				const struct regulator_data *regulator_data =
@@ -321,6 +394,7 @@ uint32_t RegulatorInit(PcbType board_type)
 					}
 				}
 			}
+			I2CUnlock(PMBUS_MST_ID);
 		}
 	}
 	return aggregate_i2c_errors;
@@ -346,13 +420,18 @@ static uint8_t set_voltage_handler(const union request *request, struct response
 	uint32_t slave_addr = request->set_voltage.slave_addr;
 	uint32_t voltage_in_mv = request->set_voltage.voltage_in_mv;
 
+	/* Direct regulator writes bypass the VF arbiter and can undervolt a live
+	 * high-frequency clock. Runtime callers must use the ordered DVFS controls.
+	 */
+	if (dvfs_enabled) {
+		return 2;
+	}
+
 	switch (slave_addr) {
 	case P0V8_VCORE_ADDR:
-		set_vcore(voltage_in_mv);
-		return 0;
+		return set_vcore(voltage_in_mv) != 0;
 	case P0V8_VCOREM_ADDR:
-		set_vcorem(voltage_in_mv);
-		return 0;
+		return set_vcorem(voltage_in_mv) != 0;
 	default:
 		return 1;
 	}
@@ -381,10 +460,10 @@ static uint8_t get_voltage_handler(const union request *request, struct response
 	switch (slave_addr) {
 	case P0V8_VCORE_ADDR:
 		response->data[1] = get_vcore();
-		return 0;
+		return response->data[1] == UINT32_MAX;
 	case P0V8_VCOREM_ADDR:
 		response->data[1] = get_vcorem();
-		return 0;
+		return response->data[1] == UINT32_MAX;
 	default:
 		return 1;
 	}
@@ -409,13 +488,17 @@ static uint8_t switch_vout_control_handler(const union request *request, struct 
 {
 	uint32_t source = request->switch_vout_control.source;
 
-	SwitchVoutControl(source);
-	return 0;
+	/* Keep runtime voltage changes on the source validated during DVFS init. */
+	if (dvfs_enabled) {
+		return 2;
+	}
+	return SwitchVoutControl(source) != 0;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_SET_VOLTAGE, set_voltage_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_GET_VOLTAGE, get_voltage_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_SWITCH_VOUT_CONTROL, switch_vout_control_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_SET_VOLTAGE, set_voltage_handler, MSGQUEUE_COMMAND_DENIED);
+REGISTER_MESSAGE(TT_SMC_MSG_GET_VOLTAGE, get_voltage_handler, MSGQUEUE_COMMAND_DIAGNOSTIC);
+REGISTER_MESSAGE(TT_SMC_MSG_SWITCH_VOUT_CONTROL, switch_vout_control_handler,
+		 MSGQUEUE_COMMAND_DENIED);
 
 static int regulator_init(void)
 {

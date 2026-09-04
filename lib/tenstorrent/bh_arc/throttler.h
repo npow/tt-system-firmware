@@ -37,6 +37,7 @@ void ThrottlerTestSetRuntimePowerControllerInitialized(bool initialized);
 void ThrottlerTestCompleteRuntimePowerControllerInit(void);
 void ThrottlerTestStartRuntimePowerSampleWatchdog(uint32_t now_ms);
 void ThrottlerTestRecordInputPowerSampleAtPower(uint32_t now_ms, uint16_t input_power);
+void ThrottlerTestApplyPendingBoardPowerLimit(void);
 uint16_t ThrottlerTestConsumeRuntimePowerPeak(void);
 bool ThrottlerTestRuntimePowerSampleExpired(uint32_t now_ms);
 bool ThrottlerTestUpdateRuntimePowerFreshnessGuard(uint32_t now_ms);

@@ -76,6 +76,25 @@ static uint32_t power_slew_last_rise_ms;
 static uint32_t final_arbiter_count[aiclk_arb_max_count];
 static uint32_t throttler_frozen_mask;
 static uint32_t throttler_overflow_mask;
+static int last_aiclk_set_error;
+#if defined(CONFIG_ZTEST)
+static bool test_fail_dvfs_control_change;
+#endif
+
+static uint8_t apply_dvfs_control_change_locked(uint8_t failure_code)
+{
+	if (!dvfs_enabled) {
+		return 0;
+	}
+
+#if defined(CONFIG_ZTEST)
+	if (test_fail_dvfs_control_change) {
+		return failure_code;
+	}
+#endif
+
+	return DVFSChangeLocked() ? 0 : failure_code;
+}
 
 void SetAiclkArbMax(enum aiclk_arb_max arb_max, float freq)
 {
@@ -135,6 +154,12 @@ void AiclkTestClearCharacterizationOverrides(void)
 	aiclk_ppm.forced_freq = 0U;
 	aiclk_ppm.sweep_en = 0U;
 	aiclk_ppm.host_requested_fmin = 0U;
+	test_fail_dvfs_control_change = false;
+}
+
+void AiclkTestFailDvfsControlChange(bool fail)
+{
+	test_fail_dvfs_control_change = fail;
 }
 #endif
 
@@ -243,37 +268,52 @@ void CalculateTargAiclk(void)
 			      aiclk_ppm.lim_arb_info.u32_all);
 }
 
-void DecreaseAiclk(void)
+static bool SetAiclkFrequency(uint32_t freq)
+{
+	int ret = clock_control_set_rate(pll_dev_0,
+					 (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
+					 (clock_control_subsys_rate_t)freq);
+
+	if (ret != 0) {
+		if (ret != last_aiclk_set_error) {
+			LOG_WRN("AICLK set to %u MHz failed: %d", freq, ret);
+			last_aiclk_set_error = ret;
+		}
+		return false;
+	}
+
+	last_aiclk_set_error = 0;
+	aiclk_ppm.curr_freq = freq;
+	sys_trace_named_event("aiclk_update", aiclk_ppm.curr_freq, aiclk_ppm.targ_freq);
+	return true;
+}
+
+bool DecreaseAiclk(void)
 {
 	if (ThrottlerRuntimePowerClampActive()) {
 		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
 	}
 	if (aiclk_ppm.targ_freq < aiclk_ppm.curr_freq) {
-		clock_control_set_rate(pll_dev_0,
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-				       (clock_control_subsys_rate_t)aiclk_ppm.targ_freq);
-		aiclk_ppm.curr_freq = aiclk_ppm.targ_freq;
-		sys_trace_named_event("aiclk_update", aiclk_ppm.curr_freq, aiclk_ppm.targ_freq);
+		return SetAiclkFrequency(aiclk_ppm.targ_freq);
 	}
+
+	return true;
 }
 
-void IncreaseAiclk(void)
+bool IncreaseAiclk(void)
 {
 	/* Never commit an upward target calculated before an asynchronous sample
 	 * asserted the power clamp.
 	 */
 	if (ThrottlerRuntimePowerClampActive()) {
 		aiclk_ppm.targ_freq = aiclk_ppm.fmin;
-		DecreaseAiclk();
-		return;
+		return DecreaseAiclk();
 	}
 	if (aiclk_ppm.targ_freq > aiclk_ppm.curr_freq) {
-		clock_control_set_rate(pll_dev_0,
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-				       (clock_control_subsys_rate_t)aiclk_ppm.targ_freq);
-		aiclk_ppm.curr_freq = aiclk_ppm.targ_freq;
-		sys_trace_named_event("aiclk_update", aiclk_ppm.curr_freq, aiclk_ppm.targ_freq);
+		return SetAiclkFrequency(aiclk_ppm.targ_freq);
 	}
+
+	return true;
 }
 
 float GetThrottlerArbMax(enum aiclk_arb_max arb_max)
@@ -366,30 +406,57 @@ uint8_t ForceAiclk(uint32_t freq)
 		return 1;
 	}
 
+	if (!DVFSControlLock()) {
+		return 2;
+	}
+
+	uint8_t status = 0;
+
 	if (dvfs_enabled) {
 		aiclk_ppm.forced_freq = freq;
-		DVFSChange();
+		status = apply_dvfs_control_change_locked(2);
 	} else {
-		/* restore to boot frequency */
-		if (freq == 0) {
-			freq = aiclk_ppm.boot_freq;
+		/* If voltage initialization failed, a requested frequency has no
+		 * verified VF operating point. Only restoring the boot clock is safe.
+		 */
+		if (freq != 0U) {
+			status = 2;
+			goto out;
 		}
 
-		clock_control_set_rate(pll_dev_0,
-				       (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-				       (clock_control_subsys_rate_t)freq);
+		aiclk_ppm.forced_freq = 0U;
+		/* restore to boot frequency */
+		freq = aiclk_ppm.boot_freq;
+
+		if (!SetAiclkFrequency(freq)) {
+			status = 2;
+		}
 	}
-	return 0;
+
+out:
+	DVFSControlUnlock();
+	return status;
 }
 
-void SetAiclkResetSafe(bool enable)
+bool SetAiclkResetSafe(bool enable)
 {
-	if (aiclk_ppm.reset_safe == enable) {
-		return;
+	if (!DVFSControlLock()) {
+		return false;
 	}
 
-	aiclk_ppm.reset_safe = enable;
-	DVFSChange();
+	bool success = true;
+
+	if (aiclk_ppm.reset_safe != enable) {
+		aiclk_ppm.reset_safe = enable;
+		success = apply_dvfs_control_change_locked(1) == 0;
+		if (!success && !enable) {
+			/* A failed release must remain fail-safe in software too. */
+			aiclk_ppm.reset_safe = true;
+		}
+	}
+
+	DVFSControlUnlock();
+	return success;
 }
 
 uint32_t GetAiclkTarg(void)
@@ -407,7 +474,7 @@ uint32_t GetAiclkFmax(void)
 	return aiclk_ppm.fmax;
 }
 
-void aiclk_update_busy(void)
+void aiclk_update_busy_locked(void)
 {
 	bool aiclk_state;
 
@@ -418,6 +485,17 @@ void aiclk_update_busy(void)
 	} else {
 		SetAiclkArbMin(aiclk_arb_min_busy, aiclk_ppm.fmin);
 	}
+}
+
+void aiclk_update_busy(void)
+{
+	if (!DVFSControlLock()) {
+		return;
+	}
+
+	aiclk_update_busy_locked();
+	(void)apply_dvfs_control_change_locked(0);
+	DVFSControlUnlock();
 }
 
 uint32_t get_aiclk_effective_arb_min(enum aiclk_arb_min *effective_min_arb)
@@ -490,9 +568,32 @@ uint32_t get_enabled_arb_max_bitmask(void)
  */
 static uint8_t aiclk_busy_handler(const union request *request, struct response *response)
 {
-	last_msg_busy = (request->aiclk_set_speed.command_code == TT_SMC_MSG_AICLK_GO_BUSY);
-	aiclk_update_busy();
-	return 0;
+	ARG_UNUSED(response);
+	bool previous_busy;
+	bool requested_busy;
+
+	if (!DVFSControlLock()) {
+		return 2;
+	}
+
+	previous_busy = last_msg_busy;
+	requested_busy = request->aiclk_set_speed.command_code == TT_SMC_MSG_AICLK_GO_BUSY;
+	last_msg_busy = requested_busy;
+	aiclk_update_busy_locked();
+
+	uint8_t status = apply_dvfs_control_change_locked(2);
+
+	if (status != 0) {
+		/* A failed raise must not be retried by the periodic DVFS worker. A
+		 * failed idle request is already fail-safe and remains in force.
+		 */
+		last_msg_busy = previous_busy && requested_busy;
+		aiclk_update_busy_locked();
+		(void)apply_dvfs_control_change_locked(2);
+	}
+
+	DVFSControlUnlock();
+	return status;
 }
 
 /**
@@ -512,8 +613,11 @@ static uint8_t ForceAiclkHandler(const union request *request, struct response *
  */
 static uint8_t get_aiclk_handler(const union request *request, struct response *response)
 {
-	clock_control_get_rate(pll_dev_0, (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
-			       &(response->data[1]));
+	if (clock_control_get_rate(pll_dev_0,
+				   (clock_control_subsys_t)CLOCK_CONTROL_TT_BH_CLOCK_AICLK,
+				   &(response->data[1])) != 0) {
+		return 1;
+	}
 
 	if (!dvfs_enabled) {
 		response->data[2] = CLOCK_MODE_UNCONTROLLED;
@@ -532,17 +636,39 @@ static uint8_t get_aiclk_handler(const union request *request, struct response *
  */
 static uint8_t SweepAiclkHandler(const union request *request, struct response *response)
 {
+	ARG_UNUSED(response);
+
+	if (!DVFSControlLock()) {
+		return 2;
+	}
+
 	if (request->command_code == TT_SMC_MSG_AISWEEP_START) {
 		if (request->aisweep.sweep_low == 0 || request->aisweep.sweep_high == 0) {
+			DVFSControlUnlock();
 			return 1;
 		}
-		aiclk_ppm.sweep_low = MAX(request->aisweep.sweep_low, aiclk_ppm.fmin);
-		aiclk_ppm.sweep_high = MIN(request->aisweep.sweep_high, aiclk_ppm.fmax);
+		uint32_t sweep_low = MAX(request->aisweep.sweep_low, aiclk_ppm.fmin);
+		uint32_t sweep_high = MIN(request->aisweep.sweep_high, aiclk_ppm.fmax);
+
+		/* Validate after intersecting with the firmware envelope. An empty or
+		 * inverted interval would underflow the unsigned range used by rand() and
+		 * could pass an enormous target to the PLL feedback-divider step loop.
+		 */
+		if (sweep_low > sweep_high) {
+			DVFSControlUnlock();
+			return 1;
+		}
+		aiclk_ppm.sweep_low = sweep_low;
+		aiclk_ppm.sweep_high = sweep_high;
 		aiclk_ppm.sweep_en = 1;
 	} else {
 		aiclk_ppm.sweep_en = 0;
 	}
-	return 0;
+
+	uint8_t status = apply_dvfs_control_change_locked(2);
+
+	DVFSControlUnlock();
+	return status;
 }
 
 union aiclk_targ_freq_info get_targ_aiclk_info(void)
@@ -552,20 +678,44 @@ union aiclk_targ_freq_info get_targ_aiclk_info(void)
 
 static uint8_t set_arb_host_fmax_handler(const union request *request, struct response *response)
 {
+	ARG_UNUSED(response);
+
 	uint32_t new_fmax;
+	uint32_t enabled_arbiters;
+	uint32_t previous_fmax;
+	bool previous_enabled;
+	uint8_t status;
+
+	if (!DVFSControlLock()) {
+		return 2;
+	}
+
+	enabled_arbiters = get_enabled_arb_max_bitmask();
+	previous_enabled = (enabled_arbiters & BIT(aiclk_arb_max_host_fmax)) != 0U;
+	previous_fmax = (uint32_t)GetThrottlerArbMax(aiclk_arb_max_host_fmax);
 
 	if (request->set_asic_host_fmax.restore_default) {
 		/* Disable the host_fmax arbiter */
 		EnableArbMax(aiclk_arb_max_host_fmax, false);
 		UpdateTelemetryHostAiclkLimit(0);
 		LOG_INF("host fmax arbiter disabled");
-		return 0;
+		status = apply_dvfs_control_change_locked(2);
+		if (status != 0) {
+			EnableArbMax(aiclk_arb_max_host_fmax, previous_enabled);
+			SetAiclkArbMax(aiclk_arb_max_host_fmax, (float)previous_fmax);
+			UpdateTelemetryHostAiclkLimit(previous_enabled ? previous_fmax : 0U);
+			(void)apply_dvfs_control_change_locked(2);
+		}
+
+		DVFSControlUnlock();
+		return status;
 	}
 
 	new_fmax = request->set_asic_host_fmax.asic_fmax;
 
 	/* Reject if outside valid range [AICLK_FMAX_MIN, AICLK_FMAX_MAX] */
 	if (new_fmax > (uint32_t)AICLK_FMAX_MAX || new_fmax < (uint32_t)AICLK_FMAX_MIN) {
+		DVFSControlUnlock();
 		return 1;
 	}
 
@@ -573,7 +723,18 @@ static uint8_t set_arb_host_fmax_handler(const union request *request, struct re
 	SetAiclkArbMax(aiclk_arb_max_host_fmax, (float)new_fmax);
 	UpdateTelemetryHostAiclkLimit(new_fmax);
 	LOG_INF("host fmax arbiter enabled, host fmax set to %u MHz", new_fmax);
-	return 0;
+	status = apply_dvfs_control_change_locked(2);
+	if (status != 0 && previous_enabled && new_fmax > previous_fmax) {
+		/* Preserve the prior tighter ceiling after a failed raise. A failed
+		 * tightening remains safe to retry on a later DVFS tick.
+		 */
+		SetAiclkArbMax(aiclk_arb_max_host_fmax, (float)previous_fmax);
+		UpdateTelemetryHostAiclkLimit(previous_fmax);
+		(void)apply_dvfs_control_change_locked(2);
+	}
+
+	DVFSControlUnlock();
+	return status;
 }
 
 /** @brief Handles the characterization submessage for setting host minimum frequency floor
@@ -584,23 +745,36 @@ static uint8_t set_arb_host_fmax_handler(const union request *request, struct re
 static uint8_t handle_char_set_host_fmin(const struct characterisation_set_fmin_submsg fmin_value,
 					 struct response *response)
 {
+	ARG_UNUSED(response);
+
 	uint32_t new_fmin = fmin_value.value;
+
+	if (!DVFSControlLock()) {
+		return 2;
+	}
 
 	/* Check for restore flag */
 	if (new_fmin == 1) {
 		aiclk_ppm.host_requested_fmin = 0;
 		LOG_INF("host fmin floor disabled");
-		return 0;
+		uint8_t status = apply_dvfs_control_change_locked(2);
+
+		DVFSControlUnlock();
+		return status;
 	}
 
 	/* Reject if outside valid range [AICLK_FMIN_MIN, AICLK_FMIN_MAX] */
 	if (new_fmin > (uint32_t)AICLK_FMIN_MAX || new_fmin < (uint32_t)AICLK_FMIN_MIN) {
+		DVFSControlUnlock();
 		return 1;
 	}
 
 	aiclk_ppm.host_requested_fmin = new_fmin;
 	LOG_INF("host fmin floor set to %u MHz", new_fmin);
-	return 0;
+	uint8_t status = apply_dvfs_control_change_locked(2);
+
+	DVFSControlUnlock();
+	return status;
 }
 
 /** @brief Dispatcher for characterization submessages
@@ -665,11 +839,12 @@ uint8_t throttler_counter_handler(const union request *request, struct response 
 	return 0;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_AICLK_GO_BUSY, aiclk_busy_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_AICLK_GO_LONG_IDLE, aiclk_busy_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_FORCE_AICLK, ForceAiclkHandler);
-REGISTER_MESSAGE(TT_SMC_MSG_GET_AICLK, get_aiclk_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_AISWEEP_START, SweepAiclkHandler);
-REGISTER_MESSAGE(TT_SMC_MSG_AISWEEP_STOP, SweepAiclkHandler);
-REGISTER_MESSAGE(TT_SMC_MSG_SET_ASIC_HOST_FMAX, set_arb_host_fmax_handler);
-REGISTER_MESSAGE(TT_SMC_MSG_CHARACTERISATION, characterisation_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_AICLK_GO_BUSY, aiclk_busy_handler, MSGQUEUE_COMMAND_MUTATING);
+REGISTER_MESSAGE(TT_SMC_MSG_AICLK_GO_LONG_IDLE, aiclk_busy_handler, MSGQUEUE_COMMAND_MUTATING);
+REGISTER_MESSAGE(TT_SMC_MSG_FORCE_AICLK, ForceAiclkHandler, MSGQUEUE_COMMAND_DENIED);
+REGISTER_MESSAGE(TT_SMC_MSG_GET_AICLK, get_aiclk_handler, MSGQUEUE_COMMAND_DIAGNOSTIC);
+REGISTER_MESSAGE(TT_SMC_MSG_AISWEEP_START, SweepAiclkHandler, MSGQUEUE_COMMAND_DENIED);
+REGISTER_MESSAGE(TT_SMC_MSG_AISWEEP_STOP, SweepAiclkHandler, MSGQUEUE_COMMAND_DENIED);
+REGISTER_MESSAGE(TT_SMC_MSG_SET_ASIC_HOST_FMAX, set_arb_host_fmax_handler,
+		 MSGQUEUE_COMMAND_MUTATING);
+REGISTER_MESSAGE(TT_SMC_MSG_CHARACTERISATION, characterisation_handler, MSGQUEUE_COMMAND_DENIED);

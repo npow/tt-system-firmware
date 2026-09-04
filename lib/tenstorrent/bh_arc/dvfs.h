@@ -10,9 +10,13 @@
 
 extern bool dvfs_enabled;
 
-void InitDVFS(void);
+int InitDVFS(void);
 void StartDVFSTimer(void);
 void AdjustDVFSTimer(void);
-void DVFSChange(void);
+void RequestDVFSUpdate(void);
+bool DVFSControlLock(void);
+void DVFSControlUnlock(void);
+bool DVFSChangeLocked(void);
+bool DVFSChange(void);
 
 #endif

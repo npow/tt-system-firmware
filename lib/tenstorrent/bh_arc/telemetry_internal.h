@@ -6,6 +6,7 @@
 #ifndef TELEMETRY_INTERNAL_H
 #define TELEMETRY_INTERNAL_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "gddr.h"
@@ -21,5 +22,14 @@ typedef struct {
 } TelemetryInternalData;
 
 void ReadTelemetryInternal(int64_t max_staleness, TelemetryInternalData *data);
+
+/* Copy the most recent complete telemetry sample without performing hardware
+ * access. Returns false when no complete sample exists or it is too old.
+ */
+bool ReadTelemetryInternalCached(uint32_t max_staleness, TelemetryInternalData *data);
+
+#if defined(CONFIG_ZTEST)
+void TelemetryInternalTestSetCached(const TelemetryInternalData *data);
+#endif
 
 #endif

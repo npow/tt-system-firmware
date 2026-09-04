@@ -107,7 +107,10 @@ static int bh_arc_init_end(void)
 			 * We currently don't have plans to implement L2CPUCLK PPM,
 			 * so currently, dvfs_enable == aiclk_ppm_enable
 			 */
-			InitDVFS();
+			if (InitDVFS() != 0) {
+				LOG_ERR("Not enabling AICLK PPM due to voltage init error");
+				record_init_failure(INIT_STAGE_REGULATOR);
+			}
 		}
 	}
 #endif

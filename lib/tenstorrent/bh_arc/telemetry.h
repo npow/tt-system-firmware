@@ -473,12 +473,31 @@ typedef union {
  */
 #define TAG_FW_ACTIVE_CONFIG_0 79
 
+/** @brief Runtime board-power controller status.
+ *
+ * This tag has a positive ABI signature so a host reading tag 80 from older
+ * firmware cannot mistake adjacent memory for a valid status word.
+ *
+ * - bits [31:16]: @ref RUNTIME_POWER_STATUS_ABI_VALUE
+ * - bit 3: controller initialization is complete
+ * - bit 2: a valid board-power sample is within the freshness deadline
+ * - bit 1: the cable/firmware-resolved board-power limit is enforced
+ * - bit 0: reserved and always zero (there is no persistent fault latch)
+ */
+#define TAG_RUNTIME_POWER_STATUS 80
+
+#define RUNTIME_POWER_STATUS_ABI_MASK      0xFFFF0000U
+#define RUNTIME_POWER_STATUS_ABI_VALUE     0x52500000U
+#define RUNTIME_POWER_STATUS_POLICY_STRICT (1U << 1)
+#define RUNTIME_POWER_STATUS_SAMPLE_FRESH  (1U << 2)
+#define RUNTIME_POWER_STATUS_POLICY_READY  (1U << 3)
+
 /** @} */ /* end of telemetry_tag group */
 
 /* Not a real tag, signifies the last tag in the list.
  * MUST be incremented if new tags are defined.
  */
-#define TAG_COUNT 80
+#define TAG_COUNT 81
 
 /* Telemetry tags are at offset `tag` in the telemetry buffer */
 #define TELEM_OFFSET(tag) (tag)
@@ -494,6 +513,7 @@ void UpdateTelemetryTdpLimit(uint32_t tdp_limit);
 void UpdateTelemetryThermTripCount(uint16_t therm_trip_count);
 void UpdateTelemetryHostAiclkLimit(uint32_t fmax);
 void UpdateTelemetryKernelThrottler(bool enabled, uint32_t stop_nops_freq);
+void UpdateTelemetryRuntimePowerStatus(uint32_t status);
 /** @brief Get the current active firmware feature bits from @ref TAG_FW_ACTIVE_CONFIG_0.
  * @ingroup telemetry_feature_capabilities
  *

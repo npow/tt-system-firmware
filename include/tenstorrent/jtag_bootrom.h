@@ -29,15 +29,13 @@ int jtag_bootrom_reset_asic(struct bh_chip *chip);
 int jtag_bootrom_patch_offset(struct bh_chip *chip, const uint32_t *patch, size_t patch_len,
 			      const uint32_t start_addr);
 int jtag_bootrom_verify(const struct device *dev, const uint32_t *patch, size_t patch_len);
-void jtag_bootrom_soft_reset_arc(struct bh_chip *chip);
-void jtag_bootrom_set_cable_power_limit(struct bh_chip *chip, uint16_t power_limit);
-void jtag_bootrom_teardown(const struct bh_chip *chip);
+int jtag_bootrom_verify_offset(const struct device *dev, const uint32_t *patch, size_t patch_len,
+			       uint32_t start_addr);
+int jtag_bootrom_soft_reset_arc(struct bh_chip *chip);
+int jtag_bootrom_set_cable_power_limit(struct bh_chip *chip, uint16_t power_limit);
+int jtag_bootrom_teardown(const struct bh_chip *chip);
 
 uint32_t jtag_bootrom_get_perst_start_time(void);
-
-/* for verification via gpio-emul */
-void jtag_bootrom_emul_setup(const uint32_t *buf, size_t buf_len);
-int jtag_bootrom_emul_axiread(uint32_t addr, uint32_t *value);
 
 #ifdef __cplusplus
 }

@@ -12,7 +12,24 @@
 
 bool dvfs_enabled;
 
-void DVFSChange(void)
+#define DVFS_WORK_STACK_SIZE 2048
+#define DVFS_WORK_PRIORITY   K_PRIO_PREEMPT(1)
+
+static struct k_work_q dvfs_work_q;
+static K_THREAD_STACK_DEFINE(dvfs_work_stack, DVFS_WORK_STACK_SIZE);
+K_MUTEX_DEFINE(dvfs_lock);
+
+bool DVFSControlLock(void)
+{
+	return k_mutex_lock(&dvfs_lock, K_MSEC(20)) == 0;
+}
+
+void DVFSControlUnlock(void)
+{
+	k_mutex_unlock(&dvfs_lock);
+}
+
+bool DVFSChangeLocked(void)
 {
 	CalculateThrottlers();
 	CalculateTargAiclk();
@@ -24,30 +41,74 @@ void DVFSChange(void)
 
 	CalculateTargVoltage();
 
-	DecreaseAiclk();
-	VoltageChange();
-	IncreaseAiclk();
+	if (!DecreaseAiclk()) {
+		/* If a downclock did not take effect, the old lower voltage may still be required.
+		 */
+		return false;
+	}
+	if (!VoltageChange()) {
+		/* A lower clock with the previous voltage is safe. Never raise the
+		 * clock unless the corresponding voltage request was acknowledged.
+		 */
+		return false;
+	}
+	if (!IncreaseAiclk()) {
+		return false;
+	}
+
+	return true;
+}
+
+bool DVFSChange(void)
+{
+	bool success;
+
+	if (!DVFSControlLock()) {
+		return false;
+	}
+	success = DVFSChangeLocked();
+	DVFSControlUnlock();
+	return success;
 }
 
 static void dvfs_work_handler(struct k_work *work)
 {
-	DVFSChange();
+	ARG_UNUSED(work);
+	(void)DVFSChange();
 }
 static K_WORK_DEFINE(dvfs_worker, dvfs_work_handler);
 
 static void dvfs_timer_handler(struct k_timer *timer)
 {
-	k_work_submit(&dvfs_worker);
+	ARG_UNUSED(timer);
+	k_work_submit_to_queue(&dvfs_work_q, &dvfs_worker);
 }
 static K_TIMER_DEFINE(dvfs_timer, dvfs_timer_handler, NULL);
 
-void InitDVFS(void)
+void RequestDVFSUpdate(void)
+{
+	if (dvfs_enabled) {
+		k_work_submit_to_queue(&dvfs_work_q, &dvfs_worker);
+	}
+}
+
+int InitDVFS(void)
 {
 	InitVFCurve();
-	InitVoltagePPM();
+	int ret = InitVoltagePPM();
+
+	if (ret != 0) {
+		dvfs_enabled = false;
+		return ret;
+	}
 	InitArbMaxVoltage();
 	InitThrottlers();
+	k_work_queue_start(&dvfs_work_q, dvfs_work_stack, K_THREAD_STACK_SIZEOF(dvfs_work_stack),
+			   DVFS_WORK_PRIORITY, NULL);
+	k_thread_name_set(&dvfs_work_q.thread, "bh_dvfs");
 	dvfs_enabled = true;
+	RequestDVFSUpdate();
+	return 0;
 }
 
 #define DVFS_MSEC 1
@@ -72,6 +133,11 @@ void StartDVFSTimer(void)
 
 void AdjustDVFSTimer(void)
 {
+	/* A DMC sample should wake the isolated safety loop immediately rather than
+	 * waiting for the next periodic tick.
+	 */
+	RequestDVFSUpdate();
+
 	/* We just received a board power update from the DMC. If DVFS is still more than 10% of
 	 * its interval away, then reduce that time by 1%. Over enough cycles, this should bring
 	 * the DMC->DVFS latency down.

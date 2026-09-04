@@ -6,6 +6,7 @@
 #ifndef CM2DM_MSG_H
 #define CM2DM_MSG_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <zephyr/toolchain.h>
 #include <tenstorrent/bh_arc.h>
@@ -15,6 +16,7 @@ int32_t Cm2DmMsgReqSmbusHandler(uint8_t *data, uint8_t *size);
 int32_t Cm2DmMsgAckSmbusHandler(const uint8_t *data, uint8_t size);
 
 void ChipResetRequest(void *arg);
+bool Cm2DmResetPending(void);
 void UpdateFanSpeedRequest(uint32_t fan_speed);
 void UpdateForcedFanSpeedRequest(uint32_t fan_speed);
 void Dm2CmReadyRequest(void);
@@ -37,5 +39,10 @@ int32_t Dm2CmWriteTelemetry(const uint8_t *data, uint8_t size);
 int32_t Dm2CmReadControlData(uint8_t *data, uint8_t *size);
 int32_t Dm2CmDMCLogHandler(const uint8_t *data, uint8_t size);
 int32_t Dm2CmPingV2(uint8_t *data, uint8_t *size);
+
+#ifdef CONFIG_ZTEST
+void Cm2DmResetTestClear(void);
+Cm2DmResetLevel Cm2DmResetTestPendingLevel(void);
+#endif
 
 #endif

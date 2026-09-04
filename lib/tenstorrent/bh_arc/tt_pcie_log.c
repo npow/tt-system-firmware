@@ -466,7 +466,7 @@ static struct log_backend_api backend_api = {
 };
 
 /* Register the message handler for tt_pcie_log commands */
-REGISTER_MESSAGE(TT_SMC_MSG_TT_PCIE_LOG, tt_pcie_log_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_TT_PCIE_LOG, tt_pcie_log_handler, MSGQUEUE_COMMAND_DENIED);
 
 /* Define and initialize the log backend - always enabled */
 LOG_BACKEND_DEFINE(backend_tt_pcie_log, backend_api, true);

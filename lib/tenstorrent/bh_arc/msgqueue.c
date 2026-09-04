@@ -18,6 +18,7 @@
 #include "status_reg.h"
 #include "reg.h"
 #include "irqnum.h"
+#include "cm2dm_msg.h"
 
 #define MSGHANDLER_COMPAT_MASK 0x1
 
@@ -93,6 +94,7 @@ static struct message_queue message_queues[NUM_MSG_QUEUES];
 
 /* All message handlers */
 static void *message_handlers[CONFIG_TT_BH_ARC_NUM_MSG_CODES];
+static enum msgqueue_command_policy message_policies[CONFIG_TT_BH_ARC_NUM_MSG_CODES];
 
 __attribute__((used)) static const uintptr_t message_queue_info[] = {
 	(uintptr_t)&message_queues, MSG_QUEUE_SIZE | (NUM_MSG_QUEUES << 8), 0, 0};
@@ -247,6 +249,67 @@ static void advance_serial(struct message_queue *queue, const union request *req
 	}
 }
 
+enum msgqueue_command_policy msgqueue_get_command_policy(const union request *request)
+{
+	switch (request->command_code) {
+	case TT_SMC_MSG_SET_LAST_SERIAL:
+	case TT_SMC_MSG_TEST:
+	case TT_SMC_MSG_REPORT_SCRATCH_ONLY:
+		return MSGQUEUE_COMMAND_DIAGNOSTIC;
+	default:
+		break;
+	}
+
+	if (request->command_code >= CONFIG_TT_BH_ARC_NUM_MSG_CODES ||
+	    message_handlers[request->command_code] == NULL) {
+		return MSGQUEUE_COMMAND_UNSPECIFIED;
+	}
+
+	enum msgqueue_command_policy policy = message_policies[request->command_code];
+
+	if (policy == MSGQUEUE_COMMAND_REQUEST_DEPENDENT) {
+		if (request->command_code == TT_SMC_MSG_COUNTER) {
+			switch (request->counter.command) {
+			case COUNTER_CMD_GET:
+				return MSGQUEUE_COMMAND_DIAGNOSTIC;
+			case COUNTER_CMD_CLEAR:
+			case COUNTER_CMD_FREEZE:
+				return MSGQUEUE_COMMAND_DENIED;
+			default:
+				return MSGQUEUE_COMMAND_DENIED;
+			}
+		}
+		if (request->command_code == TT_SMC_MSG_SET_WDT_TIMEOUT) {
+			return request->set_wdt_timeout.timeout_ms == 0 ? MSGQUEUE_COMMAND_MUTATING
+									: MSGQUEUE_COMMAND_DENIED;
+		}
+		return MSGQUEUE_COMMAND_DENIED;
+	}
+
+	return policy;
+}
+
+static bool command_allowed(const union request *request)
+{
+	enum msgqueue_command_policy policy = msgqueue_get_command_policy(request);
+
+	if (policy == MSGQUEUE_COMMAND_UNSPECIFIED || policy == MSGQUEUE_COMMAND_DENIED) {
+		return false;
+	}
+
+	if (!Cm2DmResetPending()) {
+		return true;
+	}
+
+	/* Once reset is latched, do not enter any registered handler: even nominal
+	 * reads can touch I2C/NoC or wait on DMC. Queue-local protocol messages are
+	 * the only operations guaranteed not to race reset teardown.
+	 */
+	return request->command_code == TT_SMC_MSG_SET_LAST_SERIAL ||
+	       request->command_code == TT_SMC_MSG_TEST ||
+	       request->command_code == TT_SMC_MSG_REPORT_SCRATCH_ONLY;
+}
+
 /* Forward to process_l2_message. Nearly every message takes this path. */
 static void process_l2_message_queue(const union request *request, struct response *response)
 {
@@ -304,6 +367,11 @@ static void report_scratch_only_message(struct response *response)
 static void process_queued_message(struct message_queue *queue, const union request *request,
 				   struct response *response)
 {
+	if (!command_allowed(request)) {
+		response->data[0] = MSG_ERROR_REPLY;
+		return;
+	}
+
 	switch (request->command_code) {
 	case TT_SMC_MSG_SET_LAST_SERIAL:
 		handle_set_last_serial(queue, request);
@@ -360,13 +428,15 @@ void process_message_queues(void)
 	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_MSG_HANDLE_DONE);
 }
 
-void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler)
+void msgqueue_register_handler(uint32_t msg_code, msgqueue_request_handler_t handler,
+			       enum msgqueue_command_policy policy)
 {
 	if (msg_code >= CONFIG_TT_BH_ARC_NUM_MSG_CODES) {
 		return;
 	}
 
 	message_handlers[msg_code] = handler;
+	message_policies[msg_code] = policy;
 }
 
 static void prepare_msg_queue(void)
@@ -384,7 +454,7 @@ static void prepare_msg_queue(void)
 static int register_interrupt_handlers(void)
 {
 	STRUCT_SECTION_FOREACH(msgqueue_handler, item) {
-		msgqueue_register_handler(item->msg_type, item->handler);
+		msgqueue_register_handler(item->msg_type, item->handler, item->policy);
 	}
 	return 0;
 }

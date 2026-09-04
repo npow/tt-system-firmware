@@ -13,6 +13,7 @@ typedef enum {
 	AVSResourceUnavailable = 1, /* retry */
 	AVSBadCrc = 2,              /* retry */
 	AVSGoodCrcBadData = 3,      /* no retry */
+	AVSTimeout = 4,
 } AVSStatus;
 
 typedef enum {
@@ -36,4 +37,9 @@ AVSStatus AVSReadStatus(uint8_t rail_sel, uint16_t *status);
 AVSStatus AVSWriteStatus(uint16_t status, uint8_t rail_sel);
 AVSStatus AVSReadVersion(uint16_t *version);
 AVSStatus AVSReadSystemInputCurrent(uint16_t *response);
+
+#if defined(CONFIG_ZTEST)
+void AVSTestResetState(void);
+#endif
+
 #endif

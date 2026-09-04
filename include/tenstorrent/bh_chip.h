@@ -38,6 +38,15 @@ struct bh_chip_config {
 	struct bh_arc arc;
 };
 
+enum bh_chip_reset_type {
+	BH_CHIP_RESET_NONE = 0,
+	BH_CHIP_RESET_PERST,
+	BH_CHIP_RESET_FULL,
+};
+
+#define BH_CHIP_RESET_RETRY_INITIAL_MS 20U
+#define BH_CHIP_RESET_RETRY_MAX_MS     1000U
+
 struct bh_chip_data {
 	/* Flag set when bootrom has been loaded and the arc_soft_reset sequence can be appled. */
 	bool workaround_applied;
@@ -66,7 +75,13 @@ struct bh_chip_data {
 	volatile bool pgood_fall_triggered;
 	volatile bool pgood_rise_triggered;
 	bool pgood_severe_fault;
+	bool pgood_recovery_pending;
 	int64_t pgood_last_trip_ms;
+
+	/* Reset requests remain pending until a recovery attempt succeeds. */
+	enum bh_chip_reset_type pending_reset_type;
+	uint32_t reset_retry_at_ms;
+	uint32_t reset_retry_delay_ms;
 
 	/* Max allowable time between pings from SMC in ms */
 	uint32_t auto_reset_timeout;
@@ -181,16 +196,22 @@ int bh_chip_write_logs(struct bh_chip *chip, char *log_data, size_t log_size);
 
 void bh_chip_auto_reset(struct k_timer *timer);
 
-void bh_chip_assert_asic_reset(const struct bh_chip *chip);
-void bh_chip_deassert_asic_reset(const struct bh_chip *chip);
+int bh_chip_assert_asic_reset(const struct bh_chip *chip);
+int bh_chip_deassert_asic_reset(const struct bh_chip *chip);
+int bh_chip_hold_asic_reset_for_recovery(struct bh_chip *chip);
+int bh_chip_deassert_asic_reset_if_pgood(struct bh_chip *chip);
 
 void bh_chip_set_straps(struct bh_chip *chip);
 void bh_chip_unset_straps(struct bh_chip *chip);
 
-void bh_chip_assert_spi_reset(const struct bh_chip *chip);
-void bh_chip_deassert_spi_reset(const struct bh_chip *chip);
+int bh_chip_assert_spi_reset(const struct bh_chip *chip);
+int bh_chip_deassert_spi_reset(const struct bh_chip *chip);
 
 int bh_chip_reset_chip(struct bh_chip *chip, bool force_reset);
+void bh_chip_queue_reset(struct bh_chip *chip, enum bh_chip_reset_type reset_type);
+bool bh_chip_reset_due(const struct bh_chip *chip, uint32_t now_ms);
+void bh_chip_reset_complete(struct bh_chip *chip);
+void bh_chip_reset_retry(struct bh_chip *chip, uint32_t now_ms);
 
 int therm_trip_gpio_setup(struct bh_chip *chip);
 int pgood_gpio_setup(struct bh_chip *chip);

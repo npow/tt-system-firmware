@@ -59,6 +59,8 @@ static const uint8_t kTlbIndex;
 static const uint32_t kFirstCfgRegIndex = 0x100 / sizeof(uint32_t);
 
 static bool noc_translation_enabled;
+static uint32_t tensix_niu_cfg_0;
+static bool tensix_niu_cfg_0_valid;
 
 static volatile void *SetupNiuTlbPhys(uint8_t tlb_index, uint8_t px, uint8_t py, uint8_t noc_id)
 {
@@ -197,22 +199,27 @@ int32_t set_tensix_enable(bool enable)
 {
 	const uint8_t noc_ring = 0;
 	const uint8_t noc_tlb = 0;
-	uint8_t x;
-	uint8_t y;
+	uint32_t niu_cfg_0;
 
-	GetEnabledTensix(&x, &y);
+	if (!tensix_niu_cfg_0_valid) {
+		return -EAGAIN;
+	}
 
-	volatile uint32_t *noc_regs = SetupNiuTlb(kTlbIndex, x, y, 0);
-
-	uint32_t niu_cfg_0 = ReadNocCfgReg(noc_regs, NIU_CFG_0);
+	/*
+	 * Never read a remote tile on this runtime management path.  If that tile
+	 * is stalled, a CPU load through NOC2AXI has no usable timeout and can
+	 * wedge ARC.  NocInit cached the value after programming a healthy enabled
+	 * Tensix, so only the clock-gate bit needs to change here.
+	 */
+	niu_cfg_0 = tensix_niu_cfg_0;
 
 	WRITE_BIT(niu_cfg_0, NIU_CFG_0_TILE_CLK_OFF, !enable);
 	uint32_t niu_cfg_0_addr = 0xFFB20100;
 
-	NOC2AXITensixBroadcastTlbSetup(noc_ring, noc_tlb, niu_cfg_0_addr, kNoc2AxiOrderingStrict);
+	NOC2AXITensixBroadcastTlbSetup(noc_ring, noc_tlb, niu_cfg_0_addr,
+				       kNoc2AxiOrderingPostedStrict);
 	NOC2AXIWrite32(noc_ring, noc_tlb, niu_cfg_0_addr, niu_cfg_0);
-
-	noc_regs = SetupNiuTlb(kTlbIndex, x, y, 0);
+	tensix_niu_cfg_0 = niu_cfg_0;
 
 	struct tensix_state_msg tensix_state = {enable};
 
@@ -289,6 +296,11 @@ void NocInitSingleTile(uint8_t noc0_x, uint8_t noc0_y)
 		niu_cfg_0 |= niu_cfg_0_updates;
 		WRITE_BIT(niu_cfg_0, NIU_CFG_0_TILE_CLK_OFF, tile_clk_off);
 		WriteNocCfgReg(noc_regs, NIU_CFG_0, niu_cfg_0);
+		if ((noc_id == 0U) && (px >= 1U) && (px <= 14U) && (py >= 2U) && !tile_clk_off &&
+		    !tensix_niu_cfg_0_valid) {
+			tensix_niu_cfg_0 = niu_cfg_0;
+			tensix_niu_cfg_0_valid = true;
+		}
 
 		uint32_t router_cfg_0 = ReadNocCfgReg(noc_regs, ROUTER_CFG(0));
 
@@ -763,41 +775,17 @@ void ClearNocTranslation(void)
  */
 static uint8_t debug_noc_translation_handler(const union request *req, struct response *rsp)
 {
-	bool enable_translation = req->debug_noc_translation.enable_translation;
-	unsigned int pcie_instance = req->debug_noc_translation.pcie_instance;
-	bool pcie_instance_override = req->debug_noc_translation.pcie_instance_override;
-	uint16_t bad_tensix_cols = req->debug_noc_translation.bad_tensix_cols;
+	ARG_UNUSED(req);
+	ARG_UNUSED(rsp);
 
-	uint8_t bad_gddr = req->debug_noc_translation.bad_gddr;
-	uint16_t skip_eth = req->debug_noc_translation.skip_eth_low |
-			    ((uint16_t)req->debug_noc_translation.skip_eth_hi << 8U);
-
-	if (bad_gddr >= NUM_GDDR && bad_gddr != NO_BAD_GDDR) {
-		return -EINVAL;
-	}
-	ClearNocTranslation();
-
-	ProgramBroadcastExclusion(bad_tensix_cols);
-
-	if (enable_translation) {
-		if (!pcie_instance_override) {
-			struct bh_pci_property pci1;
-
-			bh_chip_info_pci_property(1, &pci1);
-			if (pci1.pcie_mode == BH_PCIE_MODE_EP) {
-				pcie_instance = 1;
-			} else {
-				pcie_instance = 0;
-			}
-		}
-
-		InitNocTranslation(pcie_instance, bad_tensix_cols, bad_gddr, skip_eth);
-	}
-
-	return 0;
+	/* Reprogramming live route tables has no quiesce/rollback contract. A raw
+	 * host message could strand ARC telemetry or in-flight management DMA.
+	 */
+	return 1;
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_DEBUG_NOC_TRANSLATION, debug_noc_translation_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_DEBUG_NOC_TRANSLATION, debug_noc_translation_handler,
+		 MSGQUEUE_COMMAND_DENIED);
 
 void GetEnabledTensix(uint8_t *x, uint8_t *y)
 {

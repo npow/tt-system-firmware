@@ -8,6 +8,9 @@
 #include <zephyr/sys/byteorder.h>
 
 #include "aiclk_ppm.h"
+#include "dvfs.h"
+#include "telemetry.h"
+#include "telemetry_internal.h"
 #include "throttler.h"
 #include <tenstorrent/msgqueue.h>
 #include <tenstorrent/smc_msg.h>
@@ -27,6 +30,13 @@ static void *aiclk_ppm_setup(void)
 static void reset_arb(void *fixture)
 {
 	(void)fixture;
+	dvfs_enabled = false;
+	TelemetryInternalData telemetry = {};
+
+	/* Keep every test independent of prior safety and telemetry state. */
+	zassert_true(SetAiclkResetSafe(false), "Expected reset-safe state to clear");
+	AiclkTestClearCharacterizationOverrides();
+	TelemetryInternalTestSetCached(&telemetry);
 
 	/* Reset all arbiter values and disable */
 	for (int i = 0; i < aiclk_arb_max_count; i++) {
@@ -54,7 +64,10 @@ static void set_busy(bool busy)
 
 static void reinit_arb(void *fixture)
 {
+	TelemetryInternalData telemetry = {};
+
 	(void)fixture;
+	dvfs_enabled = false;
 	for (int i = 0; i < aiclk_arb_max_count; i++) {
 		SetAiclkArbMax(i, fmax);
 		EnableArbMax(i, true);
@@ -65,8 +78,10 @@ static void reinit_arb(void *fixture)
 	}
 
 	set_busy(false);
+	zassert_true(SetAiclkResetSafe(false), "Expected reset-safe state to clear");
 	AiclkTestClearCharacterizationOverrides();
 	ThrottlerTestResetRuntimePowerState();
+	TelemetryInternalTestSetCached(&telemetry);
 }
 
 ZTEST(aiclk_ppm, test_power_slew_reaches_max_without_same_tick_bypass)
@@ -90,8 +105,11 @@ ZTEST(aiclk_ppm, test_strict_power_max_wins_over_force_and_host_floor)
 	struct response rsp = {0};
 	uint32_t strict_max = fmin + 100U;
 
+	/* This test alone exercises the runtime board-power controller. */
+	ThrottlerTestResetRuntimePowerState();
 	sys_put_le16(300U, data);
 	zassert_ok(Dm2CmSetBoardPowerLimit(data, sizeof(data)));
+	ThrottlerTestApplyPendingBoardPowerLimit();
 	ThrottlerTestRecordInputPowerSampleAtPower(k_uptime_get_32(), 200U);
 
 	SetAiclkArbMax(aiclk_arb_max_host_fmax, strict_max);
@@ -102,12 +120,19 @@ ZTEST(aiclk_ppm, test_strict_power_max_wins_over_force_and_host_floor)
 	zassert_ok(msgqueue_request_push(0, &req));
 	process_message_queues();
 	zassert_ok(msgqueue_response_pop(0, &rsp));
-	zassert_ok(rsp.data[0]);
+	zassert_not_equal(rsp.data[0], 0, "normal runtime must reject characterization overrides");
 
+	dvfs_enabled = true;
 	zassert_ok(ForceAiclk(fmax));
 	zassert_true(GetAiclkTarg() <= strict_max,
 		     "forced/host-min target %u bypassed strict max %u", GetAiclkTarg(),
 		     strict_max);
+}
+
+ZTEST(aiclk_ppm, test_nonzero_force_is_rejected_without_dvfs)
+{
+	zassert_equal(ForceAiclk(fmax), 2);
+	zassert_ok(ForceAiclk(0));
 }
 
 ZTEST(aiclk_ppm, test_no_arb_enabled)
@@ -497,6 +522,22 @@ static void send_set_host_fmax(uint32_t freq, uint8_t restore_default, uint8_t *
 	}
 }
 
+static void send_set_host_fmin(uint32_t freq, uint8_t *status_out)
+{
+	union request req = {0};
+	struct response rsp = {0};
+
+	req.characterisation_msg.command_code = TT_SMC_MSG_CHARACTERISATION;
+	req.characterisation_msg.submsg_ID = TT_SUB_MSG_SET_HOST_REQUESTED_FMIN;
+	req.characterisation_msg.submsg_data.fmin_value.value = freq;
+	msgqueue_request_push(0, &req);
+	process_message_queues();
+	msgqueue_response_pop(0, &rsp);
+	if (status_out != NULL) {
+		*status_out = rsp.data[0];
+	}
+}
+
 ZTEST(aiclk_ppm, test_set_host_fmax_valid)
 {
 	uint8_t status;
@@ -534,6 +575,49 @@ ZTEST(aiclk_ppm, test_set_host_fmax_restore_default)
 		      "host fmax arbiter should be disabled after restore_default");
 }
 
+ZTEST(aiclk_ppm, test_failed_host_fmax_raise_preserves_tighter_ceiling)
+{
+	uint8_t status;
+	enum aiclk_arb_max effective_arb;
+	uint32_t effective_max;
+
+	send_set_host_fmax(900U, 0, &status);
+	zassert_ok(status);
+	dvfs_enabled = true;
+	AiclkTestFailDvfsControlChange(true);
+	send_set_host_fmax(1200U, 0, &status);
+	zassert_not_equal(status, 0, "injected DVFS failure was not returned");
+
+	effective_max = get_aiclk_effective_arb_max(&effective_arb);
+	zassert_equal(effective_arb, aiclk_arb_max_host_fmax);
+	zassert_equal(effective_max, 900U, "failed raise escaped prior tighter ceiling");
+	zassert_equal(GetTelemetryTag(TAG_HOST_AICLK_LIMIT), 900U,
+		      "telemetry did not roll back with the ceiling");
+
+	AiclkTestFailDvfsControlChange(false);
+	zassert_true(DVFSChange(), "later DVFS pass failed");
+	zassert_true(GetAiclkTarg() <= 900U, "later DVFS pass applied rejected raise");
+}
+
+ZTEST(aiclk_ppm, test_failed_go_busy_does_not_retry_raise)
+{
+	union request req = {0};
+	struct response rsp = {0};
+
+	set_busy(false);
+	dvfs_enabled = true;
+	AiclkTestFailDvfsControlChange(true);
+	req.aiclk_set_speed.command_code = TT_SMC_MSG_AICLK_GO_BUSY;
+	zassert_ok(msgqueue_request_push(0, &req));
+	process_message_queues();
+	zassert_ok(msgqueue_response_pop(0, &rsp));
+	zassert_not_equal(rsp.data[0], 0, "injected GO_BUSY failure was not returned");
+
+	AiclkTestFailDvfsControlChange(false);
+	zassert_true(DVFSChange(), "later DVFS pass failed");
+	zassert_equal(GetAiclkTarg(), fmin, "later DVFS pass retried rejected GO_BUSY raise");
+}
+
 ZTEST(aiclk_ppm, test_set_host_fmax_out_of_range_high)
 {
 	uint8_t status;
@@ -550,11 +634,60 @@ ZTEST(aiclk_ppm, test_set_host_fmax_out_of_range_low)
 	zassert_not_equal(status, 0, "Expected error for out-of-range fmax (too low)");
 }
 
+ZTEST(aiclk_ppm, test_set_host_fmax_updates_target_immediately_with_dvfs)
+{
+	uint8_t status;
+
+	dvfs_enabled = true;
+	set_busy(true);
+	EnableArbMin(aiclk_arb_min_busy, true);
+	send_set_host_fmax(1000, 0, &status);
+	zassert_equal(status, 0, "Expected success for valid fmax");
+	zassert_equal(GetAiclkTarg(), 1000U,
+		      "Expected target AICLK to reflect host fmax immediately");
+
+	send_set_host_fmax(0, 1, &status);
+	zassert_equal(status, 0, "Expected success for restore_default");
+	zassert_equal(GetAiclkTarg(), fmax,
+		      "Expected target AICLK to return to Fmax after restore_default");
+}
+
+ZTEST(aiclk_ppm, test_set_host_fmin_updates_target_immediately_with_dvfs)
+{
+	uint8_t status;
+
+	dvfs_enabled = true;
+	set_busy(false);
+	send_set_host_fmin(fmax, &status);
+	zassert_not_equal(status, 0, "normal runtime must reject host fmin characterization");
+	zassert_equal(GetAiclkTarg(), fmin, "rejected host fmin changed target AICLK");
+
+	send_set_host_fmin(1U, &status);
+	zassert_not_equal(status, 0, "normal runtime must reject characterization messages");
+	zassert_equal(GetAiclkTarg(), fmin,
+		      "Expected target AICLK to return to Fmin after restore");
+}
+
+ZTEST(aiclk_ppm, test_reset_safe_updates_target_immediately_with_dvfs)
+{
+	dvfs_enabled = true;
+	set_busy(true);
+	EnableArbMin(aiclk_arb_min_busy, true);
+
+	zassert_true(SetAiclkResetSafe(true), "Expected reset-safe clamp to succeed");
+	zassert_equal(GetAiclkTarg(), (uint32_t)AICLK_RESET_SAFE_FREQ,
+		      "Expected reset-safe clamp to apply immediately");
+
+	zassert_true(SetAiclkResetSafe(false), "Expected reset-safe release to succeed");
+	zassert_equal(GetAiclkTarg(), fmax, "Expected target AICLK to return to Fmax");
+}
+
 ZTEST(aiclk_ppm, test_msg_type_force_aiclk)
 {
 	union request req = {0};
 	struct response rsp = {0};
 
+	dvfs_enabled = true;
 	req.force_aiclk.command_code = TT_SMC_MSG_FORCE_AICLK;
 	req.force_aiclk.forced_freq = 1000;
 
@@ -562,7 +695,7 @@ ZTEST(aiclk_ppm, test_msg_type_force_aiclk)
 	process_message_queues();
 	msgqueue_response_pop(0, &rsp);
 
-	zassert_equal(rsp.data[0], 0);
+	zassert_not_equal(rsp.data[0], 0, "raw FORCE_AICLK must be denied");
 
 	/* Disable forcing */
 	req = (union request){0};
@@ -575,7 +708,7 @@ ZTEST(aiclk_ppm, test_msg_type_force_aiclk)
 	process_message_queues();
 	msgqueue_response_pop(0, &rsp);
 
-	zassert_equal(rsp.data[0], 0);
+	zassert_not_equal(rsp.data[0], 0, "raw FORCE_AICLK release must be denied");
 }
 
 ZTEST(aiclk_ppm, test_msg_type_get_aiclk)
@@ -609,7 +742,7 @@ ZTEST(aiclk_ppm, test_msg_type_aisweep_start_stop)
 	process_message_queues();
 	msgqueue_response_pop(0, &rsp);
 
-	zassert_equal(rsp.data[0], 0);
+	zassert_not_equal(rsp.data[0], 0, "AICLK sweep must be denied in normal runtime");
 
 	/* Stop sweep */
 	req = (union request){0};
@@ -621,7 +754,34 @@ ZTEST(aiclk_ppm, test_msg_type_aisweep_start_stop)
 	process_message_queues();
 	msgqueue_response_pop(0, &rsp);
 
-	zassert_equal(rsp.data[0], 0);
+	zassert_not_equal(rsp.data[0], 0, "AICLK sweep must be denied in normal runtime");
+}
+
+ZTEST(aiclk_ppm, test_msg_type_aisweep_rejects_empty_intersection)
+{
+	const struct {
+		uint32_t low;
+		uint32_t high;
+	} invalid_ranges[] = {
+		{.low = fmax, .high = fmin},
+		{.low = fmax + 1U, .high = UINT32_MAX},
+		{.low = 1U, .high = fmin - 1U},
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(invalid_ranges); i++) {
+		union request req = {0};
+		struct response rsp = {0};
+
+		req.aisweep.command_code = TT_SMC_MSG_AISWEEP_START;
+		req.aisweep.sweep_low = invalid_ranges[i].low;
+		req.aisweep.sweep_high = invalid_ranges[i].high;
+
+		zassert_ok(msgqueue_request_push(0, &req));
+		process_message_queues();
+		zassert_ok(msgqueue_response_pop(0, &rsp));
+		zassert_not_equal(rsp.data[0], 0, "Invalid sweep [%u, %u] was accepted",
+				  invalid_ranges[i].low, invalid_ranges[i].high);
+	}
 }
 
 ZTEST_SUITE(aiclk_ppm, NULL, aiclk_ppm_setup, reset_arb, NULL, reinit_arb);

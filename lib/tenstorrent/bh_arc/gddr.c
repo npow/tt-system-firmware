@@ -15,6 +15,7 @@
 #include "status_reg.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #include <tenstorrent/bh_power.h>
 #include <tenstorrent/msgqueue.h>
@@ -39,6 +40,19 @@ static const struct device *const pll_dev_3 = DEVICE_DT_GET_OR_NULL(DT_NODELABEL
 static const struct device *flash = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(spi_flash));
 #ifdef CONFIG_DMA_ARC_HS
 static const struct device *const arc_dma_dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(dma0));
+/*
+ * The ARC DMA engine cannot abort a timed-out remote access. Keep its local
+ * source/destination alive for the lifetime of the firmware so a late
+ * completion cannot touch a returned stack frame. The channel is quarantined
+ * after an incomplete transfer, so this staging area is never reused afterward.
+ */
+static union {
+	gddr_telemetry_table_t telemetry;
+	uint32_t word;
+} gddr_remote_read_staging __aligned(4);
+static uint32_t gddr_remote_write_staging __aligned(4);
+K_MUTEX_DEFINE(gddr_remote_dma_lock);
+static bool gddr_remote_dma_available = true;
 #endif
 static const struct device *dma_noc = DEVICE_DT_GET(DT_NODELABEL(dma1));
 
@@ -54,16 +68,17 @@ uint8_t get_gddr_mrisc_noc2axi_port(uint8_t gddr_inst)
 	return (gddr_inst == 0) ? 2 : MRISC_FW_NOC2AXI_PORT;
 }
 
-#define MRISC_SETUP_TLB               13
-#define MRISC_L1_ADDR                 (1ULL << 37)
-#define MRISC_REG_ADDR                (1ULL << 40)
-#define MRISC_FW_CFG_OFFSET           0x3C00
-#define ARC_NOC0_X                    8
-#define ARC_NOC0_Y                    0
-#define MRISC_L1_SIZE                 (128 * 1024)
-#define GDDR_WIPE_DMA_CHANNEL         1U
-#define GDDR_WIPE_TIMEOUT_MS          50U
-#define GDDR_TELEMETRY_DMA_TIMEOUT_MS 5U
+#define MRISC_SETUP_TLB            13
+#define MRISC_DMA_TLB              12
+#define MRISC_L1_ADDR              (1ULL << 37)
+#define MRISC_REG_ADDR             (1ULL << 40)
+#define MRISC_FW_CFG_OFFSET        0x3C00
+#define ARC_NOC0_X                 8
+#define ARC_NOC0_Y                 0
+#define MRISC_L1_SIZE              (128 * 1024)
+#define GDDR_WIPE_DMA_CHANNEL      1U
+#define GDDR_WIPE_TIMEOUT_MS       50U
+#define GDDR_REMOTE_DMA_TIMEOUT_MS 5U
 
 #define MRISC_FW_TAG     "memfw"
 #define MRISC_FW_CFG_TAG "memfwcfg"
@@ -104,54 +119,155 @@ static volatile void *SetupMriscL1Tlb(uint8_t gddr_inst)
 	return GetTlbWindowAddr(0, MRISC_SETUP_TLB, MRISC_L1_ADDR);
 }
 
-static uint32_t MriscL1Read32(uint8_t gddr_inst, uint32_t addr)
+static int gddr_remote_read_xy(uint8_t x, uint8_t y, uint64_t base_addr, uint32_t offset,
+			       void *dest, size_t len)
 {
-	uint8_t x, y;
+#if defined(CONFIG_TT_BH_ARC_EMUL)
+	if ((dest == NULL) || ((len % sizeof(uint32_t)) != 0U)) {
+		return -EINVAL;
+	}
 
-	GetGddrMriscNocCoords(gddr_inst, 0, &x, &y);
-	NOC2AXITlbSetup(0, MRISC_SETUP_TLB, x, y, MRISC_L1_ADDR);
-	return NOC2AXIRead32(0, MRISC_SETUP_TLB, MRISC_L1_ADDR + addr);
+	NOC2AXITlbSetup(0, MRISC_DMA_TLB, x, y, base_addr);
+	for (size_t i = 0; i < len; i += sizeof(uint32_t)) {
+		uint32_t word = NOC2AXIRead32(0, MRISC_DMA_TLB, base_addr + offset + i);
+
+		memcpy((uint8_t *)dest + i, &word, sizeof(word));
+	}
+	return 0;
+#elif defined(CONFIG_DMA_ARC_HS)
+	int rc;
+
+	if ((dest == NULL) || (len > sizeof(gddr_remote_read_staging))) {
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&gddr_remote_dma_lock, K_FOREVER);
+	if (!gddr_remote_dma_available) {
+		k_mutex_unlock(&gddr_remote_dma_lock);
+		return -ENODEV;
+	}
+	NOC2AXITlbSetup(0, MRISC_DMA_TLB, x, y, base_addr);
+	rc = dma_arc_hs_transfer(
+		arc_dma_dev, 0,
+		(const void *)((volatile uint8_t *)GetTlbWindowAddr(0, MRISC_DMA_TLB, base_addr) +
+			       offset),
+		&gddr_remote_read_staging, len, K_MSEC(GDDR_REMOTE_DMA_TIMEOUT_MS));
+	if (rc == 0) {
+		memcpy(dest, &gddr_remote_read_staging, len);
+	} else if ((rc == -ETIMEDOUT) || (rc == -EIO)) {
+		gddr_remote_dma_available = false;
+		LOG_WRN("Disabling GDDR remote DMA after incomplete read: %d", rc);
+	}
+	k_mutex_unlock(&gddr_remote_dma_lock);
+	return rc;
+#else
+	ARG_UNUSED(x);
+	ARG_UNUSED(y);
+	ARG_UNUSED(base_addr);
+	ARG_UNUSED(offset);
+	ARG_UNUSED(dest);
+	ARG_UNUSED(len);
+	return -ENOTSUP;
+#endif
 }
 
-static void MriscL1Write32(uint8_t gddr_inst, uint32_t addr, uint32_t val)
+static int gddr_remote_read(uint8_t gddr_inst, uint64_t base_addr, uint32_t offset, void *dest,
+			    size_t len)
 {
 	uint8_t x, y;
 
+	if (gddr_inst >= NUM_GDDR) {
+		return -EINVAL;
+	}
 	GetGddrMriscNocCoords(gddr_inst, 0, &x, &y);
-	NOC2AXITlbSetup(0, MRISC_SETUP_TLB, x, y, MRISC_L1_ADDR);
-	NOC2AXIWrite32(0, MRISC_SETUP_TLB, MRISC_L1_ADDR + addr, val);
+	return gddr_remote_read_xy(x, y, base_addr, offset, dest, len);
 }
 
-static uint32_t MriscRegRead32(uint8_t gddr_inst, uint32_t addr)
+static int gddr_remote_write32_xy(uint8_t x, uint8_t y, uint64_t base_addr, uint32_t offset,
+				  uint32_t value)
 {
-	uint8_t x, y;
+#if defined(CONFIG_TT_BH_ARC_EMUL)
+	NOC2AXITlbSetup(0, MRISC_DMA_TLB, x, y, base_addr);
+	NOC2AXIWrite32(0, MRISC_DMA_TLB, base_addr + offset, value);
+	return 0;
+#elif defined(CONFIG_DMA_ARC_HS)
+	int rc;
 
-	GetGddrMriscNocCoords(gddr_inst, 0, &x, &y);
-	NOC2AXITlbSetup(0, MRISC_SETUP_TLB, x, y, MRISC_REG_ADDR + addr);
-	return NOC2AXIRead32(0, MRISC_SETUP_TLB, MRISC_REG_ADDR + addr);
+	k_mutex_lock(&gddr_remote_dma_lock, K_FOREVER);
+	if (!gddr_remote_dma_available) {
+		k_mutex_unlock(&gddr_remote_dma_lock);
+		return -ENODEV;
+	}
+	NOC2AXITlbSetup(0, MRISC_DMA_TLB, x, y, base_addr);
+	gddr_remote_write_staging = value;
+	rc = dma_arc_hs_transfer(
+		arc_dma_dev, 0, &gddr_remote_write_staging,
+		(void *)((volatile uint8_t *)GetTlbWindowAddr(0, MRISC_DMA_TLB, base_addr) +
+			 offset),
+		sizeof(value), K_MSEC(GDDR_REMOTE_DMA_TIMEOUT_MS));
+	if ((rc == -ETIMEDOUT) || (rc == -EIO)) {
+		gddr_remote_dma_available = false;
+		LOG_WRN("Disabling GDDR remote DMA after incomplete write: %d", rc);
+	}
+	k_mutex_unlock(&gddr_remote_dma_lock);
+	return rc;
+#else
+	ARG_UNUSED(x);
+	ARG_UNUSED(y);
+	ARG_UNUSED(base_addr);
+	ARG_UNUSED(offset);
+	ARG_UNUSED(value);
+	return -ENOTSUP;
+#endif
 }
 
-static void MriscRegWrite32(uint8_t gddr_inst, uint32_t addr, uint32_t val)
+static int gddr_remote_write32(uint8_t gddr_inst, uint64_t base_addr, uint32_t offset,
+			       uint32_t value)
 {
 	uint8_t x, y;
 
+	if (gddr_inst >= NUM_GDDR) {
+		return -EINVAL;
+	}
 	GetGddrMriscNocCoords(gddr_inst, 0, &x, &y);
-	NOC2AXITlbSetup(0, MRISC_SETUP_TLB, x, y, MRISC_REG_ADDR + addr);
-	NOC2AXIWrite32(0, MRISC_SETUP_TLB, MRISC_REG_ADDR + addr, val);
+	return gddr_remote_write32_xy(x, y, base_addr, offset, value);
+}
+
+static int MriscL1Read32(uint8_t gddr_inst, uint32_t addr, uint32_t *value)
+{
+	return gddr_remote_read(gddr_inst, MRISC_L1_ADDR, addr, value, sizeof(*value));
+}
+
+static int MriscL1Write32(uint8_t gddr_inst, uint32_t addr, uint32_t value)
+{
+	return gddr_remote_write32(gddr_inst, MRISC_L1_ADDR, addr, value);
+}
+
+static int MriscRegRead32(uint8_t gddr_inst, uint32_t addr, uint32_t *value)
+{
+	return gddr_remote_read(gddr_inst, MRISC_REG_ADDR, addr, value, sizeof(*value));
+}
+
+static int MriscRegWrite32(uint8_t gddr_inst, uint32_t addr, uint32_t value)
+{
+	return gddr_remote_write32(gddr_inst, MRISC_REG_ADDR, addr, value);
 }
 
 int read_gddr_telemetry_table(uint8_t gddr_inst, gddr_telemetry_table_t *gddr_telemetry)
 {
 #ifdef CONFIG_DMA_ARC_HS
-	volatile uint8_t *mrisc_l1 = SetupMriscL1Tlb(gddr_inst);
-	int rc = dma_arc_hs_transfer(
-		arc_dma_dev, 0, (const void *)(mrisc_l1 + GDDR_TELEMETRY_TABLE_ADDR),
-		gddr_telemetry, sizeof(*gddr_telemetry), K_MSEC(GDDR_TELEMETRY_DMA_TIMEOUT_MS));
+	if ((gddr_inst >= NUM_GDDR) || (gddr_telemetry == NULL)) {
+		return -EINVAL;
+	}
+	int rc = gddr_remote_read(gddr_inst, MRISC_L1_ADDR, GDDR_TELEMETRY_TABLE_ADDR,
+				  gddr_telemetry, sizeof(*gddr_telemetry));
 
 	if (rc < 0) {
 		/* Never fall back to CPU loads from a remote MRISC. If the tile is
 		 * unresponsive, such a load can block ARC forever and take PCIe
-		 * management down with it. The DMA path has a finite timeout.
+		 * management down with it. The DMA path has a finite timeout and
+		 * quarantines the channel because the hardware request cannot be
+		 * aborted.
 		 */
 		return rc;
 	}
@@ -188,16 +304,18 @@ int read_gddr_telemetry_table(uint8_t gddr_inst, gddr_telemetry_table_t *gddr_te
 	return 0;
 }
 
-static void ReleaseMriscReset(uint8_t gddr_inst)
+static int ReleaseMriscReset(uint8_t gddr_inst)
 {
 	const uint32_t kSoftReset0Addr = 0xFFB121B0;
-	uint8_t x, y;
+	uint32_t soft_reset_0;
+	int rc;
 
-	GetGddrMriscNocCoords(gddr_inst, 0, &x, &y);
-	NOC2AXITlbSetup(0, MRISC_SETUP_TLB, x, y, kSoftReset0Addr);
-
-	volatile uint32_t *soft_reset_0 = GetTlbWindowAddr(0, MRISC_SETUP_TLB, kSoftReset0Addr);
-	*soft_reset_0 &= ~(1 << 11); /* Clear bit corresponding to MRISC reset */
+	rc = gddr_remote_read(gddr_inst, kSoftReset0Addr, 0, &soft_reset_0, sizeof(soft_reset_0));
+	if (rc != 0) {
+		return rc;
+	}
+	soft_reset_0 &= ~BIT(11); /* Clear bit corresponding to MRISC reset */
+	return gddr_remote_write32(gddr_inst, kSoftReset0Addr, 0, soft_reset_0);
 }
 
 static void SetAxiEnable(uint8_t gddr_inst, uint8_t noc2axi_port, bool axi_enable)
@@ -290,7 +408,12 @@ int get_gddr_temps(struct gddr_temps *temps)
 
 static int check_mrisc_busy(uint8_t gddr_inst)
 {
-	uint32_t status = MriscRegRead32(gddr_inst, MRISC_MSG_REGISTER);
+	uint32_t status;
+	int rc = MriscRegRead32(gddr_inst, MRISC_MSG_REGISTER, &status);
+
+	if (rc != 0) {
+		return rc;
+	}
 
 	if (status != MRISC_MSG_TYPE_NONE) {
 		LOG_WRN("GDDR %d message buffer is not free. Current value: 0x%x", gddr_inst,
@@ -302,15 +425,25 @@ static int check_mrisc_busy(uint8_t gddr_inst)
 
 static int wait_mrisc_not_busy(uint8_t gddr_inst, k_timepoint_t timeout, const char *op_desc)
 {
-	while (MriscRegRead32(gddr_inst, MRISC_MSG_REGISTER) != 0) {
+	uint32_t status;
+	int rc;
+
+	do {
+		rc = MriscRegRead32(gddr_inst, MRISC_MSG_REGISTER, &status);
+		if (rc != 0) {
+			return rc;
+		}
+		if (status == MRISC_MSG_TYPE_NONE) {
+			return 0;
+		}
 		/* Wait for the message to be processed */
 		if (sys_timepoint_expired(timeout)) {
 			LOG_ERR("Timeout after %d ms waiting for GDDR instance %d to run %s",
 				MRISC_MEMTEST_TIMEOUT, gddr_inst, op_desc);
 			return -ETIMEDOUT;
 		}
-	}
-	return 0;
+		k_busy_wait(100);
+	} while (true);
 }
 
 static int StartHwMemtest(uint8_t gddr_inst, uint32_t addr_bits, uint32_t start_addr, uint32_t mask)
@@ -349,10 +482,12 @@ static int StartHwMemtest(uint8_t gddr_inst, uint32_t addr_bits, uint32_t start_
 		return -EINVAL;
 	}
 	for (int i = 0; i < 3; i++) {
-		MriscL1Write32(gddr_inst, GDDR_MSG_STRUCT_ADDR + i * 4, msg_args[i]);
+		ret = MriscL1Write32(gddr_inst, GDDR_MSG_STRUCT_ADDR + i * 4, msg_args[i]);
+		if (ret != 0) {
+			return ret;
+		}
 	}
-	MriscRegWrite32(gddr_inst, MRISC_MSG_REGISTER, MRISC_MSG_TYPE_RUN_MEMTEST);
-	return 0;
+	return MriscRegWrite32(gddr_inst, MRISC_MSG_REGISTER, MRISC_MSG_TYPE_RUN_MEMTEST);
 }
 
 static int CheckHwMemtestResult(uint8_t gddr_inst, k_timepoint_t timeout)
@@ -365,7 +500,13 @@ static int CheckHwMemtestResult(uint8_t gddr_inst, k_timepoint_t timeout)
 		return ret;
 	}
 
-	uint32_t pass = MriscL1Read32(gddr_inst, GDDR_MSG_STRUCT_ADDR + 8 * 4);
+	uint32_t pass;
+
+	ret = MriscL1Read32(gddr_inst, GDDR_MSG_STRUCT_ADDR + 8 * 4, &pass);
+	if (ret != 0) {
+		gddr_bist.failed |= BIT(gddr_inst);
+		return ret;
+	}
 
 	gddr_bist.complete |= BIT(gddr_inst);
 	if (pass != 0) {
@@ -437,9 +578,19 @@ static int wipe_l1(void)
 
 				if (rc == 0) {
 					rc = dma_start(dma_noc, GDDR_WIPE_DMA_CHANNEL);
+					if (rc == -ETIMEDOUT) {
+						dma_stop(dma_noc, GDDR_WIPE_DMA_CHANNEL);
+					}
 				}
 				if (rc == 0) {
 					rc = wait_for_gddr_wipe_dma();
+					if (rc != 0) {
+						/*
+						 * NoC DMA has no abort; stop quarantines the
+						 * engine.
+						 */
+						dma_stop(dma_noc, GDDR_WIPE_DMA_CHANNEL);
+					}
 				}
 				if (rc != 0) {
 					return rc;
@@ -554,8 +705,18 @@ static int InitMrisc(void)
 				record_init_failure(INIT_STAGE_MRISC_LOAD);
 				return -EIO;
 			}
-			MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
-			ReleaseMriscReset(gddr_inst);
+			rc = MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
+			if (rc != 0) {
+				LOG_ERR("Failed to initialize MRISC %u status: %d", gddr_inst, rc);
+				record_init_failure(INIT_STAGE_MRISC_LOAD);
+				return rc;
+			}
+			rc = ReleaseMriscReset(gddr_inst);
+			if (rc != 0) {
+				LOG_ERR("Failed to release MRISC %u reset: %d", gddr_inst, rc);
+				record_init_failure(INIT_STAGE_MRISC_LOAD);
+				return rc;
+			}
 		}
 	}
 
@@ -568,13 +729,24 @@ static int CheckGddrTraining(uint8_t gddr_inst, k_timepoint_t timeout)
 	gddr_telemetry_version_ok &= ~BIT(gddr_inst);
 
 	do {
-		uint32_t poll_val = MriscRegRead32(gddr_inst, MRISC_INIT_STATUS);
+		uint32_t poll_val;
+		int rc = MriscRegRead32(gddr_inst, MRISC_INIT_STATUS, &poll_val);
+
+		if (rc != 0) {
+			return rc;
+		}
 
 		if (poll_val == MRISC_INIT_FINISHED) {
-			uint32_t version =
-				MriscL1Read32(gddr_inst, GDDR_TELEMETRY_TABLE_ADDR +
-								 offsetof(gddr_telemetry_table_t,
-									  telemetry_table_version));
+			uint32_t version;
+
+			rc = MriscL1Read32(
+				gddr_inst,
+				GDDR_TELEMETRY_TABLE_ADDR +
+					offsetof(gddr_telemetry_table_t, telemetry_table_version),
+				&version);
+			if (rc != 0) {
+				return rc;
+			}
 
 			if (version != GDDR_TELEMETRY_TABLE_T_VERSION) {
 				LOG_ERR("%s[%d]: version mismatch: %d (expected %d)",
@@ -592,8 +764,14 @@ static int CheckGddrTraining(uint8_t gddr_inst, k_timepoint_t timeout)
 		k_msleep(1);
 	} while (!sys_timepoint_expired(timeout));
 
-	LOG_ERR("%s[%d]: 0x%x", "MRISC_POST_CODE", gddr_inst,
-		MriscRegRead32(gddr_inst, MRISC_POST_CODE));
+	uint32_t post_code;
+	int rc = MriscRegRead32(gddr_inst, MRISC_POST_CODE, &post_code);
+
+	if (rc == 0) {
+		LOG_ERR("%s[%d]: 0x%x", "MRISC_POST_CODE", gddr_inst, post_code);
+	} else {
+		LOG_ERR("Failed to read MRISC_POST_CODE[%d]: %d", gddr_inst, rc);
+	}
 
 	return -ETIMEDOUT;
 }
@@ -700,7 +878,10 @@ static int32_t mrisc_message(uint32_t op_code, uint32_t instance_mask, uint32_t 
 			if (ret != 0) {
 				return ret;
 			}
-			MriscRegWrite32(gddr_inst, MRISC_MSG_REGISTER, op_code);
+			ret = MriscRegWrite32(gddr_inst, MRISC_MSG_REGISTER, op_code);
+			if (ret != 0) {
+				return ret;
+			}
 		}
 	}
 	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(timeout_ms));
@@ -729,18 +910,22 @@ int32_t set_mrisc_power_setting(bool on)
 
 SYS_INIT_APP(gddr_training);
 
-static void assert_mrisc_soft_reset(uint8_t gddr_inst)
+static int assert_mrisc_soft_reset(uint8_t gddr_inst)
 {
 	const uint32_t kSoftReset0Addr = 0xFFB121B0;
 	const uint32_t kAllRiscSoftReset = 0x47800;
+	int rc;
 
 	for (uint8_t noc_node = 0; noc_node < NUM_MRISC_NOC2AXI_PORT; noc_node++) {
 		uint8_t x, y;
 
 		GetGddrNocCoords(gddr_inst, noc_node, 0, &x, &y);
-		NOC2AXITlbSetup(0, MRISC_SETUP_TLB, x, y, kSoftReset0Addr);
-		NOC2AXIWrite32(0, MRISC_SETUP_TLB, kSoftReset0Addr, kAllRiscSoftReset);
+		rc = gddr_remote_write32_xy(x, y, kSoftReset0Addr, 0, kAllRiscSoftReset);
+		if (rc != 0) {
+			return rc;
+		}
 	}
+	return 0;
 }
 
 /**
@@ -787,10 +972,22 @@ static uint8_t toggle_gddr_reset(const union request *req, struct response *rsp)
 		}
 	}
 
-	assert_mrisc_soft_reset(gddr_inst);
+	rc = assert_mrisc_soft_reset(gddr_inst);
+	if (rc != 0) {
+		rsp->data[1] = GDDR_RESET_ERR_TRAINING;
+		return 1;
+	}
 
-	MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
-	ReleaseMriscReset(gddr_inst);
+	rc = MriscRegWrite32(gddr_inst, MRISC_INIT_STATUS, MRISC_INIT_BEFORE);
+	if (rc != 0) {
+		rsp->data[1] = GDDR_RESET_ERR_TRAINING;
+		return 1;
+	}
+	rc = ReleaseMriscReset(gddr_inst);
+	if (rc != 0) {
+		rsp->data[1] = GDDR_RESET_ERR_TRAINING;
+		return 1;
+	}
 
 	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(MRISC_INIT_TIMEOUT));
 
@@ -826,5 +1023,5 @@ static uint8_t toggle_gddr_reset(const union request *req, struct response *rsp)
 }
 
 #ifndef CONFIG_TT_SMC_RECOVERY
-REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_GDDR_RESET, toggle_gddr_reset);
+REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_GDDR_RESET, toggle_gddr_reset, MSGQUEUE_COMMAND_DENIED);
 #endif

@@ -19,4 +19,4 @@ static uint8_t counter_handler(const union request *request, struct response *re
 	}
 }
 
-REGISTER_MESSAGE(TT_SMC_MSG_COUNTER, counter_handler);
+REGISTER_MESSAGE(TT_SMC_MSG_COUNTER, counter_handler, MSGQUEUE_COMMAND_REQUEST_DEPENDENT);
