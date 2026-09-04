@@ -66,8 +66,8 @@ struct gddr_temps {
 /**
  * @brief Read the DRAM die temperatures for all enabled GDDR instances.
  *
- * Disabled instances are left zeroed. Reads that fail are logged and skipped, leaving the
- * corresponding entry zeroed while the remaining instances are still read.
+ * Values are cached by the bounded periodic GDDR telemetry DMA so callers on the 1 ms DVFS path
+ * never issue synchronous remote-tile reads. Disabled instances are left zeroed.
  *
  * @param [out] temps Destination struct. Fully overwritten on entry.
  * @return 0 if all enabled instances were read successfully. If one or more reads failed,

@@ -48,6 +48,10 @@ LOG_MODULE_REGISTER(eth, CONFIG_TT_APP_LOG_LEVEL);
 #define ETH_END_PC_1                0xFFB1400C
 #define ETH_RISC_DEBUG_SOFT_RESET_0 0xFFB121B0
 #define ETH_PCS_STATUS              0xFFB9800C
+#define ETH_ALL_RISC_SOFT_RESET     0x47800
+
+#define ARC_NOC0_X 8U
+#define ARC_NOC0_Y 0U
 
 #define ETH_MAC_ADDR_ORG 0x208C47 /* 20:8C:47 */
 
@@ -58,12 +62,22 @@ LOG_MODULE_REGISTER(eth, CONFIG_TT_APP_LOG_LEVEL);
 #define ETH_ALT_SD_REG_TAG "altsdreg"
 #define ETH_ALT_SD_FW_TAG  "altsdfw"
 
+#define ETH_WIPE_DMA_CHANNEL              1U
+#define ETH_RUNTIME_TELEMETRY_DMA_CHANNEL 2U
+#define ETH_WIPE_DMA_TIMEOUT_MS           50U
+#define ETH_RUNTIME_TELEMETRY_TIMEOUT_MS  5U
+
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 static const struct device *flash = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(spi_flash));
 static const struct device *const arc_dma_dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(dma0));
 static const struct device *dma_noc = DEVICE_DT_GET(DT_NODELABEL(dma1));
 
 static uint32_t saved_heartbeat[MAX_ETH_INSTANCES];
+static uint32_t cached_eth_fw_version;
+#if !defined(CONFIG_TT_BH_ARC_EMUL)
+static uint32_t eth_telemetry_readback __aligned(4);
+#endif
+static bool eth_runtime_telemetry_available;
 
 typedef struct {
 	uint32_t sd_mode_sel_0: 1;
@@ -211,20 +225,99 @@ uint64_t GetMacAddressBase(void)
 
 uint32_t GetEthFwVersion(uint32_t ring)
 {
-	/* Look through all the enabled ETH tiles, and grab the FW version from the first
-	 * available tile's L1 (at ETH_FW_BASE_ADDR + ETH_FW_VERSION_ADDR_OFFSET)
-	 */
-	for (uint8_t eth_inst = 0; eth_inst < MAX_ETH_INSTANCES; eth_inst++) {
-		if (IS_BIT_SET(tile_enable.eth_enabled, eth_inst)) {
-			SetupEthTlb(eth_inst, ring, ETH_FW_BASE_ADDR);
+	ARG_UNUSED(ring);
 
-			return NOC2AXIRead32(ring, ETH_SETUP_TLB,
-					     ETH_FW_BASE_ADDR + ETH_FW_VERSION_ADDR_OFFSET);
+	/* The version is immutable and was cached from the same SPI image loaded into
+	 * every enabled ETH tile. Reading it from a tile here can block ARC forever
+	 * when that tile is absent or stalled, preventing PCIe management recovery.
+	 */
+	return cached_eth_fw_version;
+}
+
+static int wait_for_eth_dma(uint32_t channel, uint32_t timeout_ms)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(timeout_ms));
+	struct dma_status status;
+	int rc;
+
+	do {
+		rc = dma_get_status(dma_noc, channel, &status);
+		if (rc != 0) {
+			return rc;
 		}
+		if (!status.busy) {
+			return 0;
+		}
+		k_busy_wait(10);
+	} while (!sys_timepoint_expired(timeout));
+
+	return -ETIMEDOUT;
+}
+
+static int read_eth_remote32(uint8_t eth_inst, uint32_t ring, uint64_t address, uint32_t *value)
+{
+#if defined(CONFIG_TT_BH_ARC_EMUL)
+	ARG_UNUSED(eth_inst);
+	ARG_UNUSED(ring);
+	ARG_UNUSED(address);
+	*value = 0U;
+	return 0;
+#else
+	uint8_t x, y;
+	int rc;
+
+	if (!eth_runtime_telemetry_available) {
+		return -ENODEV;
+	}
+	if (ring != 0U) {
+		return -ENOTSUP;
 	}
 
-	/* If no ETHs are enabled, return 0 as the FW version, which will be read as 0.0.0 */
+	GetEthNocCoords(eth_inst, ring, &x, &y);
+	eth_telemetry_readback = 0U;
+
+	struct dma_block_config block = {
+		.source_address = (uintptr_t)&eth_telemetry_readback,
+		.dest_address = address,
+		.block_size = sizeof(eth_telemetry_readback),
+	};
+	struct dma_config config = {
+		.channel_direction = MEMORY_TO_PERIPHERAL,
+		.source_data_size = 1,
+		.dest_data_size = 1,
+		.source_burst_length = 1,
+		.dest_burst_length = 1,
+		.block_count = 1,
+		.head_block = &block,
+	};
+	struct tt_bh_dma_noc_coords coords = {
+		.source_x = ARC_NOC0_X,
+		.source_y = ARC_NOC0_Y,
+		.dest_x = x,
+		.dest_y = y,
+	};
+
+	rc = tt_dma_config(dma_noc, ETH_RUNTIME_TELEMETRY_DMA_CHANNEL, &config, &coords);
+	if (rc == 0) {
+		rc = dma_start(dma_noc, ETH_RUNTIME_TELEMETRY_DMA_CHANNEL);
+	}
+	if (rc == 0) {
+		rc = wait_for_eth_dma(ETH_RUNTIME_TELEMETRY_DMA_CHANNEL,
+				      ETH_RUNTIME_TELEMETRY_TIMEOUT_MS);
+	}
+	if (rc != 0) {
+		/* dma_stop() cannot cancel an in-flight NOC request. Permanently stop
+		 * using this dedicated channel for the current boot so a late response
+		 * cannot be mistaken for completion of a later telemetry request.
+		 */
+		eth_runtime_telemetry_available = false;
+		LOG_WRN("Disabling ETH runtime telemetry after bounded read failure: %d", rc);
+		return rc;
+	}
+
+	*value = eth_telemetry_readback;
 	return 0;
+#endif
 }
 
 uint32_t GetEthHeartbeatStatus(uint32_t ring)
@@ -237,9 +330,12 @@ uint32_t GetEthHeartbeatStatus(uint32_t ring)
 
 	for (uint8_t eth_inst = 0; eth_inst < MAX_ETH_INSTANCES; eth_inst++) {
 		if (IS_BIT_SET(tile_enable.eth_enabled, eth_inst)) {
-			SetupEthTlb(eth_inst, ring, ETH_HEARTBEAT_ADDR);
+			uint32_t heartbeat;
 
-			uint32_t heartbeat = NOC2AXIRead32(ring, ETH_SETUP_TLB, ETH_HEARTBEAT_ADDR);
+			if (read_eth_remote32(eth_inst, ring, ETH_HEARTBEAT_ADDR, &heartbeat) !=
+			    0) {
+				break;
+			}
 
 			if (saved_heartbeat[eth_inst] != heartbeat) {
 				heartbeat_status |= BIT(eth_inst);
@@ -261,9 +357,11 @@ uint32_t GetEthLinkStatus(uint32_t ring)
 
 	for (uint8_t eth_inst = 0; eth_inst < MAX_ETH_INSTANCES; eth_inst++) {
 		if (IS_BIT_SET(tile_enable.eth_enabled, eth_inst)) {
-			SetupEthTlb(eth_inst, ring, ETH_PCS_STATUS);
+			uint32_t pcs_status;
 
-			uint32_t pcs_status = NOC2AXIRead32(ring, ETH_SETUP_TLB, ETH_PCS_STATUS);
+			if (read_eth_remote32(eth_inst, ring, ETH_PCS_STATUS, &pcs_status) != 0) {
+				break;
+			}
 
 			if (pcs_status) {
 				link_status |= BIT(eth_inst);
@@ -277,10 +375,12 @@ uint32_t GetEthLinkStatus(uint32_t ring)
 void ReleaseEthReset(uint32_t eth_inst, uint32_t ring)
 {
 	SetupEthTlb(eth_inst, ring, ETH_RESET_PC_0);
-
-	volatile uint32_t *soft_reset_0 =
-		GetTlbWindowAddr(ring, ETH_SETUP_TLB, ETH_RISC_DEBUG_SOFT_RESET_0);
-	*soft_reset_0 &= ~(1 << 11); /* Clear bit for RISC0 reset, leave RISC1 in reset still */
+	/* AssertSoftResets and the reset message both write this known value first.
+	 * Avoid a remote read-modify-write: a missing ETH response would otherwise
+	 * block ARC and all PCIe management indefinitely.
+	 */
+	NOC2AXIWrite32(ring, ETH_SETUP_TLB, ETH_RISC_DEBUG_SOFT_RESET_0,
+		       ETH_ALL_RISC_SOFT_RESET & ~BIT(11));
 }
 
 int LoadEthFw(uint32_t eth_inst, uint32_t ring, uint8_t *buf, size_t buf_size, size_t spi_address,
@@ -428,7 +528,7 @@ static bool LoadAltSerdes(uint8_t serdes_inst)
 	return false;
 }
 
-static void SerdesEthInit(void)
+static int SerdesEthInit(void)
 {
 	uint32_t ring = 0;
 	int rc;
@@ -459,33 +559,39 @@ static void SerdesEthInit(void)
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_SD_FW_TAG, &serdes_fw_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_SD_FW_TAG, rc);
-		return;
+		return rc;
 	}
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_ALT_SD_FW_TAG, &alt_serdes_fw_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_ALT_SD_FW_TAG, rc);
-		return;
+		return rc;
 	}
 
 	/* Load fw */
 	for (uint8_t serdes_inst = 0; serdes_inst < 6; serdes_inst++) {
 		if (IS_BIT_SET(load_serdes, serdes_inst)) {
 			if (LoadAltSerdes(serdes_inst)) {
-				LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
-						alt_serdes_fw_fd.spi_addr,
-						alt_serdes_fw_fd.flags.f.image_size);
+				rc = LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
+						     alt_serdes_fw_fd.spi_addr,
+						     alt_serdes_fw_fd.flags.f.image_size);
 			} else {
-				LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
-						serdes_fw_fd.spi_addr,
-						serdes_fw_fd.flags.f.image_size);
+				rc = LoadSerdesEthFw(serdes_inst, ring, buf, SCRATCHPAD_SIZE,
+						     serdes_fw_fd.spi_addr,
+						     serdes_fw_fd.flags.f.image_size);
+			}
+			if (rc != 0) {
+				LOG_ERR("%s(%u) failed: %d", "LoadSerdesEthFw", serdes_inst, rc);
+				return rc;
 			}
 		}
 	}
+
+	return 0;
 }
 
 /* This function assumes that tensix L1s have already been cleared */
-static void wipe_l1(void)
+static int wipe_l1(void)
 {
 	uint8_t noc_id = 0;
 	uint64_t addr = 0;
@@ -515,13 +621,25 @@ static void wipe_l1(void)
 		if (IS_BIT_SET(tile_enable.eth_enabled, eth_inst)) {
 			GetEthNocCoords(eth_inst, noc_id, &coords.dest_x, &coords.dest_y);
 
-			tt_dma_config(dma_noc, 1, &config, &coords);
-			dma_start(dma_noc, 1);
+			int rc = tt_dma_config(dma_noc, ETH_WIPE_DMA_CHANNEL, &config, &coords);
+
+			if (rc == 0) {
+				rc = dma_start(dma_noc, ETH_WIPE_DMA_CHANNEL);
+			}
+			if (rc == 0) {
+				rc = wait_for_eth_dma(ETH_WIPE_DMA_CHANNEL,
+						      ETH_WIPE_DMA_TIMEOUT_MS);
+			}
+			if (rc != 0) {
+				return rc;
+			}
 		}
 	}
+
+	return 0;
 }
 
-static void EthInit(void)
+static int EthInit(void)
 {
 	uint32_t ring = 0;
 	int rc;
@@ -532,41 +650,57 @@ static void EthInit(void)
 
 	/* Early exit if no ETH tiles enabled */
 	if (tile_enable.eth_enabled == 0) {
-		return;
+		return 0;
 	}
 
-	wipe_l1();
+	rc = wipe_l1();
+	if (rc != 0) {
+		LOG_ERR("%s() failed: %d", "wipe_l1", rc);
+		return rc;
+	}
 
 	uint8_t buf[SCRATCHPAD_SIZE] __aligned(4);
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_FW_TAG, &eth_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_FW_TAG, rc);
-		return;
+		return rc;
+	}
+	if (eth_fd.flags.f.image_size < ETH_FW_VERSION_ADDR_OFFSET + sizeof(uint32_t)) {
+		LOG_ERR("ETH firmware image is too small to contain its version");
+		return -EINVAL;
+	}
+	rc = flash_read(flash, eth_fd.spi_addr + ETH_FW_VERSION_ADDR_OFFSET, &cached_eth_fw_version,
+			sizeof(cached_eth_fw_version));
+	if (rc != 0) {
+		LOG_ERR("Failed to cache ETH firmware version: %d", rc);
+		return rc;
 	}
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_FW_CFG_TAG, &eth_cfg_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_FW_CFG_TAG, rc);
-		return;
+		return rc;
 	}
 
 	/* Loading ETH FW configuration data requires the whole data to be loaded into buffer */
-	__ASSERT(SCRATCHPAD_SIZE >= eth_cfg_fd.flags.f.image_size,
-		 "spi buffer size %zu must be larger than image size %zu", SCRATCHPAD_SIZE,
-		 eth_cfg_fd.flags.f.image_size);
+	if (eth_cfg_fd.flags.f.image_size > SCRATCHPAD_SIZE) {
+		LOG_ERR("ETH configuration image too large: %zu > %u",
+			(size_t)eth_cfg_fd.flags.f.image_size, SCRATCHPAD_SIZE);
+		return -E2BIG;
+	}
 
 	/* Load the SerDes cfg from SPI into each enabled ETH tile's L1 at ETH_SERDES_CFG_ADDR */
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_SD_REG_TAG, &serdes_reg_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_SD_REG_TAG, rc);
-		return;
+		return rc;
 	}
 
 	rc = tt_boot_fs_find_fd_by_tag(flash, ETH_ALT_SD_REG_TAG, &alt_serdes_reg_fd);
 	if (rc < 0) {
 		LOG_ERR("%s(%s) failed: %d", "tt_boot_fs_find_fd_by_tag", ETH_ALT_SD_REG_TAG, rc);
-		return;
+		return rc;
 	}
 
 	/* Load fw, params, and serdes cfg */
@@ -575,8 +709,12 @@ static void EthInit(void)
 			continue;
 		}
 
-		LoadEthFw(eth_inst, ring, buf, SCRATCHPAD_SIZE, eth_fd.spi_addr,
-			  eth_fd.flags.f.image_size);
+		rc = LoadEthFw(eth_inst, ring, buf, SCRATCHPAD_SIZE, eth_fd.spi_addr,
+			       eth_fd.flags.f.image_size);
+		if (rc != 0) {
+			LOG_ERR("%s(%u) failed: %d", "LoadEthFw", eth_inst, rc);
+			return rc;
+		}
 
 		if (load_alt_eth_serdes_cfg(eth_inst)) {
 			rc = load_eth_serdes_cfg(eth_inst, ring, buf, SCRATCHPAD_SIZE,
@@ -589,11 +727,15 @@ static void EthInit(void)
 		}
 		if (rc < 0) {
 			LOG_ERR("%s(%u) failed: %d", "load_eth_serdes_cfg", eth_inst, rc);
-			return;
+			return rc;
 		}
 
-		LoadEthFwCfg(eth_inst, ring, buf, tile_enable.eth_enabled, eth_cfg_fd.spi_addr,
-			     eth_cfg_fd.flags.f.image_size);
+		rc = LoadEthFwCfg(eth_inst, ring, buf, tile_enable.eth_enabled, eth_cfg_fd.spi_addr,
+				  eth_cfg_fd.flags.f.image_size);
+		if (rc != 0) {
+			LOG_ERR("%s(%u) failed: %d", "LoadEthFwCfg", eth_inst, rc);
+			return rc;
+		}
 	}
 
 	/* Deassert tile reset */
@@ -607,6 +749,9 @@ static void EthInit(void)
 
 		ReleaseEthReset(eth_inst, ring);
 	}
+
+	eth_runtime_telemetry_available = true;
+	return 0;
 }
 
 static void assert_eth_risc_soft_reset(uint32_t eth_inst, uint32_t ring)
@@ -745,8 +890,12 @@ REGISTER_MESSAGE(TT_SMC_MSG_TOGGLE_ETH_RESET, toggle_eth_reset_handler);
 
 static int eth_init(void)
 {
+	int rc;
+
 	/* TODO: Load ERISC (Ethernet RISC) FW to all ethernets (8 of them) */
 	SetPostCode(POST_CODE_SRC_CMFW, POST_CODE_ARC_INIT_STEPA);
+	cached_eth_fw_version = 0U;
+	eth_runtime_telemetry_available = false;
 	if (IS_ENABLED(CONFIG_TT_SMC_RECOVERY) || !IS_ENABLED(CONFIG_ARC)) {
 		return 0;
 	}
@@ -758,8 +907,19 @@ static int eth_init(void)
 		return 0;
 	}
 
-	SerdesEthInit();
-	EthInit();
+	if (!device_is_ready(dma_noc) || flash == NULL || !device_is_ready(flash)) {
+		return -ENODEV;
+	}
+
+	rc = SerdesEthInit();
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = EthInit();
+	if (rc != 0) {
+		return rc;
+	}
 
 	return 0;
 }

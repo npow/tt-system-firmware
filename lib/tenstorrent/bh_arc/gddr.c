@@ -54,13 +54,16 @@ uint8_t get_gddr_mrisc_noc2axi_port(uint8_t gddr_inst)
 	return (gddr_inst == 0) ? 2 : MRISC_FW_NOC2AXI_PORT;
 }
 
-#define MRISC_SETUP_TLB       13
-#define MRISC_L1_ADDR         (1ULL << 37)
-#define MRISC_REG_ADDR        (1ULL << 40)
-#define MRISC_FW_CFG_OFFSET   0x3C00
-#define ARC_NOC0_X            8
-#define ARC_NOC0_Y            0
-#define MRISC_L1_SIZE         (128 * 1024)
+#define MRISC_SETUP_TLB               13
+#define MRISC_L1_ADDR                 (1ULL << 37)
+#define MRISC_REG_ADDR                (1ULL << 40)
+#define MRISC_FW_CFG_OFFSET           0x3C00
+#define ARC_NOC0_X                    8
+#define ARC_NOC0_Y                    0
+#define MRISC_L1_SIZE                 (128 * 1024)
+#define GDDR_WIPE_DMA_CHANNEL         1U
+#define GDDR_WIPE_TIMEOUT_MS          50U
+#define GDDR_TELEMETRY_DMA_TIMEOUT_MS 5U
 
 #define MRISC_FW_TAG     "memfw"
 #define MRISC_FW_CFG_TAG "memfwcfg"
@@ -71,6 +74,9 @@ static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtab
 
 static struct gddr_bist_info gddr_bist;
 static uint8_t gddr_telemetry_version_ok;
+static struct gddr_temps cached_gddr_temps;
+static uint8_t cached_gddr_temp_valid;
+static struct k_spinlock cached_gddr_temp_lock;
 
 struct gddr_bist_info get_gddr_bist_info(void)
 {
@@ -138,19 +144,21 @@ int read_gddr_telemetry_table(uint8_t gddr_inst, gddr_telemetry_table_t *gddr_te
 {
 #ifdef CONFIG_DMA_ARC_HS
 	volatile uint8_t *mrisc_l1 = SetupMriscL1Tlb(gddr_inst);
-	bool dma_ok = false;
+	int rc = dma_arc_hs_transfer(
+		arc_dma_dev, 0, (const void *)(mrisc_l1 + GDDR_TELEMETRY_TABLE_ADDR),
+		gddr_telemetry, sizeof(*gddr_telemetry), K_MSEC(GDDR_TELEMETRY_DMA_TIMEOUT_MS));
 
-#ifdef CONFIG_DMA_ARC_HS
-	dma_ok = dma_arc_hs_transfer(arc_dma_dev, 0,
-				     (const void *)(mrisc_l1 + GDDR_TELEMETRY_TABLE_ADDR),
-				     gddr_telemetry, sizeof(*gddr_telemetry), K_MSEC(500)) >= 0;
-#endif
-	if (!dma_ok) {
-		for (int i = 0; i < sizeof(*gddr_telemetry) / 4; i++) {
-			((uint32_t *)gddr_telemetry)[i] =
-				MriscL1Read32(gddr_inst, GDDR_TELEMETRY_TABLE_ADDR + i * 4);
-		}
+	if (rc < 0) {
+		/* Never fall back to CPU loads from a remote MRISC. If the tile is
+		 * unresponsive, such a load can block ARC forever and take PCIe
+		 * management down with it. The DMA path has a finite timeout.
+		 */
+		return rc;
 	}
+#else
+	ARG_UNUSED(gddr_inst);
+	ARG_UNUSED(gddr_telemetry);
+	return -ENOTSUP;
 #endif
 	/* Check that version matches expectation. */
 	if (gddr_telemetry->telemetry_table_version != GDDR_TELEMETRY_TABLE_T_VERSION) {
@@ -158,6 +166,24 @@ int read_gddr_telemetry_table(uint8_t gddr_inst, gddr_telemetry_table_t *gddr_te
 			     gddr_telemetry->telemetry_table_version,
 			     GDDR_TELEMETRY_TABLE_T_VERSION);
 		return -ENOTSUP;
+	}
+
+	{
+		k_spinlock_key_t key = k_spin_lock(&cached_gddr_temp_lock);
+
+		cached_gddr_temps.inst[gddr_inst].top = gddr_telemetry->dram_temperature_top;
+		cached_gddr_temps.inst[gddr_inst].bottom = gddr_telemetry->dram_temperature_bottom;
+		cached_gddr_temp_valid |= BIT(gddr_inst);
+		cached_gddr_temps.max_temp = 0U;
+		for (uint8_t i = 0; i < NUM_GDDR; i++) {
+			if (IS_BIT_SET(cached_gddr_temp_valid, i)) {
+				cached_gddr_temps.max_temp =
+					MAX(cached_gddr_temps.max_temp,
+					    MAX(cached_gddr_temps.inst[i].top,
+						cached_gddr_temps.inst[i].bottom));
+			}
+		}
+		k_spin_unlock(&cached_gddr_temp_lock, key);
 	}
 	return 0;
 }
@@ -241,55 +267,25 @@ static uint32_t GetDramMask(void)
 	return dram_mask;
 }
 
-/* Read the top and bottom DRAM die temperatures (degrees Celsius) for a single GDDR instance. */
-static int read_gddr_temperature(uint8_t gddr_inst, struct gddr_inst_temp *temp)
-{
-	if (gddr_inst >= NUM_GDDR || temp == NULL) {
-		return -EINVAL;
-	}
-	if (!IS_BIT_SET(gddr_telemetry_version_ok, gddr_inst)) {
-		return -ENOTSUP;
-	}
-	/* dram_temperature_top and dram_temperature_bottom are adjacent uint16_t fields that */
-	/* share a single 32-bit word: [15:0] = top, [31:16] = bottom */
-	uint32_t temps = MriscL1Read32(
-		gddr_inst,
-		GDDR_TELEMETRY_TABLE_ADDR + offsetof(gddr_telemetry_table_t, dram_temperature_top));
-	temp->top = temps & 0xff;
-	temp->bottom = (temps >> 16) & 0xff;
-	return 0;
-}
-
 int get_gddr_temps(struct gddr_temps *temps)
 {
+	uint8_t valid;
+	k_spinlock_key_t key;
+
 	if (temps == NULL) {
 		return -EINVAL;
 	}
 
-	*temps = (struct gddr_temps){0};
-	uint32_t dram_mask = GetDramMask();
+	/* DVFS calls this every millisecond. Never perform a synchronous remote
+	 * tile access on that critical path; the 100 ms telemetry worker refreshes
+	 * this cache through dma_arc_hs_transfer(), which has a finite timeout.
+	 */
+	key = k_spin_lock(&cached_gddr_temp_lock);
+	*temps = cached_gddr_temps;
+	valid = cached_gddr_temp_valid;
+	k_spin_unlock(&cached_gddr_temp_lock, key);
 
-	int ret = 0;
-
-	for (int i = 0; i < NUM_GDDR; i++) {
-		if (!IS_BIT_SET(dram_mask, i)) {
-			continue;
-		}
-
-		int rc = read_gddr_temperature(i, &temps->inst[i]);
-
-		if (rc < 0) {
-			LOG_WRN_ONCE("Failed to read GDDR %d temperature while updating telemetry",
-				     i);
-			ret = rc;
-			continue;
-		}
-
-		temps->max_temp =
-			MAX(temps->max_temp, MAX(temps->inst[i].top, temps->inst[i].bottom));
-	}
-
-	return ret;
+	return (valid & GetDramMask()) == GetDramMask() ? 0 : -EAGAIN;
 }
 
 static int check_mrisc_busy(uint8_t gddr_inst)
@@ -382,8 +378,28 @@ static int CheckHwMemtestResult(uint8_t gddr_inst, k_timepoint_t timeout)
 	return 0;
 }
 
+static int wait_for_gddr_wipe_dma(void)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(GDDR_WIPE_TIMEOUT_MS));
+	struct dma_status status;
+	int rc;
+
+	do {
+		rc = dma_get_status(dma_noc, GDDR_WIPE_DMA_CHANNEL, &status);
+		if (rc != 0) {
+			return rc;
+		}
+		if (!status.busy) {
+			return 0;
+		}
+		k_busy_wait(10);
+	} while (!sys_timepoint_expired(timeout));
+
+	return -ETIMEDOUT;
+}
+
 /* This function assumes that tensix L1s have already been cleared */
-static void wipe_l1(void)
+static int wipe_l1(void)
 {
 	uint8_t noc_id = 0;
 	uint64_t addr = 0;
@@ -416,11 +432,23 @@ static void wipe_l1(void)
 						 &coords.dest_y);
 
 				/* AXI enable must not be set, using MRISC address 0 */
-				tt_dma_config(dma_noc, 1, &config, &coords);
-				dma_start(dma_noc, 1);
+				int rc = tt_dma_config(dma_noc, GDDR_WIPE_DMA_CHANNEL, &config,
+						       &coords);
+
+				if (rc == 0) {
+					rc = dma_start(dma_noc, GDDR_WIPE_DMA_CHANNEL);
+				}
+				if (rc == 0) {
+					rc = wait_for_gddr_wipe_dma();
+				}
+				if (rc != 0) {
+					return rc;
+				}
 			}
 		}
 	}
+
+	return 0;
 }
 
 static int InitMrisc(void)
@@ -438,7 +466,13 @@ static int InitMrisc(void)
 		return 0;
 	}
 
-	wipe_l1();
+	int rc = wipe_l1();
+
+	if (rc != 0) {
+		LOG_ERR("%s() failed: %d", "wipe_l1", rc);
+		record_init_failure(INIT_STAGE_MRISC_LOAD);
+		return rc;
+	}
 
 	/* Load MRISC (DRAM RISC) FW to all DRAMs in the middle NOC node */
 
@@ -451,7 +485,6 @@ static int InitMrisc(void)
 
 	uint32_t dram_mask = GetDramMask();
 
-	int rc;
 	tt_boot_fs_fd tag_fd;
 	size_t image_size;
 	size_t spi_address;

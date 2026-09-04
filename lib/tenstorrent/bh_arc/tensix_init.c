@@ -58,6 +58,7 @@ LOG_MODULE_REGISTER(tensix_init, CONFIG_TT_APP_LOG_LEVEL);
 #define COUNTER_L1_ADDR       0x110000 /* L1 address of the atomic counter itself */
 #define NUM_TENSIX_ROWS       10
 #define WIPE_DEST_TIMEOUT_US  10000 /* 10ms timeout */
+#define WIPE_DMA_TIMEOUT_MS   50
 
 static const struct device *const fwtable_dev = DEVICE_DT_GET(DT_NODELABEL(fwtable));
 static const struct device *const dma_noc = DEVICE_DT_GET(DT_NODELABEL(dma1));
@@ -126,7 +127,43 @@ void EnableTensixCG(bool broadcast, uint8_t noc_x, uint8_t noc_y)
  * all other non-harvested tensix cores. This approach is faster than iterating over all tensix
  * cores sequentially to clear each l1.
  */
-static void wipe_l1(void)
+static int wait_for_noc_dma(void)
+{
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(WIPE_DMA_TIMEOUT_MS));
+	struct dma_status status;
+	int ret;
+
+	do {
+		ret = dma_get_status(dma_noc, 1, &status);
+		if (ret != 0) {
+			return ret;
+		}
+		if (!status.busy) {
+			return 0;
+		}
+		k_busy_wait(10);
+	} while (!sys_timepoint_expired(timeout));
+
+	return -ETIMEDOUT;
+}
+
+static int run_noc_dma(struct dma_config *config, struct tt_bh_dma_noc_coords *coords)
+{
+	int ret = tt_dma_config(dma_noc, 1, config, coords);
+
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = dma_start(dma_noc, 1);
+	if (ret != 0) {
+		return ret;
+	}
+
+	return wait_for_noc_dma();
+}
+
+static int wipe_l1(void)
 {
 	uint64_t addr = 0;
 	uint8_t tensix_x, tensix_y;
@@ -157,8 +194,11 @@ static void wipe_l1(void)
 					      .dest_x = ARC_NOC0_X,
 					      .dest_y = ARC_NOC0_Y};
 
-	tt_dma_config(dma_noc, 1, &config, &coords);
-	dma_start(dma_noc, 1);
+	int ret = run_noc_dma(&config, &coords);
+
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* wipe entire L1 of the chosen tensix */
 	uint32_t offset = sizeof(sram_buffer);
@@ -172,8 +212,10 @@ static void wipe_l1(void)
 		block.dest_address = offset;
 		block.block_size = size;
 
-		tt_dma_config(dma_noc, 1, &config, &coords);
-		dma_start(dma_noc, 1);
+		ret = run_noc_dma(&config, &coords);
+		if (ret != 0) {
+			return ret;
+		}
 
 		offset += offset;
 	}
@@ -184,8 +226,7 @@ static void wipe_l1(void)
 	block.dest_address = addr;
 	block.block_size = TENSIX_L1_SIZE;
 
-	tt_dma_config(dma_noc, 1, &config, &coords);
-	dma_start(dma_noc, 1);
+	return run_noc_dma(&config, &coords);
 }
 
 /**
@@ -362,7 +403,13 @@ static int tensix_init(void)
 
 	TensixInit();
 
-	wipe_l1();
+	int rc_wipe_l1 = wipe_l1();
+
+	if (rc_wipe_l1 < 0) {
+		LOG_ERR("%s: wipe_l1 failed: %d", __func__, rc_wipe_l1);
+		record_init_failure(INIT_STAGE_TENSIX);
+		return rc_wipe_l1;
+	}
 	int rc_wipe_dest = wipe_dest();
 
 	if (rc_wipe_dest < 0) {
